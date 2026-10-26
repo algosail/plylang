@@ -17,15 +17,33 @@ test("names a supported platform", () => {
 });
 
 test("uses the checkout binary when no platform package is installed", () => {
-  const found = resolveBinary("plylang", { env: {}, resolvePackage: () => null });
-  const release = join(root, "target", "release", "plylang");
-  const debug = join(root, "target", "debug", "plylang");
-  assert.ok(found === release || found === debug, found);
+  const dir = mkdtempSync(join(tmpdir(), "plylang-checkout-"));
+  const release = join(dir, "target", "release");
+  mkdirSync(release, { recursive: true });
+  const file = join(release, process.platform === "win32" ? "plylang.exe" : "plylang");
+  writeFileSync(file, "#!/bin/sh\n");
+  chmodSync(file, 0o755);
+  const found = resolveBinary("plylang", {
+    env: {},
+    resolvePackage: () => null,
+    packageRoot: dir,
+  });
+  assert.equal(found, file);
 });
 
 test("finds the language server the same way", () => {
-  const found = resolveBinary("plylang-ls", { env: {}, resolvePackage: () => null });
-  assert.match(found, /target\/(release|debug)\/plylang-ls$/);
+  const dir = mkdtempSync(join(tmpdir(), "plylang-checkout-"));
+  const debug = join(dir, "target", "debug");
+  mkdirSync(debug, { recursive: true });
+  const file = join(debug, process.platform === "win32" ? "plylang-ls.exe" : "plylang-ls");
+  writeFileSync(file, "#!/bin/sh\n");
+  chmodSync(file, 0o755);
+  const found = resolveBinary("plylang-ls", {
+    env: {},
+    resolvePackage: () => null,
+    packageRoot: dir,
+  });
+  assert.equal(found, file);
 });
 
 test("an override replaces the checkout binary", () => {

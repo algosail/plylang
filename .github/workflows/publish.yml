@@ -26,6 +26,8 @@ jobs:
       - run: node script/check-release.js
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+      # The usage test launches this debug binary.
+      - run: cargo build -p plylang -p plylang-ls
       - run: node --test bin/native.test.js script/stage-native.test.js
       - run: cargo test --workspace -- --test-threads=8
 
