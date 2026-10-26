@@ -623,32 +623,41 @@ impl Checker {
         produced: usize,
         frame: &mut Frame,
     ) {
-        let Some(dict) = dicts.first() else {
+        let Some((dict, extras)) = dicts.split_first() else {
             self.emit_word(name, dicts, stack_args, produced, frame);
             return;
         };
         match dict {
             Dict::Assumption(index) => {
                 let base = self.assumption_locals[*index];
-                self.emit_prop_apply(base, name, stack_args, produced, frame);
+                let mut args = self.materialize_dicts(extras, frame);
+                args.extend(stack_args);
+                self.emit_prop_apply(base, name, args, produced, frame);
             }
             Dict::Super { .. } => {
                 let base = self.materialize_dict(dict, frame);
-                self.emit_prop_apply(base, name, stack_args, produced, frame);
+                let mut args = self.materialize_dicts(extras, frame);
+                args.extend(stack_args);
+                self.emit_prop_apply(base, name, args, produced, frame);
             }
             Dict::Instance { methods, .. } => {
                 let method = methods
                     .iter()
                     .find(|method| method.name == name)
                     .expect("class dictionary contains the method");
-                let mut args = Vec::new();
-                for nested in &method.dicts {
-                    args.push(self.materialize_dict(nested, frame));
-                }
+                let mut args = self.materialize_dicts(&method.dicts, frame);
+                args.extend(self.materialize_dicts(extras, frame));
                 args.extend(stack_args);
                 self.emit_call(&method.word, args, produced, frame);
             }
         }
+    }
+
+    fn materialize_dicts(&mut self, dicts: &[Dict], frame: &mut Frame) -> Vec<LocalId> {
+        dicts
+            .iter()
+            .map(|dict| self.materialize_dict(dict, frame))
+            .collect()
     }
 
     fn emit_word(
@@ -729,7 +738,7 @@ impl Checker {
                             dicts.push(self.materialize_dict(nested, frame));
                         }
                         DictValue::Closure {
-                            params: self.fresh_vec(method.arity),
+                            params: self.fresh_vec(method.extra + method.arity),
                             dicts,
                             word: method.word.clone(),
                         }
@@ -2549,6 +2558,61 @@ if (headName({ people: [{ name: "Ada" }] }) !== "Ada") throw new Error("head");
 if (headName({ people: [] }) !== "") throw new Error("no head");
 if (headName({ people: [{ name: "Ada" }, { name: "Grace" }] }) !== "") throw new Error("long");
 if (touch({ name: "Ada", age: 36 }) !== true) throw new Error("touch");
+"#,
+        );
+    }
+
+    #[test]
+    fn a_method_constraint_is_passed_at_the_call() {
+        run(
+            r#"
+& Comparable a
+  eq ( a a -- Bool )
+
+: eqInt ( Int Int -- Bool )
+  drop drop true
+
+# Comparable Int
+  eq = eqInt
+
+& Wrappable f
+  wrap ( a -- (f a) )
+
+; Box a = Mk a
+
+: wrapBox ( a -- (Box a) )
+  Mk
+
+# Wrappable Box
+  wrap = wrapBox
+
+& Walk t
+  step ( f. Wrappable f => (t Int) -- (f (t Int)) )
+
+: stepBox ( f. Comparable Int, Wrappable f => (Box Int) -- (f (Box Int)) )
+  wrap
+
+# Walk Box
+  step = stepBox
+
+: use ( (Box Int) -- (Box (Box Int)) )
+  step
+
+: usePoly ( t f. Walk t, Wrappable f => (t Int) -- (f (t Int)) )
+  step
+
+: useVia ( (Box Int) -- (Box (Box Int)) )
+  usePoly
+"#,
+            r#"
+const once = use(Mk(1n));
+if (once.tag !== "Mk" || once.value.tag !== "Mk" || once.value.value !== 1n) {
+  throw new Error("use " + JSON.stringify(once));
+}
+const twice = useVia(Mk(2n));
+if (twice.tag !== "Mk" || twice.value.tag !== "Mk" || twice.value.value !== 2n) {
+  throw new Error("via " + JSON.stringify(twice));
+}
 "#,
         );
     }

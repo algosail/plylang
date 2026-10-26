@@ -1,6 +1,7 @@
 # Publishes when a GitHub release is published.
 # The tag must be `v` plus the version in package.json.
-# Repository secret NPM_TOKEN is an npm token that can publish @plylang/*.
+# npm authenticates with GitHub OIDC. Each of the seven packages needs a
+# trusted publisher for this file, publish.yml, with direct npm publish allowed.
 
 name: Publish
 
@@ -63,8 +64,6 @@ jobs:
       - run: node script/stage-native.js ${{ matrix.platform }} target/release staging
       - run: npm publish --provenance --access public
         working-directory: staging
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   package:
     needs: native
@@ -81,5 +80,3 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
       - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -291,7 +291,11 @@ struct InstanceInfo {
 struct InstanceMethod {
     name: String,
     word: String,
+    /// Dictionaries fixed by the instance head. The call site does not pass them.
     context: Vec<SemConstraint>,
+    /// Method constraints after the class. The call site passes these dictionaries,
+    /// because they mention the method's own variables rather than the head.
+    extra: usize,
     arity: usize,
 }
 
@@ -313,6 +317,7 @@ struct ResolvedMethod {
     name: String,
     word: String,
     dicts: Vec<Dict>,
+    extra: usize,
     arity: usize,
 }
 
@@ -823,17 +828,9 @@ impl Checker {
                 }
             }
         }
-        // A superclass is declared in a dependency, or earlier in that module.
-        // The closure lists the provider first, so dependencies are installed
-        // before it. Within one module, source order still applies.
-        let mut class_modules: Vec<&Module> = Vec::with_capacity(known.len());
-        if known.len() > 1 {
-            class_modules.extend(known[1..].iter().rev().map(|known_module| &known_module.module));
-        }
-        if let Some(provider) = known.first() {
-            class_modules.push(&provider.module);
-        }
-        for module in class_modules {
+        // A superclass module is installed before the class that extends it.
+        // Within one module, source order still applies.
+        for module in dependency_order(known) {
             for item in &module.items {
                 if let Item::Class(class) = item {
                     self.ensure_class(class)?;
@@ -3228,6 +3225,44 @@ impl Checker {
             let kind = self.kind_var();
             params.push((param.clone(), self.ty_of_kind(kind)));
         }
+        // Reinstalling a class from an import closure elaborates constraints
+        // on classes that are installed but not named in this import list.
+        let saved_relax = self.relax_visibility;
+        if !export_methods {
+            self.relax_visibility = true;
+        }
+        let methods = self.elaborate_methods(class, &params, export_methods);
+        self.relax_visibility = saved_relax;
+        let methods = methods?;
+        // A methodless class learns its parameter kind from the superclasses.
+        // Defaulting first would turn that variable into `Type`.
+        let supers = self.elaborate_supers(class, &params, export_methods)?;
+        for (_, id) in &params {
+            if let Some(kind) = self.ty_kind.get(id).copied() {
+                self.default_kind(kind);
+            }
+        }
+        if export_methods {
+            self.visible_classes.insert(class.name.clone());
+            self.defined_classes.insert(class.name.clone());
+        }
+        self.classes.insert(
+            class.name.clone(),
+            ClassInfo {
+                params,
+                methods,
+                supers,
+            },
+        );
+        Ok(())
+    }
+
+    fn elaborate_methods(
+        &mut self,
+        class: &Class,
+        params: &[(String, TyId)],
+        export_methods: bool,
+    ) -> Result<Vec<ClassMethod>, Diagnostic> {
         let mut methods = Vec::new();
         for method in &class.methods {
             if methods.iter().any(|have: &ClassMethod| have.name == method.name) {
@@ -3237,7 +3272,7 @@ impl Checker {
                 ));
             }
             let mut scope = Scope::new();
-            for (name, id) in &params {
+            for (name, id) in params {
                 scope.tys.insert(name.clone(), *id);
                 scope.quantified_tys.push((name.clone(), *id));
             }
@@ -3260,29 +3295,12 @@ impl Checker {
                 arity,
             });
         }
-        for (_, id) in &params {
-            if let Some(kind) = self.ty_kind.get(id).copied() {
-                self.default_kind(kind);
-            }
-        }
-        let supers = self.elaborate_supers(class, &params, export_methods)?;
-        if export_methods {
-            self.visible_classes.insert(class.name.clone());
-            self.defined_classes.insert(class.name.clone());
-        }
-        self.classes.insert(
-            class.name.clone(),
-            ClassInfo {
-                params,
-                methods,
-                supers,
-            },
-        );
-        Ok(())
+        Ok(methods)
     }
 
     /// Superclass arguments are the class parameters. A free name is not quantified.
-    /// Kinds already come from the methods: an unsolved kind has been defaulted to `Type`.
+    /// An unsolved parameter kind is still a variable here. It is defaulted to
+    /// `Type` after the superclasses have been elaborated.
     fn elaborate_supers(
         &mut self,
         class: &Class,
@@ -3561,11 +3579,13 @@ impl Checker {
                 }
             }
             let word = self.lookup_word_scheme(module, &binding.word, binding.name_span)?;
-            let context = self.check_impl(class, method, &word, &head, binding.name_span)?;
+            let (context, extra) =
+                self.check_impl(class, method, &word, &head, binding.name_span)?;
             methods.push(InstanceMethod {
                 name: method.name.clone(),
                 word: binding.word.clone(),
                 context,
+                extra,
                 arity: method.arity,
             });
         }
@@ -3699,20 +3719,26 @@ impl Checker {
         name: &str,
         span: Span,
     ) -> Result<SemScheme, Diagnostic> {
+        // The provider's own definition is the instance. An importer often
+        // already has the class method under that name, and that scheme is
+        // not the implementation.
+        if let Some(def) = find_def(module, name) {
+            let saved = self.relax_visibility;
+            self.relax_visibility = true;
+            let result = self.elaborate_scheme(&def.scheme, def.name_span);
+            self.relax_visibility = saved;
+            return result;
+        }
         if let Some(scheme) = self.lookup(name) {
             return Ok(scheme);
         }
-        let saved = self.relax_visibility;
-        self.relax_visibility = true;
-        let result = if let Some(def) = find_def(module, name) {
-            self.elaborate_scheme(&def.scheme, def.name_span)
-        } else {
-            Err(self.error(span, Error::UndefinedWord(name.to_string())))
-        };
-        self.relax_visibility = saved;
-        result
+        Err(self.error(span, Error::UndefinedWord(name.to_string())))
     }
 
+    /// The implementation word lists head dictionaries first and the method's own
+    /// constraints last. A head dictionary is solved when the instance dictionary
+    /// is built. A method constraint mentions a variable of the method, so the
+    /// call site passes that dictionary.
     fn check_impl(
         &mut self,
         class: &ClassInfo,
@@ -3720,8 +3746,9 @@ impl Checker {
         word: &SemScheme,
         head: &[TyId],
         span: Span,
-    ) -> Result<Vec<SemConstraint>, Diagnostic> {
-        let (need_in, need_out, need_effect, skolems) = self.method_at_head(class, method, head);
+    ) -> Result<(Vec<SemConstraint>, usize), Diagnostic> {
+        let (need_in, need_out, need_effect, skolems, extras) =
+            self.method_at_head(class, method, head);
         let (have_in, have_out, have_effect, context) = self.instantiate_scheme(word, false);
         self.unify_stack(have_in, need_in)
             .map_err(|message| self.error(span, message))?;
@@ -3729,7 +3756,33 @@ impl Checker {
             .map_err(|message| self.error(span, message))?;
         self.unify_effect(have_effect, need_effect)
             .map_err(|message| self.error(span, message))?;
-        for constraint in &context {
+        if context.len() < extras.len() {
+            return Err(self.error(
+                span,
+                Error::TypeMismatch {
+                    expected: self.show_constraints(&extras),
+                    found: self.show_constraints(&context),
+                },
+            ));
+        }
+        let split = context.len() - extras.len();
+        for (have, need) in context[split..].iter().zip(&extras) {
+            if have.class_name != need.class_name || have.args.len() != need.args.len() {
+                return Err(self.error(
+                    span,
+                    Error::TypeMismatch {
+                        expected: self.show_constraint(need),
+                        found: self.show_constraint(have),
+                    },
+                ));
+            }
+            for (have_arg, need_arg) in have.args.iter().zip(&need.args) {
+                self.unify_ty(*have_arg, *need_arg)
+                    .map_err(|message| self.error(span, message))?;
+            }
+        }
+        let mut kept = Vec::new();
+        for constraint in &context[..split] {
             let shown = self.show_constraint(constraint);
             if constraint
                 .args
@@ -3743,8 +3796,9 @@ impl Checker {
                     return Err(self.error(span, Error::AmbiguousConstraint(shown)));
                 }
             }
+            kept.push(constraint.clone());
         }
-        Ok(context)
+        Ok((kept, extras.len()))
     }
 
     /// A method variable that is not the class parameter. The implementation
@@ -3815,7 +3869,7 @@ impl Checker {
         class: &ClassInfo,
         method: &ClassMethod,
         head: &[TyId],
-    ) -> (StackId, StackId, EffectId, Vec<TyId>) {
+    ) -> (StackId, StackId, EffectId, Vec<TyId>, Vec<SemConstraint>) {
         let mut subst = Subst::default();
         let mut skolems = Vec::new();
         for ((_, param), arg) in class.params.iter().zip(head) {
@@ -3850,7 +3904,13 @@ impl Checker {
         let input = self.copy_stack(method.scheme.input, &subst, &mut memo);
         let output = self.copy_stack(method.scheme.output, &subst, &mut memo);
         let effect = self.copy_effect(method.scheme.effect, &subst, &mut memo);
-        (input, output, effect, skolems)
+        // The first constraint is the class itself, inserted when the class was installed.
+        let extras = if method.scheme.constraints.is_empty() {
+            Vec::new()
+        } else {
+            self.copy_constraints(&method.scheme.constraints[1..], &subst, &mut memo)
+        };
+        (input, output, effect, skolems, extras)
     }
 
     fn overlaps(&mut self, left: &InstanceInfo, right: &InstanceInfo) -> bool {
@@ -3895,6 +3955,7 @@ impl Checker {
                 name: method.name.clone(),
                 word: method.word.clone(),
                 arity: method.arity,
+                extra: method.extra,
                 context: self.copy_constraints(&method.context, &subst, &mut memo),
             })
             .collect();
@@ -4044,6 +4105,7 @@ impl Checker {
                         name: method.name.clone(),
                         word: method.word.clone(),
                         dicts,
+                        extra: method.extra,
                         arity: method.arity,
                     }),
                     Err(error) if error.code == "PL0088" => {
@@ -4484,6 +4546,17 @@ impl Checker {
         out
     }
 
+    fn show_constraints(&self, constraints: &[SemConstraint]) -> String {
+        if constraints.is_empty() {
+            return "no constraint".to_string();
+        }
+        constraints
+            .iter()
+            .map(|constraint| self.show_constraint(constraint))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     fn prefix_len(&self, mut current: StackId) -> usize {
         let mut count = 0;
         loop {
@@ -4506,6 +4579,50 @@ impl Checker {
     fn error(&self, span: Span, error: Error) -> Diagnostic {
         Diagnostic::new(span, error)
     }
+}
+
+/// Modules in an import closure, dependencies first.
+/// The closure walk lists the provider first and is not a topological order:
+/// a later import can be installed before the superclass it names.
+fn dependency_order(known: &[KnownModule]) -> Vec<&Module> {
+    let mut by_key = HashMap::new();
+    for (index, known_module) in known.iter().enumerate() {
+        by_key.insert(file_key(&known_module.origin), index);
+    }
+    let mut edges = vec![Vec::new(); known.len()];
+    for (index, known_module) in known.iter().enumerate() {
+        for import in &known_module.module.imports {
+            let Some(dep) = by_key.get(&file_key(&import.path)).copied() else {
+                continue;
+            };
+            if dep != index {
+                edges[index].push(dep);
+            }
+        }
+    }
+    let mut seen = vec![false; known.len()];
+    let mut order = Vec::with_capacity(known.len());
+    for index in 0..known.len() {
+        visit_dependency(index, &edges, &mut seen, &mut order);
+    }
+    order.into_iter().map(|index| &known[index].module).collect()
+}
+
+fn visit_dependency(index: usize, edges: &[Vec<usize>], seen: &mut [bool], order: &mut Vec<usize>) {
+    if seen[index] {
+        return;
+    }
+    seen[index] = true;
+    for dep in &edges[index] {
+        visit_dependency(*dep, edges, seen, order);
+    }
+    order.push(index);
+}
+
+/// `Ply/Applicable.ply` and `Ply/Applicable` both key as `Applicable`.
+fn file_key(path: &str) -> String {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    name.strip_suffix(".ply").unwrap_or(name).to_string()
 }
 
 /// Free type variables in a scheme, in source order. Stack, row, and effect
@@ -5189,6 +5306,98 @@ mod tests {
     }
 
     #[test]
+    fn a_superclass_module_is_installed_before_the_subclass() {
+        let mappable = parse(
+            "& Mappable f\n  map ( a b. (f a) (a -- b) -- (f b) )\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let applicable = parse(
+            "~ \"Ply/Mappable\" (Mappable)\n\n& Mappable f => Applicable f\n  apply ( a b. (f a) (f (a -- b)) -- (f b) )\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let flat = parse(
+            "~ \"Ply/Applicable\" (Applicable)\n\n& Applicable f => Flatmappable f\n  flatmap ( a b. (f a) (a -- (f b)) -- (f b) )\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let consumer = parse("~ \"Ply/Flatmappable\" (Flatmappable)\n", ParseMode::Source).unwrap();
+        let known = vec![
+            super::KnownModule {
+                origin: "Ply/Flatmappable.ply".to_string(),
+                module: flat.clone(),
+            },
+            super::KnownModule {
+                origin: "Ply/Mappable.ply".to_string(),
+                module: mappable,
+            },
+            super::KnownModule {
+                origin: "Ply/Applicable.ply".to_string(),
+                module: applicable,
+            },
+        ];
+        super::check_with_imports(
+            &consumer,
+            &[super::ResolvedImport {
+                provider: &flat,
+                import: &consumer.imports[0],
+                known: &known,
+            }],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_instance_word_is_not_the_imported_method() {
+        let comparable = parse(
+            "& Comparable a\n  eq ( a a -- Bool )\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let number = parse(
+            "~ \"Ply/Comparable\" (Comparable)\n\n: eq ( Num Num -- Bool )\n  drop drop true\n\n# Comparable Num\n  eq = eq\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let consumer = parse(
+            "~ \"Ply/Comparable\" (Comparable, eq)\n~ \"Ply/Number\" ()\n\n: use ( Num Num -- Bool )\n  eq\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let known_number = vec![
+            super::KnownModule {
+                origin: "Ply/Comparable.ply".to_string(),
+                module: comparable.clone(),
+            },
+            super::KnownModule {
+                origin: "Ply/Number.ply".to_string(),
+                module: number.clone(),
+            },
+        ];
+        let known_comparable = vec![super::KnownModule {
+            origin: "Ply/Comparable.ply".to_string(),
+            module: comparable.clone(),
+        }];
+        super::check_with_imports(
+            &consumer,
+            &[
+                super::ResolvedImport {
+                    provider: &comparable,
+                    import: &consumer.imports[0],
+                    known: &known_comparable,
+                },
+                super::ResolvedImport {
+                    provider: &number,
+                    import: &consumer.imports[1],
+                    known: &known_number,
+                },
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn imports_are_selective() {
         let provider = parse(
             "; Maybe a = Nothing | Just a\n\n: fromMaybe ( a. a (Maybe a) -- a )\n  Nothing ->\n  Just -> nip\n\n: private hidden ( Int -- Int )\n  dup drop\n",
@@ -5779,6 +5988,71 @@ mod tests {
         err(
             "& Eq a\n  eq ( a a -- Bool )\n\n& Eq a => Ord a\n  compare ( a a -- Bool )\n\n: cmpInt ( Int Int -- Bool )\n  drop drop true\n\n# Ord Int\n  compare = cmpInt\n",
             "no instance for Eq Int",
+        );
+        ok(
+            "\
+& Mappable f
+  map ( (f a) (a -- b) -- (f b) )
+
+& Mappable f => Sequenceable f
+
+; Box a = Mk a
+
+: mapBox ( (Box a) (a -- b) -- (Box b) )
+  (Mk x) f ->
+    x f call Mk
+
+# Mappable Box
+  map = mapBox
+
+# Sequenceable Box
+
+: use ( Sequenceable f => (f Int) (Int -- Bool) -- (f Bool) )
+  map
+",
+        );
+        ok(
+            "\
+& Eq a
+  eq ( a a -- Bool )
+
+& Eq a => Law a
+
+: eqInt ( Int Int -- Bool )
+  drop drop true
+
+# Eq Int
+  eq = eqInt
+
+# Law Int
+
+: use ( Law a => a a -- Bool )
+  eq
+",
+        );
+        err(
+            "\
+& Wrappable f
+  wrap ( a -- (f a) )
+
+; Box a = Mk a
+
+: wrapBox ( a -- (Box a) )
+  Mk
+
+# Wrappable Box
+  wrap = wrapBox
+
+& Walk t
+  step ( f a. Wrappable f => (t a) -- (f (t a)) )
+
+: stepBox ( f a. (Box a) -- (f (Box a)) )
+  drop Mk
+
+# Walk Box
+  step = stepBox
+",
+            "type mismatch: expected Wrappable f, found no constraint",
         );
         err(
             "\

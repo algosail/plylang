@@ -145,8 +145,9 @@ pub enum Value {
     Record {
         fields: Vec<(String, LocalId)>,
     },
-    /// Class dictionary. A method is either the implementing word or a closure
-    /// that supplies that word's context dictionaries.
+    /// Class dictionary. A method is the implementing word, or a closure that
+    /// closes over dictionaries fixed by the instance head. The closure's
+    /// parameters are the method's own dictionaries and then the stack values.
     Dict {
         fields: Vec<DictField>,
     },

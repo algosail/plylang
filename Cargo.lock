@@ -240,14 +240,14 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "plylang"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "plylang-ls"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "idna",
  "idna_adapter",
