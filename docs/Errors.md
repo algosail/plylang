@@ -467,7 +467,7 @@ Fix: declare it, import it, or correct the spelling. A `private` word is visible
 
 The type is not a builtin, a type in this module, or a type you imported.
 
-Fix: declare it, import it, or correct the spelling. Builtin types include `Int`, `Num`, `Str`, `Bool`, `Void`, `Array`, and `StrMap`.
+Fix: declare it, import it, or correct the spelling. Builtin types include `Int`, `Num`, `Str`, `Bool`, `Unit`, `Array`, and `StrMap`.
 
 ## PL0056
 
@@ -948,3 +948,13 @@ Fix: if this text is the diagnostic you see, report it as a compiler bug.
 While searching for an instance, a candidate's head length differed from the constraint's argument count. That failure is normally turned into another instance diagnostic.
 
 Fix: if this text is the diagnostic you see, report it as a compiler bug. An instance head that simply has the wrong number of arguments is `PL0080`.
+
+**Entry**
+
+## PL0115
+
+`word main must have scheme ( -- Unit )`
+
+A word named `main` is the program of its module. The scheme has no constraints and no effects, takes no inputs, and returns `Unit`. `private` is allowed. Any other scheme is this error. A module with no word named `main` is a library module.
+
+Fix: write `: main ( -- Unit )` and a body that returns `Unit`, or rename the word. `( . -- . Unit )` and `( ..s -- ..s Unit )` are the same shape and are accepted.

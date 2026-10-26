@@ -1,7 +1,7 @@
 //! Compiler builtins. Checking, lowering, hover, and completion read this table.
 //!
 //! Value operations live in the prelude. The compiler keeps the stack, quotations,
-//! and the word `Void`. `Void` is also a nullary constructor; the checker installs
+//! and the word `Unit`. `Unit` is also a nullary constructor; the checker installs
 //! that data type while loading the table. A digit, `-`, `*`, or `@` cannot start
 //! one identifier.
 
@@ -57,7 +57,7 @@ pub const TYPES: &[Type] = &[
     Type { name: "Num", arity: 0 },
     Type { name: "Str", arity: 0 },
     Type { name: "Bool", arity: 0 },
-    Type { name: "Void", arity: 0 },
+    Type { name: "Unit", arity: 0 },
     Type { name: "Array", arity: 1 },
     Type { name: "StrMap", arity: 1 },
 ];
@@ -232,9 +232,9 @@ pub const WORDS: &[Word] = &[
         Lowering::If,
     ),
     w(
-        "Void",
-        "..s -- ..s Void",
-        "The only value of type `Void`.",
+        "Unit",
+        "..s -- ..s Unit",
+        "The only value of type `Unit`.",
         Lowering::Unit,
     ),
 ];

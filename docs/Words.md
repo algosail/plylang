@@ -234,10 +234,10 @@ Pops a `Bool` and two quotations. The `true` branch is pushed first, so the `fal
 
 ## Value
 
-### Void
+### Unit
 
 ```ply
-..s -- ..s Void
+..s -- ..s Unit
 ```
 
-Pushes the only value of type [`Void`](Types.md#void).
+Pushes the only value of type [`Unit`](Types.md#unit).

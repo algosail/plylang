@@ -11,7 +11,7 @@ const root = join(import.meta.dirname, "..");
 
 test("the release manifest matches the compiler version", () => {
   assert.deepEqual(checkRelease(root), []);
-  assert.deepEqual(checkRelease(root, "v1.0.1"), []);
+  assert.deepEqual(checkRelease(root, "v1.0.2"), []);
   assert.match(checkRelease(root, "v0.0.0").join("\n"), /release tag v0.0.0/);
 });
 

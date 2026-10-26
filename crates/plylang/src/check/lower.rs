@@ -1516,7 +1516,7 @@ fn expr_uses_unit(expr: &Expr) -> bool {
 
 fn value_uses_unit(value: &Value) -> bool {
     match value {
-        Value::Ctor { name, .. } => name == "Void",
+        Value::Ctor { name, .. } => name == "Unit",
         Value::Quote(quote) => expr_uses_unit(&quote.body),
         Value::If { yes, no, .. } => expr_uses_unit(yes) || expr_uses_unit(no),
         Value::Choose { arms } => arms.iter().any(|arm| expr_uses_unit(&arm.body)),
@@ -1638,8 +1638,8 @@ mod tests {
 : pairSnd ( a b. a b -- b )
   Pair takeSnd
 
-: unit ( -- Void )
-  Void
+: unit ( -- Unit )
+  Unit
 
 : label ( -- Str )
   "hi"

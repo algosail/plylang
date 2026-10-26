@@ -36,11 +36,11 @@ No parameters. The values are `true` and `false`. Those two arms cover `Bool`.
 
 JavaScript emits a boolean.
 
-## Void
+## Unit
 
-No parameters. The only value is the word [`Void`](Words.md#void). JavaScript emits `undefined`.
+No parameters. The only value is the word [`Unit`](Words.md#unit). JavaScript emits `undefined`.
 
-That word is also the constructor, so `Void ->` matches the value.
+That word is also the constructor, so `Unit ->` matches the value.
 
 ## Array
 

@@ -130,6 +130,7 @@ pub enum Error {
     Os(String),
     Frozen,
     Arity,
+    EntryWord,
 }
 
 impl Error {
@@ -346,6 +347,7 @@ impl Error {
             Os(detail) => ("PL0112", detail.clone()),
             Frozen => static_text("PL0113", "frozen"),
             Arity => static_text("PL0114", "arity"),
+            EntryWord => static_text("PL0115", "word main must have scheme ( -- Unit )"),
         }
     }
 }
@@ -592,8 +594,13 @@ mod tests {
             (Error::Os("disk full".into()), "disk full", "PL0112"),
             (Error::Frozen, "frozen", "PL0113"),
             (Error::Arity, "arity", "PL0114"),
+            (
+                Error::EntryWord,
+                "word main must have scheme ( -- Unit )",
+                "PL0115",
+            ),
         ];
-        assert_eq!(samples.len(), 114);
+        assert_eq!(samples.len(), 115);
         for (error, message, code) in samples {
             assert_eq!(error.code(), code, "{message}");
             assert_eq!(error.message(), message);

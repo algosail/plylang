@@ -1,6 +1,8 @@
 //! `plylang build` compiles a package: resolve imports, write `.js` and `.d.ply`.
 //! `plylang build --exports` then replaces the `exports` field with those modules.
 //! `plylang check` runs that compile and writes nothing.
+//! A word named `main` with scheme `( -- Unit )` is called at the bottom of its
+//! module when Node starts that file.
 //!
 //! A local import is a module path such as `Data/Either`. A package import is
 //! `@scope/name/...` or an unscoped `name/...`. `plylang check --js` prints the
@@ -14,7 +16,7 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 
 use crate::anf::{js_ident, referenced_words, AnfModule};
-use crate::ast::{scheme_string, Import, Item, Module};
+use crate::ast::{scheme_string, Def, Import, Item, Module, Type};
 use crate::check::{
     check, check_with_imports, collect_sites, collect_sites_with_imports, KnownModule,
     ResolvedImport, StackAt,
@@ -65,6 +67,9 @@ struct Unit {
     color: Color,
     deps: Vec<usize>,
 }
+
+/// Word that starts its module when Node runs the compiled file. Scheme `( -- Unit )`.
+const ENTRY_WORD: &str = "main";
 
 pub(crate) struct Package {
     pub(crate) root: PathBuf,
@@ -181,7 +186,8 @@ fn snippet_javascript(path: &Path) -> Result<String, BuildError> {
     let source = fs::read_to_string(path).map_err(|error| os_error(path, error))?;
     let module = parse(&source, mode_from_path(&path.to_string_lossy()))
         .map_err(|error| located(path, &source, error))?;
-    crate::check::javascript(&module).map_err(|error| located(path, &source, error))
+    let js = crate::check::javascript(&module).map_err(|error| located(path, &source, error))?;
+    apply_entry(path, &source, &module, js)
 }
 
 /// Check one editor buffer. Inside a package, imports resolve as in `plylang build`.
@@ -194,6 +200,9 @@ pub fn check_buffer(path: &Path, source: &str) -> Result<(), Diagnostic> {
         ParseMode::Source
     };
     let module = parse(source, mode)?;
+    if mode == ParseMode::Source {
+        reject_bad_entry(&module)?;
+    }
     let Some(root) = find_ply_root(path) else {
         return check(&module);
     };
@@ -613,6 +622,11 @@ impl Session {
         let header = self.js_header(id, &js_path, &checked.anf);
         let body = checked.anf.javascript();
         let js = combine(&header, &body);
+        let js = match entry_def(&module) {
+            Some(def) if accepts_entry(def) => with_entry_guard(js),
+            Some(def) => return Err(self.fail(id, def.name_span, Error::EntryWord)),
+            None => js,
+        };
         let iface = interface_text(&module);
         self.outputs.push(Output {
             js_path,
@@ -1949,6 +1963,91 @@ fn pkg_error(path: &Path, source: &str, error: Error) -> BuildError {
     located(path, source, Diagnostic::new(Span::new(0, 0), error))
 }
 
+fn reject_bad_entry(module: &Module) -> Result<(), Diagnostic> {
+    match entry_def(module) {
+        Some(def) if !accepts_entry(def) => Err(Diagnostic::new(def.name_span, Error::EntryWord)),
+        _ => Ok(()),
+    }
+}
+
+fn apply_entry(
+    path: &Path,
+    source: &str,
+    module: &Module,
+    js: String,
+) -> Result<String, BuildError> {
+    match entry_def(module) {
+        Some(def) if accepts_entry(def) => Ok(with_entry_guard(js)),
+        Some(def) => Err(located(
+            path,
+            source,
+            Diagnostic::new(def.name_span, Error::EntryWord),
+        )),
+        None => Ok(js),
+    }
+}
+
+fn entry_def(module: &Module) -> Option<&Def> {
+    module.items.iter().find_map(|item| match item {
+        Item::Def(def) if def.name == ENTRY_WORD => Some(def),
+        _ => None,
+    })
+}
+
+/// `( -- Unit )`, including a private word. No constraints, no effects, no inputs.
+fn accepts_entry(def: &Def) -> bool {
+    let scheme = &def.scheme;
+    if !scheme.constraints.is_empty() || scheme.effect.effects.is_some() {
+        return false;
+    }
+    scheme.effect.input.items.is_empty()
+        && matches!(
+            scheme.effect.output.items.as_slice(),
+            [Type::Ctor(name)] if name == "Unit"
+        )
+}
+
+fn with_entry_guard(js: String) -> String {
+    let (import_line, call) = entry_pieces(&js);
+    let mut js = format!("{import_line}{js}");
+    if !js.ends_with('\n') {
+        js.push('\n');
+    }
+    js.push_str(&call);
+    js
+}
+
+fn entry_pieces(js: &str) -> (String, String) {
+    let mut used = Vec::new();
+    let realpath = take_js_name(js, &mut used, "plyRealpath");
+    let path_to_file = take_js_name(js, &mut used, "plyPathToFileURL");
+    let flag = take_js_name(js, &mut used, "plyIsEntry");
+    let call = js_ident(ENTRY_WORD);
+    let import_line = format!(
+        "import {{ realpathSync as {realpath} }} from \"node:fs\";\nimport {{ pathToFileURL as {path_to_file} }} from \"node:url\";\n"
+    );
+    let guard = format!(
+        "let {flag} = import.meta.main === true;\nif (import.meta.main === undefined && process.argv[1]) {{\n  try {{\n    {flag} = import.meta.url === {path_to_file}({realpath}(process.argv[1])).href;\n  }} catch {{\n    {flag} = false;\n  }}\n}}\nif ({flag}) {call}();\n"
+    );
+    (import_line, guard)
+}
+
+fn take_js_name(js: &str, used: &mut Vec<String>, base: &str) -> String {
+    let mut name = base.to_string();
+    let mut n = 2u32;
+    while js_word(js, &name) || used.iter().any(|have| have == &name) {
+        name = format!("{base}{n}");
+        n += 1;
+    }
+    used.push(name.clone());
+    name
+}
+
+fn js_word(js: &str, name: &str) -> bool {
+    js.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|word| word == name)
+}
+
 pub(crate) fn io_error(path: &Path, error: Error) -> BuildError {
     let detail = error.message();
     let code = error.code();
@@ -2284,7 +2383,7 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{build, build_exports, exported_arity, relative_specifier, JsExport};
+    use super::{build, build_exports, check_package, exported_arity, relative_specifier, JsExport};
 
     struct Temp(PathBuf);
 
@@ -2725,6 +2824,47 @@ mod tests {
     }
 
     #[test]
+    fn a_dependency_interface_installs_superclasses_first() {
+        let temp = Temp::new("super");
+        temp.write(
+            "node_modules/@algosail/cls/package.json",
+            r#"{
+  "name": "@algosail/cls",
+  "type": "module",
+  "ply": { "source": "src", "foreign": "foreign", "out": "dist", "language": 1 },
+  "exports": {
+    "./Mappable": { "ply": "./dist/Mappable.d.ply", "import": "./dist/Mappable.js" },
+    "./Applicable": { "ply": "./dist/Applicable.d.ply", "import": "./dist/Applicable.js" },
+    "./Wrappable": { "ply": "./dist/Wrappable.d.ply", "import": "./dist/Wrappable.js" }
+  }
+}"#,
+        );
+        temp.write(
+            "node_modules/@algosail/cls/dist/Mappable.d.ply",
+            "language 1\n\n& Mappable f\n  map ( a b. (f a) (a -- b) -- (f b) )\n",
+        );
+        temp.write(
+            "node_modules/@algosail/cls/dist/Applicable.d.ply",
+            "language 1\n~ \"Mappable\" (Mappable)\n\n& Mappable f => Applicable f\n  apply ( a b. (f a) (f (a -- b)) -- (f b) )\n",
+        );
+        temp.write(
+            "node_modules/@algosail/cls/dist/Wrappable.d.ply",
+            "language 1\n~ \"Applicable\" (Applicable)\n\n& Applicable f => Wrappable f\n  wrap ( a -- (f a) )\n",
+        );
+        temp.write(
+            "package.json",
+            &package_json(
+                r#""./App": { "ply": "./dist/App.d.ply", "import": "./dist/App.js" }"#,
+            ),
+        );
+        temp.write(
+            "src/App.ply",
+            "~ \"@algosail/cls/Wrappable\" (Wrappable, wrap)\n\n: use ( f a. Wrappable f => a -- (f a) )\n  wrap\n",
+        );
+        check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+    }
+
+    #[test]
     fn local_import_is_checked_and_called() {
         let temp = Temp::new("local");
         temp.write(
@@ -3144,6 +3284,124 @@ mod tests {
         );
         let error = build(&temp.0).unwrap_err();
         assert_eq!(error.message, "~ \"Data/Io\" does not export secret");
+    }
+
+    #[test]
+    fn main_runs_from_node_and_an_import_does_not_call_it() {
+        let temp = Temp::new("entry-main");
+        temp.write("package.json", &package_json(""));
+        temp.write(
+            "src/App.ply",
+            ": foreign touch ( -- Unit )\n\n: private main ( -- Unit )\n  touch\n",
+        );
+        temp.write(
+            "src/Tool.ply",
+            ": foreign touch ( -- Unit )\n\n: main ( -- Unit )\n  touch\n",
+        );
+        temp.write("src/Other.ply", ": idle ( -- Unit )\n  Unit\n");
+        let app_mark = temp.0.join("app.txt");
+        let tool_mark = temp.0.join("tool.txt");
+        temp.write("foreign/App.js", &touch_js(&app_mark));
+        temp.write("foreign/Tool.js", &touch_js(&tool_mark));
+        check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        assert!(!temp.0.join("dist").exists());
+        build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+
+        let app = fs::read_to_string(temp.0.join("dist/App.js")).unwrap();
+        assert!(app.contains("function main("), "{app}");
+        assert!(!app.contains("export function main("), "{app}");
+        assert!(app.contains("if (plyIsEntry) main();"), "{app}");
+        assert!(!app.lines().any(|line| line.trim() == "main();"), "{app}");
+        let tool = fs::read_to_string(temp.0.join("dist/Tool.js")).unwrap();
+        assert!(tool.contains("export function main("), "{tool}");
+        assert!(tool.contains("if (plyIsEntry) main();"), "{tool}");
+        let other = fs::read_to_string(temp.0.join("dist/Other.js")).unwrap();
+        assert!(!other.contains("import.meta.main"), "{other}");
+        assert!(!temp.0.join("dist/run.js").exists());
+
+        let importer = temp.0.join("use.mjs");
+        fs::write(
+            &importer,
+            "import \"./dist/App.js\";\nimport { main } from \"./dist/Tool.js\";\nif (typeof main !== \"function\") throw new Error(\"main\");\n",
+        )
+        .unwrap();
+        let imported = Command::new("node").arg(&importer).current_dir(&temp.0).output().unwrap();
+        assert!(
+            imported.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&imported.stderr)
+        );
+        assert!(!app_mark.exists(), "import called private main");
+        assert!(!tool_mark.exists(), "import called main");
+
+        let app_run = Command::new("node")
+            .arg(temp.0.join("dist/App.js"))
+            .output()
+            .unwrap();
+        assert!(app_run.status.success(), "{}", String::from_utf8_lossy(&app_run.stderr));
+        assert_eq!(fs::read_to_string(&app_mark).unwrap(), "ran\n");
+        assert!(!tool_mark.exists());
+        let tool_run = Command::new("node")
+            .arg(temp.0.join("dist/Tool.js"))
+            .output()
+            .unwrap();
+        assert!(tool_run.status.success(), "{}", String::from_utf8_lossy(&tool_run.stderr));
+        assert_eq!(fs::read_to_string(&tool_mark).unwrap(), "ran\n");
+
+        temp.write(
+            "src/Tool.ply",
+            ": foreign boom ( -- Unit )\n\n: main ( -- Unit )\n  boom\n",
+        );
+        temp.write(
+            "foreign/Tool.js",
+            "export function boom() { throw new Error(\"boom\"); }\n",
+        );
+        build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let thrown = Command::new("node")
+            .arg(temp.0.join("dist/Tool.js"))
+            .output()
+            .unwrap();
+        assert_eq!(thrown.status.code(), Some(1));
+    }
+
+    #[test]
+    fn main_accepts_only_the_unit_scheme() {
+        let temp = Temp::new("entry-scheme");
+        temp.write("package.json", &package_json(""));
+        temp.write("src/App.ply", ": main ( . -- . Unit )\n  Unit\n");
+        check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        temp.write("src/App.ply", ": main ( ..s -- ..s Unit )\n  Unit\n");
+        check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        temp.write("src/App.ply", ": start ( -- Unit )\n  Unit\n");
+        check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let js = fs::read_to_string(temp.0.join("dist/App.js")).unwrap();
+        assert!(!js.contains("import.meta.main"), "{js}");
+
+        temp.write("src/App.ply", ": main ( -- Num )\n  1\n");
+        let error = check_package(&temp.0).unwrap_err();
+        assert_eq!(error.code, "PL0115");
+        assert_eq!(error.message, "word main must have scheme ( -- Unit )");
+        assert!(error.render().contains("App.ply"), "{}", error.render());
+        temp.write("src/App.ply", ": main ( a. a -- a Unit )\n  Unit\n");
+        let error = check_package(&temp.0).unwrap_err();
+        assert_eq!(error.code, "PL0115");
+
+        let lone = Temp::new("entry-snippet");
+        lone.write("App.ply", ": main ( -- Unit )\n  Unit\n");
+        let js = super::javascript_file(&lone.0.join("App.ply"))
+            .unwrap_or_else(|error| panic!("{}", error.render()));
+        assert!(js.contains("if (plyIsEntry) main();"), "{js}");
+        lone.write("App.ply", ": main ( -- Num )\n  1\n");
+        let error = super::javascript_file(&lone.0.join("App.ply")).unwrap_err();
+        assert_eq!(error.code, "PL0115");
+    }
+
+    fn touch_js(mark: &std::path::Path) -> String {
+        let mark_lit = serde_json::to_string(&mark.to_string_lossy().into_owned()).unwrap();
+        format!(
+            "import {{ appendFileSync }} from \"node:fs\";\nexport function touch() {{ appendFileSync({mark_lit}, \"ran\\n\"); }}\n"
+        )
     }
 
     fn node(dir: &std::path::Path, script: &str) {

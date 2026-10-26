@@ -39,11 +39,11 @@ Five built-in types and two constructors of arity 1 are visible in every module.
 | `Int` | `0n`, `42n`, `-42n` | `bigint` |
 | `Str` | `"hi"`, `"a\nb"` | string |
 | `Bool` | `true`, `false` | boolean |
-| `Void` | the word `Void` | `undefined` |
+| `Unit` | the word `Unit` | `undefined` |
 
 `(Array a)` is an array. `(StrMap a)` is a dictionary with a string key. Bare digits are `Num`, an ordinary number in JavaScript. `Int` is written with the suffix `n` and becomes a `bigint`. In the examples below a number is `Num`. `1.0` is a number. `1.` is the number `1` and a separate dot. A string accepts `\\`, `\"`, `\n`, `\t`, and `\r`.
 
-`Void` is both a type and a word. The word puts the single value of that type.
+`Unit` is both a type and a word. The word puts the single value of that type.
 
 Operations on these values are imported. This text does not list them.
 
@@ -287,7 +287,7 @@ The order in the example is the dictionary, the key, and the value on top.
 
 The instance for numbers is declared in the `Num` module. `()` brings the instances of that module and brings no names. The empty import of `Num` gives `same` that instance.
 
-A hand-written instance is a word for each method. A module may write one when it defines the class, the type, or the wrapper in the head, or when the head contains a built-in constructor `Int`, `Num`, `Bool`, `Str`, `Void`, `Array`, or `StrMap`.
+A hand-written instance is a word for each method. A module may write one when it defines the class, the type, or the wrapper in the head, or when the head contains a built-in constructor `Int`, `Num`, `Bool`, `Str`, `Unit`, `Array`, or `StrMap`.
 
 ```ply
 & Equal a
@@ -365,6 +365,8 @@ plylang check --js <file>
 ```
 
 `plylang check` checks a package the same way `build` does: every file under `ply.source`, the imports, and `foreign`. It writes no files. The default directory is the current one. After the same check, `plylang build` writes a `.js` file and a `.d.ply` interface into `ply.out`. `plylang build --exports` replaces the `exports` field of `package.json` with entries for the built modules. A key is `./` followed by the module path. `ply` points at the `.d.ply`, and `import` points at the `.js`. The other fields of the file stay as they were. With this flag an import of the package's own module succeeds even when that entry was not there yet. Without the flag the entry must already be present in `exports`.
+
+A word named `main` whose scheme is `( -- Unit )` is the program of that module. It may be `private`. `build` calls it at the bottom of that module's `.js`, and only when Node started that file. `node dist/App.js` runs the program. An import of the module does not. A `package.json` script can name that file. Several modules may each have a `main`. A module without one is a library. Any other scheme on the name `main` is an error.
 
 `plylang docs` writes `DOCS.md` at the package root. `--out` names another file. A module heading is the string used to import it: the package name and the path, or only the path when there is no name. The prose comes from `..`. Inside a module the sections are `Types`, `Classes`, `Instances`, and `Words`. An empty section is left out. The name of a type, a class, or a word is a heading under its section. `Instances` is a list of `#` heads, with no comment and no method bindings.
 

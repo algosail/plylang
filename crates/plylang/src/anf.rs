@@ -179,7 +179,7 @@ impl AnfModule {
     pub fn javascript(&self) -> String {
         let mut out = String::new();
         if self.needs_unit {
-            out.push_str("const Void = undefined;\n");
+            out.push_str("const Unit = undefined;\n");
         }
         for data in &self.datas {
             for ctor in &data.ctors {

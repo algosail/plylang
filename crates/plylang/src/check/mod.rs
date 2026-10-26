@@ -332,7 +332,7 @@ enum Edit {
 struct CtorInfo {
     name: String,
     fields: Vec<TyId>,
-    /// Constructor word. Filled for every data type except builtin Void.
+    /// Constructor word. Filled for every data type except builtin Unit.
     word: Option<SemScheme>,
 }
 
@@ -548,11 +548,11 @@ impl Checker {
 
     fn install_unit(&mut self) {
         self.datas.insert(
-            "Void".to_string(),
+            "Unit".to_string(),
             DataType {
                 params: Vec::new(),
                 ctors: vec![CtorInfo {
-                    name: "Void".to_string(),
+                    name: "Unit".to_string(),
                     fields: Vec::new(),
                     word: None,
                 }],
@@ -560,7 +560,7 @@ impl Checker {
                 origin: "*builtin*".to_string(),
             },
         );
-        self.installed.insert("Void".to_string());
+        self.installed.insert("Unit".to_string());
     }
 
     fn load_aliases(&mut self, names: &[&str], signature: &str) {
@@ -4619,9 +4619,14 @@ fn visit_dependency(index: usize, edges: &[Vec<usize>], seen: &mut [bool], order
     order.push(index);
 }
 
-/// `Ply/Applicable.ply` and `Ply/Applicable` both key as `Applicable`.
+/// `Ply/Applicable.ply`, `dist/Ply/Applicable.d.ply`, and `Ply/Applicable`
+/// all key as `Applicable`. An interface path has to lose `.d.ply` whole.
+/// Stripping `.ply` first leaves `Applicable.d`, and the superclass is missed.
 fn file_key(path: &str) -> String {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    if let Some(stem) = name.strip_suffix(".d.ply") {
+        return stem.to_string();
+    }
     name.strip_suffix(".ply").unwrap_or(name).to_string()
 }
 
@@ -4963,8 +4968,8 @@ mod tests {
         ok(": flag ( -- Bool )\n  true");
         ok(": label ( -- Str )\n  \"hi\"");
         ok(": half ( (Num) (Num) -- Num )\n  drop");
-        ok(": unit_value ( -- Void )\n  Void");
-        ok(": match_unit ( Void -- Int )\n  Void -> 1n");
+        ok(": unit_value ( -- Unit )\n  Unit");
+        ok(": match_unit ( Unit -- Int )\n  Unit -> 1n");
         ok(": maybe_int ( (Maybe Int) -- Int )\n  Nothing -> 0n\n  Just ->\n\n; Maybe a = Nothing | Just a");
         ok(": foreign add ( (Int) (Int) -- Int )\n\n: use ( (Int) (Int) -- Int )\n  add");
         ok(": ignore_quote ( a. a -- a )\n  [ drop ] drop");
@@ -5334,6 +5339,49 @@ mod tests {
             },
             super::KnownModule {
                 origin: "Ply/Applicable.ply".to_string(),
+                module: applicable,
+            },
+        ];
+        super::check_with_imports(
+            &consumer,
+            &[super::ResolvedImport {
+                provider: &flat,
+                import: &consumer.imports[0],
+                known: &known,
+            }],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_interface_file_installs_the_superclass_first() {
+        let mappable = parse(
+            "& Mappable f\n  map ( a b. (f a) (a -- b) -- (f b) )\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let applicable = parse(
+            "~ \"Ply/Mappable\" (Mappable)\n\n& Mappable f => Applicable f\n  apply ( a b. (f a) (f (a -- b)) -- (f b) )\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let flat = parse(
+            "~ \"Ply/Applicable\" (Applicable)\n\n& Applicable f => Flatmappable f\n  flatmap ( a b. (f a) (a -- (f b)) -- (f b) )\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let consumer = parse("~ \"Ply/Flatmappable\" (Flatmappable)\n", ParseMode::Source).unwrap();
+        let known = vec![
+            super::KnownModule {
+                origin: "/deps/dist/Ply/Flatmappable.d.ply".to_string(),
+                module: flat.clone(),
+            },
+            super::KnownModule {
+                origin: "/deps/dist/Ply/Mappable.d.ply".to_string(),
+                module: mappable,
+            },
+            super::KnownModule {
+                origin: "/deps/dist/Ply/Applicable.d.ply".to_string(),
                 module: applicable,
             },
         ];
