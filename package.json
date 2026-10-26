@@ -1,0 +1,48 @@
+{
+  "name": "@plylang/plylang",
+  "version": "1.0.0",
+  "description": "Ply compiler and language server",
+  "license": "MIT",
+  "author": "Algosail",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/algosail/plylang.git"
+  },
+  "homepage": "https://github.com/algosail/plylang#readme",
+  "bugs": "https://github.com/algosail/plylang/issues",
+  "keywords": [
+    "ply",
+    "plylang",
+    "compiler",
+    "language-server"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "plylang": "bin/plylang.js",
+    "plylang-ls": "bin/plylang-ls.js"
+  },
+  "files": [
+    "bin/plylang.js",
+    "bin/plylang-ls.js",
+    "bin/native.js"
+  ],
+  "optionalDependencies": {
+    "@plylang/plylang-darwin-arm64": "1.0.0",
+    "@plylang/plylang-darwin-x64": "1.0.0",
+    "@plylang/plylang-linux-arm64": "1.0.0",
+    "@plylang/plylang-linux-x64": "1.0.0",
+    "@plylang/plylang-win32-arm64": "1.0.0",
+    "@plylang/plylang-win32-x64": "1.0.0"
+  },
+  "scripts": {
+    "build": "cargo build --release",
+    "test": "cargo test",
+    "test:launcher": "node --test bin/native.test.js script/stage-native.test.js"
+  }
+}
