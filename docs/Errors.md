@@ -958,3 +958,13 @@ Fix: if this text is the diagnostic you see, report it as a compiler bug. An ins
 A word named `main` is the program of its module. The scheme has no constraints and no effects, takes no inputs, and returns `Unit`. `private` is allowed. Any other scheme is this error. A module with no word named `main` is a library module.
 
 Fix: write `: main ( -- Unit )` and a body that returns `Unit`, or rename the word. `( . -- . Unit )` and `( ..s -- ..s Unit )` are the same shape and are accepted.
+
+**Foreign data**
+
+## PL0116
+
+`foreign type has no constructors`
+
+`; foreign` names a type whose values come from JavaScript. The declaration ends after the name and its parameters. `=`, `==`, or a constructor name after that is this error.
+
+Fix: write `; foreign Hub a`. A type that has constructors is an ordinary `;` declaration.

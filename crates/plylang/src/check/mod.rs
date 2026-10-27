@@ -5668,6 +5668,48 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_type_is_indexed_by_its_parameter() {
+        ok("\
+; foreign Hub a
+
+: foreign make ( a. -- (Hub a) )
+
+: pass ( (Hub a) -- (Hub a) )
+  hub -> hub
+
+& Tag a
+  tag ( a -- Str )
+
+: tagHub ( a. (Hub a) -- Str )
+  drop \"hub\"
+
+# Tag (Hub a)
+  tag = tagHub
+");
+        err(
+            "\
+; foreign Hub a
+
+: bad ( (Hub a) -- (Hub a) )
+  Listeners -> Listeners
+",
+            "constructor Listeners is not a constructor of Hub",
+        );
+        err(
+            "\
+; foreign Hub a
+
+: foreign num ( -- (Hub Num) )
+: foreign text ( -- (Hub Str) )
+
+: mix ( -- (Hub Num) )
+  text
+",
+            "type mismatch: expected Num, found Str",
+        );
+    }
+
+    #[test]
     fn a_closed_record_tail_splices_and_plus_inserts() {
         ok("- Person { name : Str, age : Num }\n- PersonWithCity { city : Str | Person }\n\n: inParis ( Person -- PersonWithCity )\n  \"Paris\" +city\n");
         ok("- Person { name : Str, age : Num }\n- PersonWithCity { city : Str | Person }\n\n: withCity ( Person Str -- PersonWithCity )\n  +city\n");

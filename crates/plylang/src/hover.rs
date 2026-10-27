@@ -265,6 +265,16 @@ fn synonym_or_ctor(module: &Module, name: &str) -> Option<Declared> {
         }
     }
     for item in &module.items {
+        if let Item::Data(data) = item {
+            if data.foreign && data.name == name {
+                return Some(Declared {
+                    line: foreign_type_line(data),
+                    doc: data.doc.clone(),
+                });
+            }
+        }
+    }
+    for item in &module.items {
         if let Item::Synonym(synonym) = item {
             if synonym.name == name {
                 return Some(declared_synonym(synonym));
@@ -272,6 +282,15 @@ fn synonym_or_ctor(module: &Module, name: &str) -> Option<Declared> {
         }
     }
     class_scheme(module, name)
+}
+
+fn foreign_type_line(data: &Data) -> String {
+    let mut out = format!("; foreign {}", data.name);
+    for param in &data.params {
+        out.push(' ');
+        out.push_str(param);
+    }
+    out
 }
 
 fn declared_synonym(synonym: &Synonym) -> Declared {
@@ -464,6 +483,24 @@ mod tests {
         assert_eq!(
             hovered.contents,
             "```ply\nNothing : -- (Maybe a)\n```\n\nA value that may be missing."
+        );
+    }
+
+    #[test]
+    fn hovers_a_foreign_type() {
+        let source = ".. A listener list.\n; foreign Hub a\n\n: keep ( (Hub a) -- (Hub a) )\n  hub -> hub\n";
+        let declared = at(source, "Hub a");
+        let hovered = hover(source, Path::new("M.ply"), declared.0, declared.1).unwrap();
+        assert_eq!(
+            hovered.contents,
+            "```ply\n; foreign Hub a\n```\n\nA listener list."
+        );
+        let used = source.rfind("Hub").unwrap();
+        let (line, character) = at_offset(source, used);
+        let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert_eq!(
+            hovered.contents,
+            "```ply\n; foreign Hub a\n```\n\nA listener list."
         );
     }
 

@@ -131,6 +131,7 @@ pub enum Error {
     Frozen,
     Arity,
     EntryWord,
+    ForeignType,
 }
 
 impl Error {
@@ -348,6 +349,7 @@ impl Error {
             Frozen => static_text("PL0113", "frozen"),
             Arity => static_text("PL0114", "arity"),
             EntryWord => static_text("PL0115", "word main must have scheme ( -- Unit )"),
+            ForeignType => static_text("PL0116", "foreign type has no constructors"),
         }
     }
 }
@@ -599,8 +601,13 @@ mod tests {
                 "word main must have scheme ( -- Unit )",
                 "PL0115",
             ),
+            (
+                Error::ForeignType,
+                "foreign type has no constructors",
+                "PL0116",
+            ),
         ];
-        assert_eq!(samples.len(), 115);
+        assert_eq!(samples.len(), 116);
         for (error, message, code) in samples {
             assert_eq!(error.code(), code, "{message}");
             assert_eq!(error.message(), message);

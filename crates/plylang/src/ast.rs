@@ -35,6 +35,9 @@ pub struct Data {
     pub name: String,
     pub params: Vec<String>,
     pub ctors: Vec<Ctor>,
+    /// No constructors and no JavaScript. Values come from foreign words.
+    /// A parameter indexes that value and is not a field.
+    pub foreign: bool,
     /// One constructor, one field, nominal, and free in JavaScript.
     pub newtype: bool,
     /// Text of the `..` lines directly above this declaration. Empty if there are none.
@@ -311,9 +314,16 @@ impl fmt::Display for Item {
 impl fmt::Display for Data {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_doc(formatter, &self.doc)?;
-        write!(formatter, "; {}", self.name)?;
+        write!(formatter, "; ")?;
+        if self.foreign {
+            write!(formatter, "foreign ")?;
+        }
+        write!(formatter, "{}", self.name)?;
         for param in &self.params {
             write!(formatter, " {param}")?;
+        }
+        if self.foreign {
+            return Ok(());
         }
         if self.newtype {
             write!(formatter, " == ")?;

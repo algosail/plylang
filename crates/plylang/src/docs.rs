@@ -246,10 +246,17 @@ fn format_word(def: &Def) -> String {
 }
 
 fn format_data(data: &Data) -> String {
-    let mut out = format!("; {}", data.name);
+    let mut out = String::from("; ");
+    if data.foreign {
+        out.push_str("foreign ");
+    }
+    out.push_str(&data.name);
     for param in &data.params {
         out.push(' ');
         out.push_str(param);
+    }
+    if data.foreign {
+        return out;
     }
     if data.newtype {
         out.push_str(" == ");

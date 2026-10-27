@@ -519,6 +519,14 @@ fn synonym_detail(synonym: &crate::ast::Synonym) -> String {
 }
 
 fn type_detail(data: &Data) -> String {
+    if data.foreign {
+        let mut out = format!("foreign {}", data.name);
+        for param in &data.params {
+            out.push(' ');
+            out.push_str(param);
+        }
+        return out;
+    }
     if data.params.is_empty() {
         String::new()
     } else {

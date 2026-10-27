@@ -60,3 +60,15 @@ A pattern has one fixed length. `<>` matches only the empty array. One length do
 ## StrMap
 
 One parameter, written `(StrMap a)`. The key is `Str`. The program chooses the key when it runs, and the type does not name that key. A value of this type comes from an imported word.
+
+## Foreign data
+
+`; foreign` declares a type with no constructors. JavaScript emits nothing for it. The values come from `: foreign` words.
+
+A parameter indexes the value. `(Hub Num)` and `(Hub Str)` are different types. The parameter is not a field.
+
+```ply
+; foreign Hub a
+```
+
+A name binds the value. There is no constructor to match. Writing `=`, `==`, or a constructor is [PL0116](Errors.md#pl0116).

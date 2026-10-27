@@ -238,14 +238,19 @@ fn def_export(def: &AnfDef) -> String {
         .map(|id| local_name(*id))
         .collect::<Vec<_>>()
         .join(", ");
-    let keyword = if def.export {
+    // `export function new` is illegal. Define `ply_new` and export it as `new`.
+    let keyword = if def.export && name == def.name {
         "export function"
     } else {
         "function"
     };
     let mut body = String::new();
     write_expr(&mut body, &def.body, 1, true);
-    format!("{keyword} {name}({params}) {{\n{body}}}")
+    let mut out = format!("{keyword} {name}({params}) {{\n{body}}}");
+    if def.export && name != def.name {
+        out.push_str(&format!("\nexport {{ {name} as {} }};", def.name));
+    }
+    out
 }
 
 fn write_expr(out: &mut String, expr: &Expr, indent: usize, ret: bool) {

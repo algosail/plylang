@@ -120,7 +120,7 @@ impl Checker {
             .items
             .iter()
             .filter_map(|item| match item {
-                Item::Data(data) => Some(AnfData {
+                Item::Data(data) if !data.ctors.is_empty() => Some(AnfData {
                     ctors: data
                         .ctors
                         .iter()
@@ -272,6 +272,11 @@ impl Checker {
                         name: name.clone(),
                     },
                 });
+                // A field may be a quotation. `call` needs the arity on this local,
+                // the same way a pattern bind and a parameter already record it.
+                if let Some(ty) = self.cons_tys(output).last().copied() {
+                    self.note_fn(id, ty);
+                }
                 frame.stack.push(Operand::Local(id));
                 output
             }
@@ -524,7 +529,10 @@ impl Checker {
         match lowering {
             Some(Lowering::Call) => {
                 self.known_arity(input, span)?;
-                self.lower_call(frame);
+                let produced = self.lower_call(frame);
+                // `call` returns `..t`, so the result types sit in that tail.
+                // A result may itself be a quotation. A later `call` needs its arity.
+                self.note_produced(output, produced, frame);
                 return Ok(output);
             }
             Some(Lowering::Dip { under }) => {
@@ -799,13 +807,14 @@ impl Checker {
         }));
     }
 
-    fn lower_call(&mut self, frame: &mut Frame) {
+    fn lower_call(&mut self, frame: &mut Frame) -> usize {
         let quote = frame.pop_one(self);
-        let (arity, _) = self.quote_arity(&quote);
+        let (arity, produced) = self.quote_arity(&quote);
         let base = take_base(self, frame, arity);
         let expr = self.reduce_quote(quote, base);
         frame.lets.extend(expr.lets);
         frame.stack = expr.result.into_iter().map(Operand::Local).collect();
+        produced
     }
 
     fn lower_dip(&mut self, frame: &mut Frame, under: usize) {
@@ -1433,6 +1442,29 @@ impl Checker {
                     return items;
                 }
             }
+        }
+    }
+
+    /// The top `produced` locals are `call`'s results. `output` is the whole
+    /// stack after the call, including values the quotation left in place.
+    fn note_produced(&mut self, output: StackId, produced: usize, frame: &Frame) {
+        if produced == 0 || frame.stack.len() < produced {
+            return;
+        }
+        let types = self.cons_tys(output);
+        if types.len() < produced {
+            return;
+        }
+        let type_start = types.len() - produced;
+        let stack_start = frame.stack.len() - produced;
+        for (operand, ty) in frame.stack[stack_start..].iter().zip(&types[type_start..]) {
+            let Operand::Local(id) = operand else {
+                continue;
+            };
+            let Some(arity) = self.fun_arity(*ty) else {
+                continue;
+            };
+            self.fn_arity.insert(*id, arity);
         }
     }
 
@@ -2191,6 +2223,62 @@ if (addOne(4) !== 5) throw new Error("addOne");
     }
 
     #[test]
+    fn call_runs_a_quotation_returned_by_call() {
+        run(
+            r#"
+: applyTo ( a b. ( -- a ) ( -- (a -- b) ) -- b )
+  act getF ->
+    act call getF call call
+
+: later ( a b. ( -- a ) ( -- (a -- b) ) -- ( -- b ) )
+  act getF ->
+    [ act call getF call call ]
+"#,
+            r#"
+const result = applyTo(() => 1, () => (n) => n + 1);
+if (result !== 2) throw new Error("applyTo " + result);
+const suspended = later(() => 1, () => (n) => n + 1);
+if (suspended() !== 2) throw new Error("later " + suspended());
+"#,
+        );
+    }
+
+    #[test]
+    fn reserved_name_is_exported_as_the_ply_word() {
+        assert_eq!(
+            js(": new ( Num -- Num )\n  dup drop"),
+            "\
+function ply_new(v0) {
+  return v0;
+}
+export { ply_new as new };
+"
+        );
+    }
+
+    #[test]
+    fn call_runs_a_function_read_from_a_record() {
+        run(
+            r#"
+- Task { go : (Num -- Num) }
+
+: runTask ( Task Num -- Num )
+  task n ->
+    n task /go call
+
+: later ( Task Num -- ( -- Num ) )
+  task n ->
+    [ n task /go call ]
+"#,
+            r#"
+const task = { go: (n) => n + 1 };
+if (runTask(task, 3) !== 4) throw new Error("runTask");
+if (later(task, 3)() !== 4) throw new Error("later");
+"#,
+        );
+    }
+
+    #[test]
     fn call_runs_a_quotation_returned_by_a_word() {
         assert_eq!(
             js(
@@ -2340,6 +2428,33 @@ if (movedTo.city !== "Paris" || movedTo.zip !== "75001" || movedTo.name !== "Ada
         assert!(indexed.contains("at(v"));
         assert!(!indexed.contains("function at"));
         assert!(!indexed.contains("array index out of range"));
+    }
+
+    #[test]
+    fn a_foreign_type_emits_nothing() {
+        let code = js(
+            "; foreign Hub a\n; Box = Box\n\n: pass ( (Hub a) -- (Hub a) )\n  hub -> hub\n",
+        );
+        assert_eq!(
+            code,
+            "export const Box = { tag: \"Box\" };\n\nexport function pass(v0) {\n  let v1;\n  v1 = v0;\n  return v1;\n}\n"
+        );
+        run(
+            r#"
+; foreign Box a
+
+: foreign make ( a. a -- (Box a) )
+: foreign open ( a. (Box a) -- a )
+
+: round ( a. a -- a )
+  make open
+"#,
+            r#"
+function make(value) { return { value }; }
+function open(box) { return box.value; }
+if (round(7) !== 7) throw new Error("round");
+"#,
+        );
     }
 
     #[test]

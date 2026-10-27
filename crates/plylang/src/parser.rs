@@ -238,11 +238,32 @@ impl Parser {
 
     fn parse_data(&mut self) -> Result<Data, Diagnostic> {
         let start = self.last_span;
+        // `; foreign Name params` has no constructors. The value comes from JS.
+        let foreign = self.eat(&TokenKind::Foreign);
         let name_span = self.cur().span;
         let name = self.expect_upper(Error::ExpectedTypeName)?;
         let mut params = Vec::new();
         while self.is_lower_ident() && !self.cur().line_start {
             params.push(self.expect_lower(Error::ExpectedTypeVariable)?);
+        }
+        if foreign {
+            self.skip_newlines();
+            if self.is_eof()
+                || self.is_item_start()
+                || self.is(TokenKind::Doc(String::new()))
+            {
+                return Ok(Data {
+                    span: start.merge(self.last_span),
+                    name_span,
+                    name,
+                    params,
+                    ctors: Vec::new(),
+                    foreign: true,
+                    newtype: false,
+                    doc: String::new(),
+                });
+            }
+            return Err(self.error(Error::ForeignType));
         }
         self.skip_newlines();
         let newtype = if self.eat(&TokenKind::EqEq) {
@@ -279,6 +300,7 @@ impl Parser {
             name,
             params,
             ctors,
+            foreign: false,
             newtype,
             doc: String::new(),
         })
@@ -1863,6 +1885,38 @@ mod tests {
             err(source, ParseMode::Source),
             "language directive is only valid in an interface"
         );
+    }
+
+    #[test]
+    fn a_foreign_type_has_no_constructors() {
+        let text = ok(".. A cell.\n; foreign Ref a\n");
+        assert!(text.starts_with(".. A cell.\n; foreign Ref a"), "{text}");
+        assert!(!text.contains('='), "{text}");
+        assert_eq!(ok(&text), text);
+        let bare = ok("; foreign Gate\n");
+        assert_eq!(bare, "; foreign Gate");
+        let next = ok("; foreign Hub a\n.. Next.\n: id ( (Hub a) -- (Hub a) )\n  dup\n");
+        assert!(
+            next.contains("; foreign Hub a\n.. Next.\n: id ( (Hub a) -- (Hub a) )"),
+            "{next}"
+        );
+        let source = "language 1\n; foreign Hub a\n";
+        let module = parse(source, ParseMode::Interface)
+            .unwrap_or_else(|error| panic!("{}", error.render("Hub.d.ply", source)));
+        assert!(module.to_string().contains("language 1\n; foreign Hub a"), "{}", module);
+        assert_eq!(
+            err("; foreign Hub a = Listeners\n", ParseMode::Source),
+            "foreign type has no constructors"
+        );
+        assert_eq!(
+            err("; foreign Age == Years Num\n", ParseMode::Source),
+            "foreign type has no constructors"
+        );
+        assert_eq!(
+            err("; foreign Hub a\n  Listeners\n", ParseMode::Source),
+            "foreign type has no constructors"
+        );
+        assert_eq!(err("; Hub a =\n", ParseMode::Source), "expected constructor");
     }
 
     #[test]
