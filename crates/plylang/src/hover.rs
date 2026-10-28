@@ -581,6 +581,112 @@ mod tests {
         assert!(inferred.contains("--"), "{inferred}");
     }
 
+    #[test]
+    fn hovers_a_synonym_by_name_on_the_stack() {
+        let source = "\
+- Person { name : Str, age : Num }
+
+: older ( Person -- Person )
+  37 =age
+
+: usePerson ( Person -- Person )
+  older
+
+- Inner { n : Num }
+- Outer { inner : Inner, name : Str }
+
+: outer ( Outer -- Outer )
+  dup drop
+
+: useOuter ( Outer -- Outer )
+  outer
+
+- Pair a b { left : a, right : b }
+
+: pair ( (Pair Int Str) -- (Pair Int Str) )
+  dup drop
+
+- Age Int
+
+: widen ( Age -- Int )
+  drop 0n
+
+: useAge ( Age -- Int )
+  widen
+
+: plain ( Int -- Int )
+  dup drop
+
+: usePlain ( Age -- Int )
+  plain
+
+: row ( { inner : Inner, name : Str } -- Str )
+  /name
+
+: useRow ( { inner : Inner, name : Str } -- Str )
+  row
+";
+        let older = source.rfind("older").unwrap();
+        let (line, character) = at_offset(source, older);
+        let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert_eq!(
+            hovered.contents,
+            "```ply\n: older ( Person -- Person )\n```\n\n```ply\nPerson -- Person\n```"
+        );
+        let between = source.find("37 =age").unwrap();
+        let (line, character) = at_offset(source, between + "37".len());
+        let gap = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert_eq!(gap.contents, "```ply\nPerson Num\n```");
+
+        let outer = source.rfind("outer").unwrap();
+        let (line, character) = at_offset(source, outer);
+        let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert!(
+            hovered.contents.ends_with("```ply\nOuter -- Outer\n```"),
+            "{}",
+            hovered.contents
+        );
+
+        let dup = source.find("(Pair Int Str) )\n  dup").unwrap();
+        let dup = dup + source[dup..].find("dup").unwrap();
+        let (line, character) = at_offset(source, dup);
+        let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert!(
+            hovered.contents.ends_with(
+                "```ply\n(Pair Int Str) -- (Pair Int Str) (Pair Int Str)\n```"
+            ),
+            "{}",
+            hovered.contents
+        );
+
+        let widen = source.rfind("widen").unwrap();
+        let (line, character) = at_offset(source, widen);
+        let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert!(
+            hovered.contents.ends_with("```ply\nAge -- Int\n```"),
+            "{}",
+            hovered.contents
+        );
+
+        let plain = source.rfind("plain").unwrap();
+        let (line, character) = at_offset(source, plain);
+        let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert!(
+            hovered.contents.ends_with("```ply\nInt -- Int\n```"),
+            "{}",
+            hovered.contents
+        );
+
+        let row = source.rfind("\n  row").unwrap() + 3;
+        let (line, character) = at_offset(source, row);
+        let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert!(
+            hovered.contents.ends_with("```ply\n{ inner : Inner, name : Str } -- Str\n```"),
+            "{}",
+            hovered.contents
+        );
+    }
+
     fn at(source: &str, needle: &str) -> (u32, u32) {
         at_offset(source, source.find(needle).unwrap())
     }

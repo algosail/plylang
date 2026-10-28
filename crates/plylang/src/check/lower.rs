@@ -1488,7 +1488,7 @@ impl Checker {
     }
 
     fn fun_arity(&self, ty: TyId) -> Option<(usize, usize)> {
-        let ty = self.find_ty(ty);
+        let ty = self.expose(ty);
         match &self.tys[ty.0 as usize] {
             TyNode::Fun(input, output, _) => Some((self.cons_len(*input), self.cons_len(*output))),
             _ => None,
@@ -2275,6 +2275,22 @@ const task = { go: (n) => n + 1 };
 if (runTask(task, 3) !== 4) throw new Error("runTask");
 if (later(task, 3)() !== 4) throw new Error("later");
 "#,
+        );
+    }
+
+    #[test]
+    fn call_runs_a_function_synonym() {
+        run(
+            "\
+- Task ( Num -- Num )
+
+: run ( Num Task -- Num )
+  call
+",
+            "\
+const inc = (n) => n + 1;
+if (run(3, inc) !== 4) throw new Error(\"run \" + run(3, inc));
+",
         );
     }
 

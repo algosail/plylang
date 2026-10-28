@@ -230,7 +230,7 @@ impl Checker {
 
     /// Element type of an array pattern. A flexible slot becomes `(Array _)`.
     pub(super) fn array_elem(&mut self, ty: TyId, span: Span) -> Result<TyId, Diagnostic> {
-        let found = self.find_ty(ty);
+        let found = self.expose(ty);
         if let TyNode::Ctor(name, args) = self.tys[found.0 as usize].clone() {
             if name == "Array" && args.len() == 1 {
                 return Ok(args[0]);
@@ -250,7 +250,7 @@ impl Checker {
         ty: TyId,
         span: Span,
     ) -> Result<(Vec<TyId>, bool), Diagnostic> {
-        let ty = self.find_ty(ty);
+        let ty = self.expose(ty);
         let (data_name, args) = match self.tys[ty.0 as usize].clone() {
             TyNode::Ctor(data_name, args) => (data_name, args),
             _ => {
@@ -322,7 +322,7 @@ impl Checker {
         if depth > NEED_DEPTH {
             return Need::Deep;
         }
-        let ty = self.find_ty(ty);
+        let ty = self.expose(ty);
         if let TyNode::Record(row) = self.tys[ty.0 as usize].clone() {
             return self.record_need(row, depth);
         }

@@ -147,6 +147,13 @@ enum TyNode {
     Fun(StackId, StackId, EffectId),
     /// Record row. Fields live on the row node; this id is that row.
     Record(RowId),
+    /// A saturated `-` synonym. Unification reads `body`. The stack note prints `name`.
+    /// `find_ty` stops here, so a later link cannot erase the name.
+    Alias {
+        name: String,
+        args: Vec<TyId>,
+        body: TyId,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -971,7 +978,13 @@ impl Checker {
         }
         let elaborated = self.elab_ty(&body.rhs, &mut scope, span);
         self.expanding.pop();
-        elaborated
+        let (body_ty, kind) = elaborated?;
+        let alias = self.push_ty(TyNode::Alias {
+            name: name.to_string(),
+            args: args.to_vec(),
+            body: body_ty,
+        });
+        Ok((alias, kind))
     }
 
     fn register_def(&mut self, def: &crate::ast::Def) -> Result<(), Diagnostic> {
@@ -1153,7 +1166,7 @@ impl Checker {
         let StackNode::Cons(_, ty) = self.stacks[id.0 as usize].clone() else {
             return Ok(());
         };
-        let ty = self.find_ty(ty);
+        let ty = self.expose(ty);
         let TyNode::Fun(input, _, _) = self.tys[ty.0 as usize].clone() else {
             return Ok(());
         };
@@ -1173,7 +1186,7 @@ impl Checker {
 
     fn solved(&self, ty: TyId) -> bool {
         !matches!(
-            &self.tys[self.find_ty(ty).0 as usize],
+            &self.tys[self.expose(ty).0 as usize],
             TyNode::Var | TyNode::Template
         )
     }
@@ -1299,7 +1312,7 @@ impl Checker {
     ) -> Result<StackId, Diagnostic> {
         let (rest, value_ty) = self.pop_slot(stack, span)?;
         let (rest, record_ty) = self.pop_slot(rest, span)?;
-        let record_ty = self.find_ty(record_ty);
+        let record_ty = self.expose(record_ty);
         let TyNode::Record(row) = self.tys[record_ty.0 as usize].clone() else {
             return Err(self.error(
                 span,
@@ -1505,6 +1518,17 @@ impl Checker {
                 memo.ty.insert(id, fresh);
                 let row = self.copy_row(row, subst, memo);
                 self.tys[fresh.0 as usize] = TyNode::Record(row);
+                fresh
+            }
+            TyNode::Alias { name, args, body } => {
+                let fresh = self.ty_var();
+                memo.ty.insert(id, fresh);
+                let args = args
+                    .into_iter()
+                    .map(|arg| self.copy_ty(arg, subst, memo))
+                    .collect();
+                let body = self.copy_ty(body, subst, memo);
+                self.tys[fresh.0 as usize] = TyNode::Alias { name, args, body };
                 fresh
             }
         }
@@ -1823,7 +1847,8 @@ impl Checker {
     }
 
     fn type_app(&mut self, head: TyId, arg: TyId) -> TyId {
-        match self.tys[self.find_ty(head).0 as usize].clone() {
+        let head = self.expose(head);
+        match self.tys[head.0 as usize].clone() {
             TyNode::Ctor(name, mut args) => {
                 args.push(arg);
                 self.ty_ctor(&name, args)
@@ -1859,7 +1884,7 @@ impl Checker {
     }
 
     fn underapplied(&self, ty: TyId) -> Option<Error> {
-        let TyNode::Ctor(name, args) = &self.tys[self.find_ty(ty).0 as usize] else {
+        let TyNode::Ctor(name, args) = &self.tys[self.expose(ty).0 as usize] else {
             return None;
         };
         let arity = self
@@ -1912,7 +1937,7 @@ impl Checker {
         seen: &mut HashSet<String>,
         fields: &mut Vec<(String, TyId)>,
     ) -> Result<(), Diagnostic> {
-        let spliced = self.find_ty(spliced);
+        let spliced = self.expose(spliced);
         let TyNode::Record(row_id) = self.tys[spliced.0 as usize].clone() else {
             return Err(self.error(
                 span,
@@ -2009,6 +2034,20 @@ impl Checker {
         ) {
             (TyNode::Var, _) => self.bind_ty(have, need),
             (_, TyNode::Var) => self.bind_ty(need, have),
+            (TyNode::Alias { body, .. }, _) => {
+                let body = self.find_ty(body);
+                if body == have {
+                    return Err(self.ty_mismatch(have, need));
+                }
+                self.unify_ty(body, need)
+            }
+            (_, TyNode::Alias { body, .. }) => {
+                let body = self.find_ty(body);
+                if body == need {
+                    return Err(self.ty_mismatch(have, need));
+                }
+                self.unify_ty(have, body)
+            }
             (TyNode::Ctor(name, args), TyNode::Ctor(need_name, need_args))
                 if name == need_name && args.len() == need_args.len() =>
             {
@@ -2284,7 +2323,10 @@ impl Checker {
     }
 
     fn row_mismatch(&self, need: RowId, have: RowId) -> Result<(), Error> {
-        Err(Error::TypeMismatch { expected: self.show_record(need, 0), found: self.show_record(have, 0) })
+        Err(Error::TypeMismatch {
+            expected: self.show_record(need, 0, false),
+            found: self.show_record(have, 0, false),
+        })
     }
 
     fn bind_extension(
@@ -2563,6 +2605,10 @@ impl Checker {
                 self.ty_in_stack(var_id, input, seen) || self.ty_in_stack(var_id, output, seen)
             }
             TyNode::Record(row) => self.ty_in_row(var_id, row, seen),
+            TyNode::Alias { args, body, .. } => {
+                args.into_iter().any(|arg| self.occurs_ty(var_id, arg, seen))
+                    || self.occurs_ty(var_id, body, seen)
+            }
             TyNode::Link(next) => self.occurs_ty(var_id, next, seen),
             _ => false,
         }
@@ -2629,6 +2675,10 @@ impl Checker {
                     || args.into_iter().any(|arg| self.stack_in_ty(var_id, arg, seen))
             }
             TyNode::Record(row) => self.stack_in_row(var_id, row, seen),
+            TyNode::Alias { args, body, .. } => {
+                args.into_iter().any(|arg| self.stack_in_ty(var_id, arg, seen))
+                    || self.stack_in_ty(var_id, body, seen)
+            }
             TyNode::Link(next) => self.stack_in_ty(var_id, next, seen),
             _ => false,
         }
@@ -2682,6 +2732,10 @@ impl Checker {
             TyNode::Fun(input, output, _) => {
                 self.row_in_stack(var_id, input, seen) || self.row_in_stack(var_id, output, seen)
             }
+            TyNode::Alias { args, body, .. } => {
+                args.into_iter().any(|arg| self.row_in_ty(var_id, arg, seen))
+                    || self.row_in_ty(var_id, body, seen)
+            }
             TyNode::Link(next) => self.row_in_ty(var_id, next, seen),
             _ => false,
         }
@@ -2702,32 +2756,32 @@ impl Checker {
     }
 
     fn show_ty(&self, id: TyId) -> String {
-        self.show_ty_at(id, 0)
+        self.show_ty_at(id, 0, false)
     }
 
-    fn show_ty_at(&self, id: TyId, depth: usize) -> String {
+    fn show_ty_at(&self, id: TyId, depth: usize, fold: bool) -> String {
         if depth > 32 {
             return "_".to_string();
         }
         match self.tys[self.find_ty(id).0 as usize].clone() {
             TyNode::Var | TyNode::Template => "_".to_string(),
             TyNode::Rigid(name) => name,
-            TyNode::Link(next) => self.show_ty_at(next, depth + 1),
+            TyNode::Link(next) => self.show_ty_at(next, depth + 1, fold),
             TyNode::Ctor(name, args) if args.is_empty() => name,
             TyNode::Ctor(name, args) => {
                 let mut out = format!("({name}");
                 for arg in args {
                     out.push(' ');
-                    out.push_str(&self.show_ty_at(arg, depth + 1));
+                    out.push_str(&self.show_ty_at(arg, depth + 1, fold));
                 }
                 out.push(')');
                 out
             }
             TyNode::App(head, args) => {
-                let mut out = format!("({}", self.show_ty_at(head, depth + 1));
+                let mut out = format!("({}", self.show_ty_at(head, depth + 1, fold));
                 for arg in args {
                     out.push(' ');
-                    out.push_str(&self.show_ty_at(arg, depth + 1));
+                    out.push_str(&self.show_ty_at(arg, depth + 1, fold));
                 }
                 out.push(')');
                 out
@@ -2735,16 +2789,32 @@ impl Checker {
             TyNode::Fun(input, output, effect) => {
                 format!(
                     "({}{})",
-                    self.show_effect(input, output, depth + 1),
+                    self.show_effect(input, output, depth + 1, fold),
                     self.effect_suffix(effect)
                 )
             }
-            TyNode::Record(row) => self.show_record(row, depth + 1),
+            TyNode::Record(row) => self.show_record(row, depth + 1, fold),
+            TyNode::Alias { name, args, body } => {
+                if !fold {
+                    return self.show_ty_at(body, depth + 1, false);
+                }
+                if args.is_empty() {
+                    name
+                } else {
+                    let mut out = format!("({name}");
+                    for arg in args {
+                        out.push(' ');
+                        out.push_str(&self.show_ty_at(arg, depth + 1, true));
+                    }
+                    out.push(')');
+                    out
+                }
+            }
         }
     }
 
     /// Labels are alphabetical. An unsolved tail is `| _`.
-    fn show_record(&self, id: RowId, depth: usize) -> String {
+    fn show_record(&self, id: RowId, depth: usize, fold: bool) -> String {
         if depth > 32 {
             return "_".to_string();
         }
@@ -2765,7 +2835,7 @@ impl Checker {
                 RowNode::Fields { fields: found, tail } => {
                     for (name, ty) in found {
                         if seen.insert(name.clone()) {
-                            fields.push((name.clone(), self.show_ty_at(*ty, depth + 1)));
+                            fields.push((name.clone(), self.show_ty_at(*ty, depth + 1, fold)));
                         }
                     }
                     current = *tail;
@@ -2785,9 +2855,9 @@ impl Checker {
         format_row(&fields, tail.as_deref())
     }
 
-    fn show_effect(&self, input: StackId, output: StackId, depth: usize) -> String {
-        let input = self.show_stack_at(input, depth, false);
-        let output = self.show_stack_at(output, depth, false);
+    fn show_effect(&self, input: StackId, output: StackId, depth: usize, fold: bool) -> String {
+        let input = self.show_stack_at(input, depth, false, fold);
+        let output = self.show_stack_at(output, depth, false, fold);
         match (input.is_empty(), output.is_empty()) {
             (true, true) => "--".to_string(),
             (true, false) => format!("-- {output}"),
@@ -2797,12 +2867,13 @@ impl Checker {
     }
 
     fn show_stack(&self, id: StackId) -> String {
-        self.show_stack_at(id, 0, false)
+        self.show_stack_at(id, 0, false, false)
     }
 
-    /// Like [`show_stack`], but a lone hidden signature tail is `.`.
+    /// Like [`show_stack`], but a lone hidden signature tail is `.`
+    /// and a `-` synonym prints by name.
     fn show_note(&self, id: StackId) -> String {
-        let text = self.show_stack_at(id, 0, true);
+        let text = self.show_stack_at(id, 0, true, true);
         if text.is_empty() {
             ".".to_string()
         } else {
@@ -2869,7 +2940,13 @@ impl Checker {
             .collect()
     }
 
-    fn show_stack_at(&self, id: StackId, depth: usize, hide_lone_hidden: bool) -> String {
+    fn show_stack_at(
+        &self,
+        id: StackId,
+        depth: usize,
+        hide_lone_hidden: bool,
+        fold: bool,
+    ) -> String {
         let mut items = Vec::new();
         let mut current = self.find_stack(id);
         let mut guard = 0;
@@ -2881,7 +2958,7 @@ impl Checker {
             }
             match self.stacks[current.0 as usize].clone() {
                 StackNode::Cons(rest, ty) => {
-                    items.push(self.show_ty_at(ty, depth + 1));
+                    items.push(self.show_ty_at(ty, depth + 1, fold));
                     current = self.find_stack(rest);
                 }
                 StackNode::Empty => break Bottom::Empty,
@@ -2909,6 +2986,7 @@ impl Checker {
     }
 
     /// Follow links to a node that is not a link. A repeated id is a link cycle.
+    /// A synonym stays here: the stack note prints its name.
     fn find_ty(&self, mut id: TyId) -> TyId {
         let mut seen = HashSet::new();
         loop {
@@ -2917,6 +2995,22 @@ impl Checker {
             }
             match &self.tys[id.0 as usize] {
                 TyNode::Link(next) => id = *next,
+                _ => return id,
+            }
+        }
+    }
+
+    /// Follow links and `-` synonyms. Structural checks use this.
+    /// A repeated id is a cycle and stays put.
+    fn expose(&self, mut id: TyId) -> TyId {
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(id) {
+                return id;
+            }
+            match &self.tys[id.0 as usize] {
+                TyNode::Link(next) => id = *next,
+                TyNode::Alias { body, .. } => id = *body,
                 _ => return id,
             }
         }
@@ -3827,6 +3921,11 @@ impl Checker {
                     || self.stack_has_skolem(output, skolems, seen)
             }
             TyNode::Record(row) => self.row_has_skolem(row, skolems, seen),
+            TyNode::Alias { args, body, .. } => {
+                args.into_iter()
+                    .any(|arg| self.ty_has_skolem(arg, skolems, seen))
+                    || self.ty_has_skolem(body, skolems, seen)
+            }
             TyNode::Link(next) => self.ty_has_skolem(next, skolems, seen),
             _ => false,
         }
@@ -4433,6 +4532,12 @@ impl Checker {
                 self.freeze_effect(effect);
             }
             TyNode::Record(row) => self.freeze_row(row),
+            TyNode::Alias { args, body, .. } => {
+                for arg in args {
+                    self.freeze_ty(arg);
+                }
+                self.freeze_ty(body);
+            }
             _ => {}
         }
     }
@@ -4499,6 +4604,9 @@ impl Checker {
                 self.flexible_stack(input, seen) || self.flexible_stack(output, seen)
             }
             TyNode::Record(row) => self.flexible_row(row, seen),
+            TyNode::Alias { args, body, .. } => {
+                args.into_iter().any(|arg| self.flexible(arg, seen)) || self.flexible(body, seen)
+            }
             TyNode::Link(next) => self.flexible(next, seen),
             _ => false,
         }
