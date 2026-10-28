@@ -650,6 +650,40 @@ enum Place {
     DataGap,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameSpace {
+    Type,
+    Value,
+    Either,
+}
+
+/// The place of the tokens before `index`. A type name and a constructor can share a name.
+pub(crate) fn name_space_at(tokens: &[Token], index: usize) -> NameSpace {
+    match walk(&prefix(tokens, index)).state {
+        Place::Signature | Place::DataFields | Place::DataName | Place::DataParams => {
+            NameSpace::Type
+        }
+        Place::Body | Place::DefName | Place::DataCtor | Place::Vis | Place::DefParen => {
+            NameSpace::Value
+        }
+        Place::Top | Place::Import | Place::ImportString | Place::ImportList | Place::DataGap => {
+            NameSpace::Either
+        }
+    }
+}
+
+/// The cursor is on the string of `~ "..."`.
+pub(crate) fn is_import_path(tokens: &[Token], index: usize) -> bool {
+    walk(&prefix(tokens, index)).state == Place::Import
+}
+
+fn prefix(tokens: &[Token], index: usize) -> Vec<&Token> {
+    tokens[..index.min(tokens.len())]
+        .iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Eof))
+        .collect()
+}
+
 fn walk(tokens: &[&Token]) -> Walk {
     let mut walked = Walk {
         state: Place::Top,
@@ -1440,7 +1474,8 @@ mod tests {
   "ply": { "source": "src", "out": "dist", "language": 1 },
   "exports": {
     "./Data/Maybe": { "ply": "./dist/Data/Maybe.d.ply" },
-    "./Try": { "ply": "./dist/Try.d.ply" }
+    "./Try": { "ply": "./dist/Try.d.ply" },
+    "./Ghost": { "ply": "./dist/Ghost.d.ply" }
   }
 }"#,
         )
@@ -1460,12 +1495,15 @@ mod tests {
 ",
         )
         .unwrap();
+        fs::write(root.join("src/Data/Extra.ply"), ": pass ( Int -- Int )\n  dup drop\n").unwrap();
         let path = root.join("src/Try.ply");
         fs::write(&path, "").unwrap();
         let (line, character) = at("~ \"\"\n", "~ \"");
         let paths = complete("~ \"\"\n", &path, line, character);
         assert!(paths.iter().any(|item| item.label == "Data/Maybe"), "{paths:?}");
+        assert!(paths.iter().any(|item| item.label == "Data/Extra"), "{paths:?}");
         assert!(paths.iter().all(|item| item.label != "Try"), "{paths:?}");
+        assert!(paths.iter().all(|item| item.label != "Ghost"), "{paths:?}");
         assert_eq!(paths.iter().find(|item| item.label == "Data/Maybe").unwrap().insert, "Data/Maybe");
 
         let source = "~ \"Data/Maybe\" (J)\n";

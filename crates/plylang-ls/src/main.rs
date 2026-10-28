@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
 use lsp_types::{
-    CompletionOptions, HoverProviderCapability, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind,
+    CompletionOptions, HoverProviderCapability, OneOf, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind,
 };
-use plylang::{check_buffer, complete, hover, utf16_position, CompletionKind};
+use plylang::{check_buffer, complete, definition, hover, utf16_position, CompletionKind};
 use serde::Deserialize;
 
 fn main() {
@@ -25,6 +25,7 @@ fn serve(connection: Connection) -> Result<(), String> {
     let capabilities = ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
+        definition_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![
                 "\"".to_string(),
@@ -53,6 +54,14 @@ fn serve(connection: Connection) -> Result<(), String> {
                 }
                 if request.method == "textDocument/hover" {
                     let response = hover_response(&docs, &request);
+                    connection
+                        .sender
+                        .send(response.into())
+                        .map_err(|error| error.to_string())?;
+                    continue;
+                }
+                if request.method == "textDocument/definition" {
+                    let response = definition_response(&docs, &request);
                     connection
                         .sender
                         .send(response.into())
@@ -132,6 +141,48 @@ fn hover_response(docs: &HashMap<String, String>, request: &Request) -> Response
         request.id.clone(),
         serde_json::json!({
             "contents": { "kind": "markdown", "value": found.contents },
+            "range": {
+                "start": { "line": start_line, "character": start_character },
+                "end": { "line": end_line, "character": end_character },
+            }
+        }),
+    )
+}
+
+fn definition_response(docs: &HashMap<String, String>, request: &Request) -> Response {
+    let params: HoverRequest = match serde_json::from_value(request.params.clone()) {
+        Ok(params) => params,
+        Err(_) => return Response::new_ok(request.id.clone(), serde_json::Value::Null),
+    };
+    let Some(text) = docs.get(&params.text_document.uri) else {
+        return Response::new_ok(request.id.clone(), serde_json::Value::Null);
+    };
+    let path = uri_path(&params.text_document.uri);
+    let Some(found) = definition(
+        text,
+        std::path::Path::new(&path),
+        params.position.line,
+        params.position.character,
+    ) else {
+        return Response::new_ok(request.id.clone(), serde_json::Value::Null);
+    };
+    let (uri, target) = if found.path == std::path::Path::new(&path) {
+        (params.text_document.uri.clone(), text.clone())
+    } else {
+        let Ok(disk) = std::fs::read_to_string(&found.path) else {
+            return Response::new_ok(request.id.clone(), serde_json::Value::Null);
+        };
+        let Ok(url) = url::Url::from_file_path(&found.path) else {
+            return Response::new_ok(request.id.clone(), serde_json::Value::Null);
+        };
+        (url.to_string(), disk)
+    };
+    let (start_line, start_character) = utf16_position(&target, found.span.start);
+    let (end_line, end_character) = utf16_position(&target, found.span.end);
+    Response::new_ok(
+        request.id.clone(),
+        serde_json::json!({
+            "uri": uri,
             "range": {
                 "start": { "line": start_line, "character": start_character },
                 "end": { "line": end_line, "character": end_character },
@@ -808,5 +859,139 @@ mod tests {
             }))
             .unwrap();
         server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn jumps_to_the_definition() {
+        let (server, client) = Connection::memory();
+        let server = thread::spawn(move || serve(server));
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(1),
+                method: "initialize".to_string(),
+                params: json!({
+                    "processId": null,
+                    "capabilities": {},
+                }),
+            }))
+            .unwrap();
+        let initialize = client
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("initialize response");
+        let Message::Response(response) = initialize else {
+            panic!("expected initialize, got {initialize:?}");
+        };
+        assert_eq!(
+            response.result.unwrap()["capabilities"]["definitionProvider"],
+            json!(true)
+        );
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "initialized".to_string(),
+                params: json!({}),
+            }))
+            .unwrap();
+        let source = ": double ( Int -- Int )\n  dup double\n";
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "textDocument/didOpen".to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": "file:///tmp/M.ply",
+                        "languageId": "ply",
+                        "version": 1,
+                        "text": source,
+                    }
+                }),
+            }))
+            .unwrap();
+        let published = client
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("diagnostics");
+        let Message::Notification(notification) = published else {
+            panic!("expected diagnostics, got {published:?}");
+        };
+        assert_eq!(notification.method, "textDocument/publishDiagnostics");
+
+        let use_at = source.rfind("double").unwrap();
+        let (line, character) = position(source, use_at);
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(2),
+                method: "textDocument/definition".to_string(),
+                params: json!({
+                    "textDocument": { "uri": "file:///tmp/M.ply" },
+                    "position": { "line": line, "character": character },
+                }),
+            }))
+            .unwrap();
+        let defined = client
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("definition");
+        let Message::Response(response) = defined else {
+            panic!("expected definition, got {defined:?}");
+        };
+        let result = response.result.unwrap();
+        assert_eq!(result["uri"], "file:///tmp/M.ply");
+        let decl = source.find("double").unwrap();
+        let (start_line, start_character) = position(source, decl);
+        let (end_line, end_character) = position(source, decl + "double".len());
+        assert_eq!(result["range"]["start"]["line"], start_line);
+        assert_eq!(result["range"]["start"]["character"], start_character);
+        assert_eq!(result["range"]["end"]["line"], end_line);
+        assert_eq!(result["range"]["end"]["character"], end_character);
+
+        let dup_at = source.find("dup").unwrap();
+        let (line, character) = position(source, dup_at);
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(3),
+                method: "textDocument/definition".to_string(),
+                params: json!({
+                    "textDocument": { "uri": "file:///tmp/M.ply" },
+                    "position": { "line": line, "character": character },
+                }),
+            }))
+            .unwrap();
+        let defined = client
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("builtin");
+        let Message::Response(response) = defined else {
+            panic!("expected definition, got {defined:?}");
+        };
+        assert!(response.result.unwrap().is_null());
+
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(4),
+                method: "shutdown".to_string(),
+                params: json!(null),
+            }))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "exit".to_string(),
+                params: json!(null),
+            }))
+            .unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    fn position(source: &str, offset: usize) -> (u32, u32) {
+        let line = source[..offset].bytes().filter(|byte| *byte == b'\n').count() as u32;
+        let line_start = source[..offset].rfind('\n').map(|index| index + 1).unwrap_or(0);
+        let character = source[line_start..offset].encode_utf16().count() as u32;
+        (line, character)
     }
 }

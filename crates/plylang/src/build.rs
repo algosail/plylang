@@ -253,8 +253,8 @@ pub fn stack_sites(path: &Path, source: &str) -> Vec<StackAt> {
     doc.sites()
 }
 
-/// Import paths the package of `from_file` can name: local exports, then
-/// `ply` exports of installed dependencies. The current file is left out.
+/// Import paths the package of `from_file` can name: files under `ply.source`,
+/// then `ply` exports of installed dependencies. The current file is left out.
 pub(crate) fn available_import_paths(from_file: &Path) -> Vec<String> {
     let Some(root) = find_ply_root(from_file) else {
         return Vec::new();
@@ -264,14 +264,19 @@ pub(crate) fn available_import_paths(from_file: &Path) -> Vec<String> {
     };
     let current = module_path_under(&package, from_file);
     let mut paths = Vec::new();
-    for key in package.exports.keys() {
-        let Some(path) = local_import_path(key) else {
-            continue;
-        };
-        if current.as_deref() == Some(path.as_str()) {
+    let mut files = Vec::new();
+    if package.source.is_dir() {
+        let _ = walk_ply(&package.source, &package.out, &mut files);
+    }
+    for file in files {
+        let module_path = module_path_of(&package.source, &file);
+        if current.as_deref() == Some(module_path.as_str()) {
             continue;
         }
-        paths.push(path);
+        if module_name_from_path(&format!("{module_path}.ply")).is_err() {
+            continue;
+        }
+        paths.push(module_path);
     }
     let text = fs::read_to_string(root.join("package.json")).unwrap_or_default();
     if let Ok(value) = serde_json::from_str::<Value>(&text) {
@@ -302,15 +307,6 @@ pub(crate) fn available_import_paths(from_file: &Path) -> Vec<String> {
     paths
 }
 
-fn local_import_path(key: &str) -> Option<String> {
-    let rest = key.strip_prefix("./")?;
-    if rest.is_empty() {
-        None
-    } else {
-        Some(rest.to_string())
-    }
-}
-
 fn package_import_path(name: &str, key: &str) -> Option<String> {
     if key == "." {
         return Some(name.to_string());
@@ -332,24 +328,75 @@ fn module_path_under(package: &Package, file: &Path) -> Option<String> {
     Some(module_path_of(&source, &file))
 }
 
-/// Read the module an import names, for hover and completion. Missing packages yield `None`.
-pub(crate) fn load_provider(from_file: &Path, import_path: &str) -> Option<Module> {
+enum Located {
+    Local(PathBuf),
+    Package {
+        root: PathBuf,
+        manifest: Value,
+        file: PathBuf,
+    },
+}
+
+fn locate_import(from_file: &Path, import_path: &str) -> Option<Located> {
     match classify(import_path)? {
         Spec::Local(module_path) => {
             let root = find_ply_root(from_file)?;
             let package = read_package(&root).ok()?;
-            let file = package.source.join(&module_path).with_extension("ply");
-            read_module(&file)
+            Some(Located::Local(
+                package.source.join(module_path).with_extension("ply"),
+            ))
         }
         Spec::Package { name, subpath } => {
-            let pkg_root = find_installed(from_file, &name)?;
-            let text = fs::read_to_string(pkg_root.join("package.json")).ok()?;
-            let value: Value = serde_json::from_str(&text).ok()?;
-            let exports = export_map(&value);
-            let target = exports.get(&export_key(&subpath))?;
-            read_module(&target_file(&pkg_root, target))
+            let root = find_installed(from_file, &name)?;
+            let text = fs::read_to_string(root.join("package.json")).ok()?;
+            let manifest: Value = serde_json::from_str(&text).ok()?;
+            let target = export_map(&manifest)
+                .get(&export_key(&subpath))?
+                .clone();
+            let file = target_file(&root, &target);
+            Some(Located::Package { root, manifest, file })
         }
     }
+}
+
+/// Read the module an import names, for hover and completion. Missing packages yield `None`.
+/// This is the exported file. Go to definition uses [`provider_file`], which prefers source.
+pub(crate) fn load_provider(from_file: &Path, import_path: &str) -> Option<Module> {
+    let file = match locate_import(from_file, import_path)? {
+        Located::Local(file) | Located::Package { file, .. } => file,
+    };
+    read_module(&file)
+}
+
+/// The file an import names. A package export under `ply.out` that ends in `.d.ply`
+/// yields the matching file under `ply.source` when that source file exists.
+pub(crate) fn provider_file(from_file: &Path, import_path: &str) -> Option<PathBuf> {
+    let file = match locate_import(from_file, import_path)? {
+        Located::Local(file) => file,
+        Located::Package { root, manifest, file } => {
+            source_beside_interface(&root, &manifest, &file).unwrap_or(file)
+        }
+    };
+    file.is_file().then_some(file)
+}
+
+/// `dist/Ply/Ref.d.ply` beside `src/Ply/Ref.ply`. The interface stays when the source is absent.
+fn source_beside_interface(root: &Path, manifest: &Value, file: &Path) -> Option<PathBuf> {
+    let file_name = file.file_name()?.to_str()?;
+    if !file_name.ends_with(".d.ply") {
+        return None;
+    }
+    let ply = manifest.get("ply")?;
+    let source_rel = clean_rel(ply.get("source")?.as_str()?);
+    let out_rel = clean_rel(ply.get("out")?.as_str()?);
+    if source_rel.is_empty() || out_rel.is_empty() {
+        return None;
+    }
+    let rel = file.strip_prefix(root.join(&out_rel)).ok()?;
+    let rel = rel.to_str()?.replace('\\', "/");
+    let stem = rel.strip_suffix(".d.ply")?;
+    let source_file = root.join(source_rel).join(format!("{stem}.ply"));
+    source_file.is_file().then_some(source_file)
 }
 
 impl Session {
@@ -484,7 +531,6 @@ impl Session {
     ) -> Result<usize, BuildError> {
         let package_root = self.units[from].package_root.clone();
         if package_root == self.package.root {
-            self.require_export(from, module_path, span)?;
             return self.by_module.get(module_path).copied().ok_or_else(|| {
                 self.fail(from, span, Error::CannotResolveImport(import_path.to_string()))
             });
@@ -521,26 +567,6 @@ impl Session {
             return Err(self.fail(from, span, Error::CannotResolveImport(import_path.to_string())));
         }
         self.load_external(file, pkg_root)
-    }
-
-    fn require_export(&self, from: usize, module_path: &str, span: Span) -> Result<(), BuildError> {
-        let key = export_key(module_path);
-        let expected = format!("./{}/{module_path}.d.ply", self.package.out_rel);
-        let found = self
-            .package
-            .exports
-            .get(&key)
-            .map(|target| target.replace('\\', "/"))
-            .as_deref()
-            == Some(expected.as_str());
-        if found {
-            return Ok(());
-        }
-        Err(self.fail(
-            from,
-            span,
-            Error::ModuleNotExported(module_path.replace('/', ".")),
-        ))
     }
 
     fn load_external(&mut self, file: PathBuf, package_root: PathBuf) -> Result<usize, BuildError> {
@@ -908,7 +934,6 @@ impl OpenDoc {
     ) -> Result<usize, Diagnostic> {
         let package_root = self.units[from].package_root.clone();
         if package_root == self.package.root {
-            self.require_export(module_path, span)?;
             if let Some(id) = self.by_module.get(module_path).copied() {
                 return Ok(id);
             }
@@ -981,25 +1006,6 @@ impl OpenDoc {
             )
         })?;
         Ok(self.insert(canonical, module, package_root, module_path))
-    }
-
-    fn require_export(&self, module_path: &str, span: Span) -> Result<(), Diagnostic> {
-        let key = export_key(module_path);
-        let expected = format!("./{}/{module_path}.d.ply", self.package.out_rel);
-        let found = self
-            .package
-            .exports
-            .get(&key)
-            .map(|target| target.replace('\\', "/"))
-            .as_deref()
-            == Some(expected.as_str());
-        if found {
-            return Ok(());
-        }
-        Err(Diagnostic::new(
-            span,
-            Error::ModuleNotExported(module_path.replace('/', ".")),
-        ))
     }
 
     fn package_exports(
@@ -1682,7 +1688,7 @@ fn find_ply_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
-fn read_module(path: &Path) -> Option<Module> {
+pub(crate) fn read_module(path: &Path) -> Option<Module> {
     let source = fs::read_to_string(path).ok()?;
     let text = path.to_string_lossy();
     let mode = if text.ends_with(".d.ply") {
@@ -2534,9 +2540,9 @@ mod tests {
         );
         temp.write("src/Data/Num.ply", ": add ( Int Int -- Int )\n  drop\n");
         temp.write("src/Hidden.ply", ": private step ( Int -- Int )\n  dup drop\n");
-        let error = build(&temp.0).unwrap_err();
-        assert_eq!(error.message, "module Data.Num is not exported");
+        build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         assert_eq!(fs::read_to_string(temp.0.join("package.json")).unwrap(), original);
+        assert!(temp.0.join("dist/Data/Num.js").is_file());
 
         build_exports(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         let expected = "{\n  \"name\": \"@algosail/b\",\n  \"description\": \"say \\\"hi\\\"\",\n  \"type\": \"module\",\n  \"ply\": { \"source\": \"src\", \"out\": \"dist\", \"language\": 1 },\n  \"exports\": {\n    \"./App\": {\n      \"ply\": \"./dist/App.d.ply\",\n      \"import\": \"./dist/App.js\"\n    },\n    \"./Data/Num\": {\n      \"ply\": \"./dist/Data/Num.d.ply\",\n      \"import\": \"./dist/Data/Num.js\"\n    },\n    \"./Hidden\": {\n      \"ply\": \"./dist/Hidden.d.ply\",\n      \"import\": \"./dist/Hidden.js\"\n    }\n  }\n}\n";
@@ -2975,8 +2981,11 @@ mod tests {
             "src/App.ply",
             "~ \"Data/Num\" (add)\n\n: twice ( Int -- Int )\n  dup add\n",
         );
-        let error = build(&missing.0).unwrap_err();
-        assert_eq!(error.message, "module Data.Num is not exported");
+        let before = fs::read_to_string(missing.0.join("package.json")).unwrap();
+        build(&missing.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        assert_eq!(fs::read_to_string(missing.0.join("package.json")).unwrap(), before);
+        assert!(missing.0.join("dist/Data/Num.js").is_file());
+        assert!(missing.0.join("dist/App.js").is_file());
 
         let renamed = Temp::new("name");
         renamed.write("package.json", &package_json(""));

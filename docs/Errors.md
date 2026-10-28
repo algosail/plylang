@@ -783,9 +783,7 @@ Fix: move the shared declarations so each import points one way.
 
 `module NAME is not exported`
 
-The package's `exports` has no `ply` condition for this module pointing at `./{out}/{module}.d.ply`. Dots in the message are slashes in the path: `Data.Num` is `Data/Num`.
-
-Fix: add that entry. For this package, `plylang build --exports` rewrites `exports` after a successful build. A check without that flag still requires the entry to exist.
+A module of this package is the file under `ply.source`. The import does not look at `exports`. Another package still finds a module through that package's `exports`. This code is not reported.
 
 ## PL0095
 

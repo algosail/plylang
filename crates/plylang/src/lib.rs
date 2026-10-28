@@ -5,6 +5,7 @@ mod build;
 mod check;
 mod codes;
 mod complete;
+mod definition;
 mod diagnostic;
 mod docs;
 mod hover;
@@ -23,6 +24,7 @@ pub use build::{
 pub use check::{check, javascript, StackAt};
 pub use codes::Error;
 pub use complete::{complete, Completion, CompletionKind};
+pub use definition::{definition, Definition};
 pub use diagnostic::Diagnostic;
 pub use docs::write_docs;
 pub use hover::{hover, Hover};
