@@ -789,7 +789,7 @@ mod tests {
                 params: json!({}),
             }))
             .unwrap();
-        let source = ": get ( { age : Int, name : Str } -- { age : Int, name : Str } )\n  1 =\n";
+        let source = "; Person = Person name : Str, age : Int\n\n: get ( Person -- Person )\n  1 >>\n";
         client
             .sender
             .send(Message::Notification(Notification {
@@ -820,7 +820,7 @@ mod tests {
                 method: "textDocument/completion".to_string(),
                 params: json!({
                     "textDocument": { "uri": "file:///tmp/M.ply" },
-                    "position": { "line": 1, "character": 5 },
+                    "position": { "line": 3, "character": 6 },
                 }),
             }))
             .unwrap();
@@ -840,8 +840,8 @@ mod tests {
         assert_eq!(name["kind"], 5);
         assert_eq!(name["detail"], "Str");
         assert_eq!(name["textEdit"]["newText"], "name");
-        assert_eq!(name["textEdit"]["range"]["start"]["character"], 5);
-        assert_eq!(name["textEdit"]["range"]["end"]["character"], 5);
+        assert_eq!(name["textEdit"]["range"]["start"]["character"], 6);
+        assert_eq!(name["textEdit"]["range"]["end"]["character"], 6);
 
         client
             .sender

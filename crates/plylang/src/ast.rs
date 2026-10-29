@@ -55,11 +55,24 @@ pub struct Synonym {
     pub doc: String,
 }
 
+/// One constructor field. `name` is set when the constructor has two or more fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CtorField {
+    pub name: Option<String>,
+    pub ty: Type,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ctor {
     pub span: Span,
     pub name: String,
-    pub fields: Vec<Type>,
+    pub fields: Vec<CtorField>,
+}
+
+impl Ctor {
+    pub(crate) fn field_tys(&self) -> Vec<Type> {
+        self.fields.iter().map(|field| field.ty.clone()).collect()
+    }
 }
 
 /// `foreign` and `private` are independent. Each may be absent.
@@ -242,8 +255,9 @@ pub enum TermNode {
     Word(String),
     Lit(Lit),
     Quote(Vec<Term>),
+    /// `name>>` reads one field.
     Field(String),
-    /// `=name`. The record is below the new value. The label must already exist.
+    /// `>>name`. The new value is above the base. The result is a new value.
     FieldSet(String),
     /// `+name`. The record is below the new value. The label must be absent.
     FieldInsert(String),
@@ -335,7 +349,7 @@ impl fmt::Display for Data {
                 write!(formatter, " | ")?;
             }
             write!(formatter, "{}", ctor.name)?;
-            write_slots(formatter, &ctor.fields)?;
+            write_ctor_fields(formatter, &ctor.fields)?;
         }
         Ok(())
     }
@@ -520,6 +534,24 @@ fn write_slots(formatter: &mut fmt::Formatter<'_>, items: &[Type]) -> fmt::Resul
     write!(formatter, "{}", slots_string(items))
 }
 
+fn write_ctor_fields(formatter: &mut fmt::Formatter<'_>, fields: &[CtorField]) -> fmt::Result {
+    if fields.iter().any(|field| field.name.is_some()) {
+        for (index, field) in fields.iter().enumerate() {
+            if index > 0 {
+                write!(formatter, ",")?;
+            }
+            write!(
+                formatter,
+                " {} : {}",
+                field.name.as_deref().unwrap_or("_"),
+                type_string(&field.ty)
+            )?;
+        }
+        return Ok(());
+    }
+    write_slots(formatter, &fields.iter().map(|field| field.ty.clone()).collect::<Vec<_>>())
+}
+
 pub(crate) fn type_string(ty: &Type) -> String {
     match ty {
         Type::Var(name) | Type::Ctor(name) => name.clone(),
@@ -662,8 +694,8 @@ fn term_string(term: &Term, indent: usize) -> String {
     match &term.node {
         TermNode::Word(name) => name.clone(),
         TermNode::Bind(names) => format!("{} ->", names.join(" ")),
-        TermNode::Field(name) => format!("/{name}"),
-        TermNode::FieldSet(name) => format!("={name}"),
+        TermNode::Field(name) => format!("{name}>>"),
+        TermNode::FieldSet(name) => format!(">>{name}"),
         TermNode::FieldInsert(name) => format!("+{name}"),
         TermNode::Lit(lit) => lit_string(lit),
         TermNode::Array(elements) => {

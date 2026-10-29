@@ -132,6 +132,14 @@ pub enum Error {
     Arity,
     EntryWord,
     ForeignType,
+    /// Two or more constructor fields were written as bare types.
+    SeveralFieldsNeedNames,
+    /// `name : Type` on a constructor that has only one field.
+    SingleFieldUnnamed,
+    /// `name>>` or `>>name` on a type with several constructors.
+    FieldOfSeveralConstructors(String),
+    /// The single constructor does not have this field.
+    NoSuchField { type_name: String, name: String },
 }
 
 impl Error {
@@ -350,6 +358,17 @@ impl Error {
             Arity => static_text("PL0114", "arity"),
             EntryWord => static_text("PL0115", "word main must have scheme ( -- Unit )"),
             ForeignType => static_text("PL0116", "foreign type has no constructors"),
+            SeveralFieldsNeedNames => {
+                static_text("PL0117", "a constructor with several fields names each one")
+            }
+            SingleFieldUnnamed => static_text("PL0118", "a single field has no name"),
+            FieldOfSeveralConstructors(name) => (
+                "PL0119",
+                format!("field {name} needs a type with one constructor"),
+            ),
+            NoSuchField { type_name, name } => {
+                ("PL0120", format!("{type_name} has no field {name}"))
+            }
         }
     }
 }
@@ -606,8 +625,24 @@ mod tests {
                 "foreign type has no constructors",
                 "PL0116",
             ),
+            (
+                Error::SeveralFieldsNeedNames,
+                "a constructor with several fields names each one",
+                "PL0117",
+            ),
+            (Error::SingleFieldUnnamed, "a single field has no name", "PL0118"),
+            (
+                Error::FieldOfSeveralConstructors("at".into()),
+                "field at needs a type with one constructor",
+                "PL0119",
+            ),
+            (
+                Error::NoSuchField { type_name: "Entry".into(), name: "city".into() },
+                "Entry has no field city",
+                "PL0120",
+            ),
         ];
-        assert_eq!(samples.len(), 116);
+        assert_eq!(samples.len(), 120);
         for (error, message, code) in samples {
             assert_eq!(error.code(), code, "{message}");
             assert_eq!(error.message(), message);

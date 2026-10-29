@@ -360,6 +360,8 @@ enum Edit {
 struct CtorInfo {
     name: String,
     fields: Vec<TyId>,
+    /// Parallel to `fields`. `None` is a positional field.
+    names: Vec<Option<String>>,
     /// Constructor word. Filled for every data type except builtin Unit.
     word: Option<SemScheme>,
 }
@@ -377,6 +379,9 @@ struct DataType {
 struct SynBody {
     params: Vec<String>,
     rhs: Type,
+    /// The right-hand side may name types from the module that declared this
+    /// synonym. Those names are not added to the importing module.
+    open: bool,
 }
 
 struct Subst {
@@ -420,8 +425,8 @@ struct Checker {
     words: HashMap<String, SemScheme>,
     type_arity: HashMap<String, usize>,
     datas: HashMap<String, DataType>,
-    /// Transparent synonyms. A body is visible only while its name is in
-    /// `type_arity` or `extra_arity`.
+    /// Transparent synonyms. A name is visible while it is in `type_arity` or
+    /// `extra_arity`. An open body may also name types from its own module.
     synonyms: HashMap<String, SynBody>,
     /// Synonym names currently being expanded. A repeat is a cycle.
     expanding: Vec<String>,
@@ -596,6 +601,7 @@ impl Checker {
                 ctors: vec![CtorInfo {
                     name: "Unit".to_string(),
                     fields: Vec::new(),
+                    names: Vec::new(),
                     word: None,
                 }],
                 newtype: false,
@@ -677,7 +683,7 @@ impl Checker {
             };
             let mut fields = Vec::new();
             for field in &ctor.fields {
-                fields.push(self.elab_type(field, &mut scope, ctor.span)?);
+                fields.push(self.elab_type(&field.ty, &mut scope, ctor.span)?);
             }
             let tail = self.fresh_tail(&mut scope, "", false);
             let effect = self.fresh_effect(&mut scope, "", true);
@@ -707,6 +713,7 @@ impl Checker {
             }
             ctors.push(CtorInfo {
                 name: ctor.name.clone(),
+                names: ctor.fields.iter().map(|field| field.name.clone()).collect(),
                 fields,
                 word: Some(scheme),
             });
@@ -739,7 +746,7 @@ impl Checker {
         self.type_arity
             .insert(synonym.name.clone(), synonym.params.len());
         self.synonyms
-            .insert(synonym.name.clone(), SynBody::from(synonym));
+            .insert(synonym.name.clone(), SynBody::from(synonym, false));
         Ok(())
     }
 
@@ -966,7 +973,7 @@ impl Checker {
             .insert(synonym.name.clone(), synonym.params.len());
         self.synonyms
             .entry(synonym.name.clone())
-            .or_insert_with(|| SynBody::from(synonym));
+            .or_insert_with(|| SynBody::from(synonym, true));
         Ok(())
     }
 
@@ -976,7 +983,7 @@ impl Checker {
                 if let Item::Synonym(synonym) = item {
                     self.synonyms
                         .entry(synonym.name.clone())
-                        .or_insert_with(|| SynBody::from(synonym));
+                        .or_insert_with(|| SynBody::from(synonym, true));
                 }
             }
         }
@@ -984,7 +991,17 @@ impl Checker {
 
     fn syn_in_scope(&self, name: &str) -> bool {
         self.synonyms.contains_key(name)
-            && (self.type_arity.contains_key(name) || self.extra_arity.contains_key(name))
+            && (self.type_arity.contains_key(name)
+                || self.extra_arity.contains_key(name)
+                || self.hidden_type_visible())
+    }
+
+    /// An imported synonym is expanded in its declaring module. A name written
+    /// in this module still has to be imported.
+    fn hidden_type_visible(&self) -> bool {
+        self.expanding.iter().any(|name| {
+            self.synonyms.get(name).is_some_and(|body| body.open)
+        })
     }
 
     /// Elaborate a saturated synonym. The caller has already checked the arity.
@@ -1199,6 +1216,29 @@ impl Checker {
         Ok(())
     }
 
+    /// Cons cells on a fresh tail. The types stay, and a rigid signature tail
+    /// does not. `if` ascribes this so a branch sees `Post` and the two
+    /// branches still meet in the scheme.
+    fn open_spine(&mut self, stack: StackId) -> StackId {
+        let mut items = Vec::new();
+        let mut current = self.find_stack(stack);
+        loop {
+            match self.stacks[current.0 as usize].clone() {
+                StackNode::Cons(rest, ty) => {
+                    items.push(ty);
+                    current = self.find_stack(rest);
+                }
+                _ => break,
+            }
+        }
+        items.reverse();
+        let mut acc = self.stack_var();
+        for ty in items {
+            acc = self.stack_cons(acc, ty);
+        }
+        acc
+    }
+
     /// Cons cells above a private tail. A rigid or empty tail is shared, so
     /// reading below the signature is still stack underflow. A variable tail
     /// is fresh: the body must not link a tail another quotation still uses.
@@ -1245,7 +1285,9 @@ impl Checker {
 
     /// Check a quotation that a combinator is about to run.
     /// `input` ascribes the stack under it first. `None` leaves the body to
-    /// decide the input, which is what `if` needs for both branches.
+    /// decide the input. `if` ascribes the stack under the `Bool` when that
+    /// stack is already built, so `name>>` sees a nominal field. An open
+    /// tail stays `None`, and the branch still decides.
     fn run_quote(&mut self, func: TyId, input: Option<StackId>) -> Result<(), Diagnostic> {
         let func = self.expose(func);
         let Some(index) = self
@@ -1266,7 +1308,7 @@ impl Checker {
 
     /// `call` and `keep` run the quotation on the stack under it. `dip` hides
     /// the values between that stack and the quotation. `if` checks both
-    /// branches on their own inputs before the scheme unifies them.
+    /// branches on the stack under the `Bool` before the scheme unifies them.
     fn force_running(&mut self, name: &str, stack: StackId) -> Result<(), Diagnostic> {
         let Some(word) = builtin::word(name) else {
             return Ok(());
@@ -1285,9 +1327,10 @@ impl Checker {
             }
             builtin::Lowering::If => {
                 if let Some((below_else, else_q)) = self.top_slot(stack) {
-                    if let Some((_, then_q)) = self.top_slot(below_else) {
-                        self.run_quote(then_q, None)?;
-                        self.run_quote(else_q, None)?;
+                    if let Some((below_then, then_q)) = self.top_slot(below_else) {
+                        let input = self.drop_cons(below_then, 1).map(|stack| self.open_spine(stack));
+                        self.run_quote(then_q, input)?;
+                        self.run_quote(else_q, input)?;
                     }
                 }
             }
@@ -1557,53 +1600,77 @@ impl Checker {
             .map_err(|message| self.error(span, message))
     }
 
-    /// `/name` reads one field. The row tail keeps every other label.
+    /// `name>>` reads one field of a type with one constructor.
     fn project_field(
         &mut self,
         span: Span,
         name: &str,
         stack: StackId,
     ) -> Result<StackId, Diagnostic> {
-        let field_ty = self.ty_var();
-        let row_tail = self.row_var();
-        let row = self.row_fields(vec![(name.to_string(), field_ty)], Some(row_tail));
-        let record = self.ty_record(row);
-        let hidden = self.stack_var();
-        let input = self.stack_cons(hidden, record);
-        let output = self.stack_cons(hidden, field_ty);
-        self.unify_stack(stack, input)
-            .map_err(|message| self.error(span, message))?;
+        let (rest, base_ty) = self.pop_slot(stack, span)?;
+        let Some(field_ty) = self.product_field(base_ty, name, span)? else {
+            return Err(self.error(span, Error::ExpectedDataType(self.show_ty(base_ty))));
+        };
+        let output = self.stack_cons(rest, field_ty);
         let effect = match self.ambient {
             Some(effect) => effect,
             None => self.effect_var(),
         };
-        self.pending_here = Some((input, output, effect));
+        self.pending_here = Some((stack, output, effect));
         Ok(output)
     }
 
-    /// `=name` replaces one field. The record is below the new value.
-    /// The label must already be there: this does not extend the row.
+    /// Field `name` of a single-constructor type, or `None` when `ty` is not that type.
+    fn product_field(
+        &mut self,
+        ty: TyId,
+        name: &str,
+        span: Span,
+    ) -> Result<Option<TyId>, Diagnostic> {
+        let ty = self.expose(ty);
+        let TyNode::Ctor(data_name, args) = self.tys[ty.0 as usize].clone() else {
+            return Ok(None);
+        };
+        let Some(data) = self.datas.get(&data_name).cloned() else {
+            return Ok(None);
+        };
+        if data.ctors.len() != 1 {
+            return Err(self.error(span, Error::FieldOfSeveralConstructors(name.to_string())));
+        }
+        if args.len() != data.params.len() {
+            return Err(self.error(span, Error::ExpectedDataType(self.show_ty(ty))));
+        }
+        let ctor = &data.ctors[0];
+        let Some(index) = ctor.names.iter().position(|field| field.as_deref() == Some(name)) else {
+            return Err(self.error(
+                span,
+                Error::NoSuchField { type_name: data_name, name: name.to_string() },
+            ));
+        };
+        let fields = self.instantiate_fields(&data.params, &args, &ctor.fields);
+        Ok(Some(fields[index]))
+    }
+
+    /// `>>name` replaces one field. The value is above the base. The result is a new value.
     fn set_field(
         &mut self,
         span: Span,
         name: &str,
         stack: StackId,
     ) -> Result<StackId, Diagnostic> {
-        let field_ty = self.ty_var();
-        let row_tail = self.row_var();
-        let row = self.row_fields(vec![(name.to_string(), field_ty)], Some(row_tail));
-        let record = self.ty_record(row);
-        let hidden = self.stack_var();
-        let under = self.stack_cons(hidden, record);
-        let input = self.stack_cons(under, field_ty);
-        let output = self.stack_cons(hidden, record);
-        self.unify_stack(stack, input)
+        let (under, value_ty) = self.pop_slot(stack, span)?;
+        let (rest, base_ty) = self.pop_slot(under, span)?;
+        let Some(field_ty) = self.product_field(base_ty, name, span)? else {
+            return Err(self.error(span, Error::ExpectedDataType(self.show_ty(base_ty))));
+        };
+        self.unify_ty(value_ty, field_ty)
             .map_err(|message| self.error(span, message))?;
+        let output = self.stack_cons(rest, base_ty);
         let effect = match self.ambient {
             Some(effect) => effect,
             None => self.effect_var(),
         };
-        self.pending_here = Some((input, output, effect));
+        self.pending_here = Some((stack, output, effect));
         Ok(output)
     }
 
@@ -2266,11 +2333,23 @@ impl Checker {
     }
 
     fn arity_of(&self, name: &str, span: Span) -> Result<usize, Diagnostic> {
-        self.type_arity
+        if let Some(arity) = self
+            .type_arity
             .get(name)
             .or_else(|| self.extra_arity.get(name))
             .copied()
-            .ok_or_else(|| self.error(span, Error::UndefinedType(name.to_string())))
+        {
+            return Ok(arity);
+        }
+        if self.hidden_type_visible() {
+            if let Some(data) = self.datas.get(name) {
+                return Ok(data.params.len());
+            }
+            if let Some(body) = self.synonyms.get(name) {
+                return Ok(body.params.len());
+            }
+        }
+        Err(self.error(span, Error::UndefinedType(name.to_string())))
     }
 
     fn arity_error(&self, span: Span, name: &str, arity: usize) -> Diagnostic {
@@ -5201,29 +5280,35 @@ enum Bottom {
 
 fn public_names(module: &Module) -> Vec<String> {
     let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    let push = |names: &mut Vec<String>, seen: &mut HashSet<String>, name: String| {
+        if seen.insert(name.clone()) {
+            names.push(name);
+        }
+    };
     for item in &module.items {
         if let Item::Data(data) = item {
-            names.push(data.name.clone());
+            push(&mut names, &mut seen, data.name.clone());
             for ctor in &data.ctors {
-                names.push(ctor.name.clone());
+                push(&mut names, &mut seen, ctor.name.clone());
             }
         }
         if let Item::Synonym(synonym) = item {
-            names.push(synonym.name.clone());
+            push(&mut names, &mut seen, synonym.name.clone());
         }
     }
     for item in &module.items {
         if let Item::Def(def) = item {
             if !def.vis.is_private() {
-                names.push(def.name.clone());
+                push(&mut names, &mut seen, def.name.clone());
             }
         }
     }
     for item in &module.items {
         if let Item::Class(class) = item {
-            names.push(class.name.clone());
+            push(&mut names, &mut seen, class.name.clone());
             for method in &class.methods {
-                names.push(method.name.clone());
+                push(&mut names, &mut seen, method.name.clone());
             }
         }
     }
@@ -5238,10 +5323,11 @@ fn find_class_item<'a>(module: &'a Module, name: &str) -> Option<&'a Class> {
 }
 
 impl SynBody {
-    fn from(synonym: &Synonym) -> Self {
+    fn from(synonym: &Synonym, open: bool) -> Self {
         Self {
             params: synonym.params.clone(),
             rhs: synonym.rhs.clone(),
+            open,
         }
     }
 }
@@ -5366,6 +5452,27 @@ mod tests {
     }
 
     #[test]
+    fn named_fields_of_one_constructor() {
+        ok("; Pair a b = Pair frs : a, snd : b\n\n: frs ( a b. (Pair a b) -- a )\n  frs>>\n");
+        ok("; Entry = Entry id : Num, at : Num\n\n: get ( Entry -- Num )\n  at>>\n");
+        ok("; Entry = Entry id : Num, at : Num\n\n: set ( Entry Num -- Entry )\n  >>at\n");
+        ok("; Entry = Entry id : Num, at : Num\n\n: shift ( Entry -- Entry )\n  dup at>> over id>> drop >>at\n");
+        ok("; Entry = Entry id : Num, at : Num\n\n: taken ( Entry Bool -- Num )\n  [ at>> ] [ id>> ] if\n");
+        err(
+            "; Shape = Circle Num | Rect w : Num, h : Num\n\n: width ( Shape -- Num )\n  w>>\n",
+            "field w needs a type with one constructor",
+        );
+        err(
+            "; Effect a = Effect ( -- a )\n\n: act ( a. (Effect a) -- ( -- a ) )\n  act>>\n",
+            "Effect has no field act",
+        );
+        err(
+            "; Entry = Entry id : Num, at : Num\n\n: city ( Entry -- Str )\n  city>>\n",
+            "Entry has no field city",
+        );
+    }
+
+    #[test]
     fn builtins_match_dip_and_if() {
         ok(": double ( Int -- Int )\n  dup drop");
         ok(": swapped ( a b. a b -- b a )\n  swap");
@@ -5445,12 +5552,12 @@ mod tests {
         );
         ok(": run ( a b. a (a -- b) -- b )\n  [ x f -> x f call ] call");
         err(
-            ": bad ( { name : Str, name : Int } -- Str )\n  drop",
+            "; Person = Person name : Str, name : Int\n",
             "duplicate field name",
         );
         err(
-            ": bad ( Int -- Int )\n  /name",
-            "type mismatch: expected { name : _ | _ }, found Int",
+            ": bad ( Int -- Int )\n  name>>",
+            "type mismatch: expected a data type, found Int",
         );
         err(": bad ( Int -- Int )\n  nope", "undefined word nope");
         err(
@@ -5516,67 +5623,27 @@ mod tests {
     }
 
     #[test]
-    fn checks_records() {
-        ok(": get ( { age : Int, name : Str } -- Str )\n  /name");
-        ok(": get ( a. { name : a | r } -- a )\n  /name");
-        ok(": get ( a. { name : a | r } -- a )\n  /name\n\n: use ( { age : Int, name : Str } -- Str )\n  get");
-        ok(": use ( { name : Str, age : Int | r } -- Str )\n  /name");
-        ok(": held ( { name : Str | r } -- { name : Str | r } )\n  dup drop");
-        ok(": touch ( { } -- { } )\n  dup drop");
-        ok(": idrec ( { name : Str | r } -- { name : Str | r } )\n  dup drop\n\n: use ( { name : Str } -- { name : Str } )\n  idrec");
-        ok(": held ( ..s { name : Str | s } -- ..s { name : Str | s } )\n  dup drop");
-        ok(": read ( a. { name : a | r } ({ name : a | r } -- a) -- a )\n  call");
-        ok("; Person = Mk { name : Str, age : Int }\n\n: personName ( Person -- Str )\n  Mk -> /name");
+    fn fields_read_a_product() {
+        ok("; Person = Person name : Str, age : Num\n- Human Person\n\n: older ( Human -- Human )\n  37 >>age\n");
+        ok("; Pair a b = Pair frs : a, snd : b\n\n: frs ( (Pair Int Str) -- Int )\n  frs>>\n");
         err(
-            ": bad ( { age : Int } -- Str )\n  /name",
-            "record has no field name",
+            ": bad ( a. a -- Str )\n  name>>",
+            "type mismatch: expected a data type, found a",
         );
         err(
-            ": bad ( { } -- Int )\n  /name",
-            "record has no field name",
+            "- Time Num\n\n: bad ( Time -- Str )\n  name>>",
+            "type mismatch: expected a data type, found Num",
         );
         err(
-            ": bad ( { name : Int } -- Str )\n  /name",
-            "type mismatch: expected Str, found Int",
+            ": bad ( Int -- Int )\n  1 >>age",
+            "type mismatch: expected a data type, found Int",
         );
+        err(": bad ( -- Str )\n  { name: \"Ada\" }", "unexpected character");
+        err(": bad ( Int -- Int )\n  +city", "unexpected character");
         err(
-            ": bad ( { name : Str | r } -- Int )\n  /age",
-            "record has no field age",
+            "; Person = Person name : Str, age : Num\n\n: bad ( Person -- Str )\n  age>>",
+            "type mismatch: expected Str, found Num",
         );
-        err(
-            ": bad ( { name : Str | r } -- { age : Int | r } )\n  dup drop",
-            "occurs check failed",
-        );
-        err(
-            ": bad ( { name : Str | r } -- { name : Str } )\n  dup drop",
-            "type mismatch: expected { name : Str }, found { name : Str | r }",
-        );
-        err(
-            ": bad ( { name : Str | r } -- { name : Str | s } )\n  dup drop",
-            "type mismatch: expected { name : Str | s }, found { name : Str | r }",
-        );
-        err(
-            ": bad ( r. { name : Str | r } -- Str )\n  /name",
-            "duplicate type variable r",
-        );
-        ok(": get ( { name : a | r } -- a )\n  /name");
-        err(
-            ": bad ( { age : Int, name : Str } -- Int )\n  dup drop",
-            "type mismatch: expected Int, found { age : Int, name : Str }",
-        );
-        err(
-            ": bad ( a. ({ name : Str } a) -- a )\n  drop",
-            "kind mismatch: expected _ -> _, found Type",
-        );
-        err(
-            ": bad ( { name : Int } -- { name : Str } )\n  dup drop",
-            "type mismatch: expected Str, found Int",
-        );
-        check_source(
-            "language 1\n: get ( a. { name : a | r } -- a )\n",
-            ParseMode::Interface,
-        )
-        .unwrap();
     }
 
     #[test]
@@ -5910,7 +5977,7 @@ mod tests {
 
     #[test]
     fn a_data_type_keeps_the_file_that_declared_it() {
-        let num = parse("; Box a = Mk a a\n", ParseMode::Source).unwrap();
+        let num = parse("; Box a = Mk one : a, two : a\n", ParseMode::Source).unwrap();
         let other = parse(
             "; Box a = Box a\n\n: wrap ( a. a -- (Box a) )\n  Box\n",
             ParseMode::Source,
@@ -5947,7 +6014,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.message, "duplicate definition Box");
 
-        let twin = parse("; Box a = Mk a a\n", ParseMode::Source).unwrap();
+        let twin = parse("; Box a = Mk one : a, two : a\n", ParseMode::Source).unwrap();
         let known_twin = vec![super::KnownModule {
             origin: "Twin.ply".to_string(),
             module: twin.clone(),
@@ -5999,12 +6066,12 @@ mod tests {
     }
 
     #[test]
-    fn checks_arrays_records_strings_and_maps() {
+    fn checks_arrays_strings_and_maps() {
         ok(": none ( -- (Array Int) )\n  <>");
         ok(": nums ( -- (Array Num) )\n  < 1 2 3 >");
         ok(": quotes ( -- (Array (Num -- Num)) )\n  < [ dup drop ] [ dup drop ] >");
-        ok(": person ( -- { name : Str, age : Num } )\n  { name: \"Ada\", age: 36 }");
-        ok(": older ( { name : Str, age : Num } -- { name : Str, age : Num } )\n  37 =age");
+        ok("; Person = Person name : Str, age : Num\n\n: person ( -- Person )\n  \"Ada\" 36 Person");
+        ok("; Person = Person name : Str, age : Num\n\n: older ( Person -- Person )\n  37 >>age");
         ok(": text ( -- Str )\n  \"ab\"");
         ok(": hold ( (StrMap Num) -- (StrMap Num) )\n  dup drop");
         err(
@@ -6012,8 +6079,8 @@ mod tests {
             "type mismatch: expected Num, found Str",
         );
         err(
-            ": bad ( { name : Str } -- { name : Str } )\n  1 =age",
-            "record has no field age",
+            "; Person = Person name : Str, age : Num\n\n: bad ( Person -- Person )\n  1 >>city",
+            "Person has no field city",
         );
         err("; Array a = Mk a", "cannot redefine builtin Array");
         err("; StrMap a = Mk a", "cannot redefine builtin StrMap");
@@ -6045,19 +6112,14 @@ mod tests {
 
     #[test]
     fn synonyms_expand_and_newtypes_stay_nominal() {
-        ok("- Person { name : Str, age : Num }\n\n: older ( Person -- Person )\n  37 =age\n");
-        ok("- Pair a b { left : a, right : b }\n\n: id ( (Pair Int Str) -- { left : Int, right : Str } )\n  dup drop\n");
+        ok("; Person = Person name : Str, age : Num\n- Human Person\n\n: older ( Human -- Human )\n  37 >>age\n");
+        ok("; Pair a b = Pair left : a, right : b\n- Twin a (Pair a a)\n\n: id ( (Twin Int) -- (Pair Int Int) )\n  dup drop\n");
         ok("- Alias Int\n\n: use ( Alias -- Int )\n  dup drop\n");
         ok("; Maybe a = Nothing | Just a\n- Answer (Maybe Int)\n\n: get ( Answer -- Int )\n  Nothing -> 0n\n  Just ->\n");
-        ok("& Eq a\n  eq ( a a -- Bool )\n\n- Person { name : Str, age : Num }\n\n: eqPerson ( { name : Str, age : Num } { name : Str, age : Num } -- Bool )\n  drop drop true\n\n# Eq Person\n  eq = eqPerson\n\n: same ( Person Person -- Bool )\n  eq\n");
+        ok("& Eq a\n  eq ( a a -- Bool )\n\n; Person = Person name : Str, age : Num\n- Human Person\n\n: eqHuman ( Human Human -- Bool )\n  drop drop true\n\n# Eq Human\n  eq = eqHuman\n\n: same ( Human Human -- Bool )\n  eq\n");
         ok("; Person = Person Str\n- Alias Person\n\n& Eq a\n  eq ( a a -- Bool )\n\n: eqPerson ( Person Person -- Bool )\n  drop drop true\n\n# Eq Alias\n  eq = eqPerson\n");
         ok("; Age == Age Num\n\n: older ( Age -- Age )\n  Age -> Age\n");
-        ok("; Person == Person { name : Str, age : Num }\n\n: older ( Person -- Person )\n  Person -> 37 =age Person\n");
         ok("; Age == Age Num\n\n& Eq a\n  eq ( a a -- Bool )\n\n: eqAge ( Age Age -- Bool )\n  drop drop true\n\n# Eq Age\n  eq = eqAge\n");
-        err(
-            "- Person { name : Str, age : Num }\n\n: bad ( Person -- Person )\n  Person ->\n",
-            "type mismatch: expected a data type, found { age : Num, name : Str }",
-        );
         err("- A A", "cyclic type A");
         err(
             "- A (Maybe A)\n\n; Maybe a = Nothing | Just a",
@@ -6080,9 +6142,9 @@ mod tests {
         );
         err("; Pair == Left Int | Right Int", "newtype expects one constructor");
         err("; Unitish == Unitish", "newtype expects one field");
-        err("; Two == Two Int Int", "newtype expects one field");
+        err("; Two == Two one : Int, two : Int", "newtype expects one field");
         err(
-            "& Eq a\n  eq ( a a -- Bool )\n\n- Person { name : Str, age : Num }\n\n: eqPerson ( Person Person -- Bool )\n  drop drop true\n\n: eqRow ( { name : Str, age : Num } { name : Str, age : Num } -- Bool )\n  drop drop true\n\n# Eq Person\n  eq = eqPerson\n\n# Eq { name : Str, age : Num }\n  eq = eqRow\n",
+            "& Eq a\n  eq ( a a -- Bool )\n\n; Person = Person name : Str, age : Num\n- Human Person\n\n: eqHuman ( Human Human -- Bool )\n  drop drop true\n\n: eqPerson ( Person Person -- Bool )\n  drop drop true\n\n# Eq Human\n  eq = eqHuman\n\n# Eq Person\n  eq = eqPerson\n",
             "incoherent instance",
         );
     }
@@ -6130,78 +6192,19 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_record_tail_splices_and_plus_inserts() {
-        ok("- Person { name : Str, age : Num }\n- PersonWithCity { city : Str | Person }\n\n: inParis ( Person -- PersonWithCity )\n  \"Paris\" +city\n");
-        ok("- Person { name : Str, age : Num }\n- PersonWithCity { city : Str | Person }\n\n: withCity ( Person Str -- PersonWithCity )\n  +city\n");
-        ok("- Person a { name : a, age : Num }\n- PersonWithCity a { city : Str | (Person a) }\n\n: withCity ( a. (Person a) Str -- (PersonWithCity a) )\n  +city\n");
-        ok("- Person { name : Str, age : Num }\n- PersonWithCity { city : Str | Person }\n\n: older ( { name : Str, age : Num | r } -- { name : Str, age : Num | r } )\n  37 =age\n\n: usePerson ( Person -- Person )\n  older\n\n: useCity ( PersonWithCity -- PersonWithCity )\n  older\n");
-        ok("- Person { name : Str, age : Num }\n\n: moved ( Person -- { name : Str, age : Num, city : Str, zip : Str } )\n  \"Paris\" +city \"75001\" +zip\n");
-        ok("- Person { name : Str, age : Num }\n- PersonWithCity { city : Str | Person }\n\n: fix ( Person -- PersonWithCity )\n  \"Lyon\" +city \"Paris\" =city\n");
-        ok(": tagged ( -- { city : Str } )\n  {} \"Paris\" +city\n");
-        ok(": named ( { city : Str | { name : Str } } -- Str )\n  /name\n");
-        ok("- Open { name : Str | r }\n\n: get ( Open -- Str )\n  /name\n");
+    fn braces_and_plus_are_not_syntax() {
+        err(": bad ( -- Str )\n  {}", "unexpected character");
+        err(": bad ( Int -- Int )\n  +name", "unexpected character");
         err(
-            "- Open { name : Str | r }\n- Bad { city : Str | Open }\n",
-            "record tail must be closed",
-        );
-        err(
-            "- Person { name : Str, age : Num }\n\n: bad ( { name : Str, age : Num | r } -- { name : Str, age : Num, city : Str | r } )\n  \"Paris\" +city\n",
-            "record tail must be closed",
-        );
-        err(
-            "- Person { name : Str, age : Num, city : Str }\n\n: bad ( Person -- Person )\n  \"Paris\" +city\n",
-            "duplicate field city",
-        );
-        err(
-            "- Bad { city : Str | Int }\n",
-            "type mismatch: expected a record, found Int",
-        );
-        err(
-            "- Person { name : Str, age : Num }\n- Bad { name : Str | Person }\n",
-            "duplicate field name",
-        );
-        err(
-            "- A { name : Str | B }\n- B { city : Str | A }\n",
-            "cyclic type A",
-        );
-        err(
-            "- Person { name : Str, age : Num }\n\n: bad ( Person -- Person )\n  \"Paris\" +city\n",
-            "record has no field city",
-        );
-        err(
-            "- Person { name : Str, age : Num }\n\n: bad ( Person -- Person )\n  \"Paris\" =city\n",
-            "record has no field city",
-        );
-        err(
-            "- Person { name : Str, age : Num }\n- PersonWithCity { city : Str | Person }\n\n: bad ( Person -- PersonWithCity )\n  1 +city\n",
-            "type mismatch: expected Str, found Num",
-        );
-        err(
-            ": bad ( a. a -- a )\n  \"x\" +name\n",
-            "type mismatch: expected a record, found a",
-        );
-        err(
-            ": bad ( Int -- Int )\n  \"x\" +name\n",
-            "type mismatch: expected a record, found Int",
-        );
-        err(
-            "; Person == Person { name : Str, age : Num }\n\n: bad ( Person -- Person )\n  \"Paris\" +city\n",
-            "type mismatch: expected a record, found Person",
-        );
-        err(
-            "- Person a { name : a }\n- Bad { city : Str | Person }\n",
-            "type constructor Person expects 1 argument",
-        );
-        err(
-            "- Wrap a { city : Str | (a) }\n",
-            "type mismatch: expected a record, found _",
+            "; Person = Person name : Str, age : Num\n\n: bad ( Person -- Person )\n  \"Paris\" +city",
+            "unexpected character",
         );
     }
 
     #[test]
     fn imports_publish_synonym_names() {
         let provider = parse(
-            "- Person { name : Str, age : Num }\n\n: older ( Person -- Person )\n  37 =age\n",
+            "; Person = Person name : Str, age : Num\n- Human Person\n\n: older ( Human -- Human )\n  37 >>age\n",
             ParseMode::Source,
         )
         .unwrap();
@@ -6221,18 +6224,28 @@ mod tests {
             )
         };
         check_import(
-            "~ \"Data/Person\" (older)\n\n: use ( { name : Str, age : Num } -- { name : Str, age : Num } )\n  older\n",
+            "~ \"Data/Person\" (older, Human)\n\n: use ( Human -- Human )\n  older\n",
         )
         .unwrap();
         check_import(
-            "~ \"Data/Person\" (..)\n\n: use ( Person -- Person )\n  older\n",
+            "~ \"Data/Person\" (..)\n\n: use ( Human -- Human )\n  older\n",
         )
         .unwrap();
         let missing = check_import(
-            "~ \"Data/Person\" (older)\n\n: use ( Person -- Person )\n  older\n",
+            "~ \"Data/Person\" (older)\n\n: use ( Human -- Human )\n  older\n",
         )
         .unwrap_err();
-        assert_eq!(missing.message, "undefined type Person");
+        assert_eq!(missing.message, "undefined type Human");
+        let hidden = check_import(
+            "~ \"Data/Person\" (older, Human)\n\n: use ( Person -- Person )\n  drop\n",
+        )
+        .unwrap_err();
+        assert_eq!(hidden.message, "undefined type Person");
+        let sneak = check_import(
+            "~ \"Data/Person\" (older)\n\n- Sneak Person\n\n: use ( Sneak -- Sneak )\n  drop\n",
+        )
+        .unwrap_err();
+        assert_eq!(sneak.message, "undefined type Person");
     }
 
     #[test]
@@ -6259,7 +6272,7 @@ mod tests {
             ": held ( a. a Bool -- a )\n  true ->\n  false ->\n",
         );
         ok(
-            "; Pair a b = Pair a b\n\n: snd ( a b. (Pair a b) -- b )\n  (Pair _ y) -> y\n\n: both ( (Pair Bool Bool) -- Int )\n  (Pair true true) -> 1n\n  (Pair true false) -> 2n\n  (Pair false true) -> 3n\n  (Pair false false) -> 4n\n",
+            "; Pair a b = Pair frs : a, snd : b\n\n: snd ( a b. (Pair a b) -- b )\n  (Pair _ y) -> y\n\n: both ( (Pair Bool Bool) -- Int )\n  (Pair true true) -> 1n\n  (Pair true false) -> 2n\n  (Pair false true) -> 3n\n  (Pair false false) -> 4n\n",
         );
         ok(
             "; Age == Age Num\n\n: years ( Age -- Num )\n  (Age n) -> n\n\n: bare ( Age -- Num )\n  Age ->\n",
@@ -6328,7 +6341,7 @@ mod tests {
             "type mismatch: expected a data type, found Int",
         );
         err(
-            "; Pair a b = Pair a b\n\n: bad ( (Pair Int Int) -- Int )\n  (Pair x x) -> x\n",
+            "; Pair a b = Pair frs : a, snd : b\n\n: bad ( (Pair Int Int) -- Int )\n  (Pair x x) -> x\n",
             "duplicate definition x",
         );
         err(
@@ -6393,69 +6406,6 @@ mod tests {
     }
 
     #[test]
-    fn record_patterns_read_named_fields() {
-        ok(
-            ": nameOf ( { name : Str | r } -- Str )\n  { name : n } -> n\n\n: born ( { name : Str, year : Int } -- Str )\n  { year : 1815n, name : n } -> n\n  { name : n } -> n\n\n: touch ( { name : Str | r } -- Bool )\n  {} -> true\n\n: title ( { who : { name : Str | s } | r } -- Str )\n  { who : { name : n } } -> n\n\n: flag ( { on : Bool } -- Bool )\n  { on : true } -> true\n  { on : false } -> false\n\n: nameOnly ( { name : Str, age : Int } -- Str )\n  { name : n } -> n\n\n- Human { name : Str, age : Num }\n\n: humanName ( Human -- Str )\n  { name : n } -> n\n\n; Person = Mk { name : Str, age : Int }\n\n: personName ( Person -- Str )\n  (Mk { name : n }) -> n\n\n; Maybe a = Nothing | Just a\n\n: parisName ( { who : (Maybe { name : Str, city : Str }) } -- Str )\n  { who : (Just { city : \"Paris\", name : n }) } -> n\n  { who : (Just { name : n }) } -> n\n  _ -> \"\"\n\n: headName ( { people : (Array { name : Str | r }) } -- Str )\n  { people : < { name : n } > } -> n\n  _ -> \"\"\n\n: firstCity ( (Array { city : Str | r }) -- Str )\n  < { city : c } > -> c\n  _ -> \"\"\n\n: ada ( { name : Str | r } Bool -- Str )\n  { name : \"Ada\" } true -> \"Ada\"\n  { name : \"Ada\" } false -> \"Ada\"\n  _ _ -> \"\"\n",
-        );
-        err(
-            ": bad ( { name : Str, year : Int } -- Str )\n  { year : 1815n } -> \"\"\n",
-            "non-exhaustive match: { name : Str, year : Int }",
-        );
-        err(
-            ": bad ( { who : (Maybe Str) } -- Str )\n  { who : (Just n) } -> n\n\n; Maybe a = Nothing | Just a",
-            "non-exhaustive match: { who : Nothing }",
-        );
-        err(
-            ": bad ( { who : (Maybe { name : Str, city : Str }) } -- Str )\n  { who : (Just { city : \"Paris\", name : n }) } -> n\n\n; Maybe a = Nothing | Just a",
-            "non-exhaustive match: { who : Nothing }, { who : (Just { city : Str, name : Str }) }",
-        );
-        err(
-            ": bad ( { nums : (Array Int) } -- Int )\n  { nums : <> } -> 0n\n",
-            "non-exhaustive match: { nums : Array }",
-        );
-        err(
-            ": bad ( { name : Str } Bool -- Str )\n  { name : \"Ada\" } true -> \"Ada\"\n  { name : \"Grace\" } _ -> \"Grace\"\n",
-            "non-exhaustive match: { name : Str } true, { name : Str } false, { name : \"Ada\" } false",
-        );
-        err(
-            ": bad ( { name : Str | r } -- Str )\n  { name : n } -> n\n  _ -> \"\"\n",
-            "redundant pattern",
-        );
-        err(
-            ": bad ( { name : Str | r } -- Str )\n  {} -> \"\"\n  { name : n } -> n\n",
-            "redundant pattern",
-        );
-        err(
-            ": bad ( { name : Str, age : Int } -- Int )\n  { age : a, name : _ } -> a\n  { name : n, age : a } -> a\n",
-            "redundant pattern",
-        );
-        err(
-            ": bad ( { name : Str | r } -- Int )\n  { age : a } -> a\n",
-            "record has no field age",
-        );
-        err(
-            ": bad ( { name : Str } -- Str )\n  { name : n, age : a } -> n\n",
-            "record has no field age",
-        );
-        err(
-            ": bad ( { name : Int } -- Int )\n  { name : 0 } -> 0n\n",
-            "type mismatch: expected Num, found Int",
-        );
-        err(
-            ": bad ( Int -- Int )\n  {} -> 0n\n",
-            "type mismatch: expected { | _ }, found Int",
-        );
-        err(
-            ": bad ( a. a -- a )\n  { name : n } -> n\n",
-            "type mismatch: expected { name : _ | _ }, found a",
-        );
-        err(
-            ": bad ( { name : Str, city : Str } -- Str )\n  { name : n, city : n } -> n\n",
-            "duplicate definition n",
-        );
-    }
-
-    #[test]
     fn one_head_can_implement_several_classes() {
         ok(
             "; Box a = Mk a\n\n& Comparable a\n  eq ( a a -- Bool )\n\n& Sortable a\n  compare ( a a -- Bool )\n\n: eqBox ( (Box a) (Box a) -- Bool )\n  drop drop true\n\n: cmpBox ( (Box a) (Box a) -- Bool )\n  drop drop true\n\n# Comparable, Sortable (Box a)\n  eq = eqBox\n  compare = cmpBox\n\n: useEq ( (Box Int) (Box Int) -- Bool )\n  eq\n\n: useCmp ( (Box Int) (Box Int) -- Bool )\n  compare\n",
@@ -6469,11 +6419,11 @@ mod tests {
     #[test]
     fn an_instance_word_must_cover_the_method() {
         err(
-            "; Pair a b = Pair a b\n\n& Mappable f\n  map ( (f a) (a -- b) -- (f b) )\n\n: mapLeft ( (Pair a b) (a -- c) -- (Pair c b) )\n  (Pair x y) f ->\n    x f call y Pair\n\n# Mappable (Pair a)\n  map = mapLeft\n",
+            "; Pair a b = Pair frs : a, snd : b\n\n& Mappable f\n  map ( (f a) (a -- b) -- (f b) )\n\n: mapLeft ( (Pair a b) (a -- c) -- (Pair c b) )\n  (Pair x y) f ->\n    x f call y Pair\n\n# Mappable (Pair a)\n  map = mapLeft\n",
             "type mismatch: expected _, found a",
         );
         ok(
-            "; Pair a b = Pair a b\n\n& Mappable f\n  map ( (f a) (a -- b) -- (f b) )\n\n: mapRight ( (Pair a b) (b -- c) -- (Pair a c) )\n  (Pair x y) f ->\n    x y f call Pair\n\n# Mappable (Pair a)\n  map = mapRight\n\n: use ( (Pair Int Str) (Str -- Bool) -- (Pair Int Bool) )\n  map\n",
+            "; Pair a b = Pair frs : a, snd : b\n\n& Mappable f\n  map ( (f a) (a -- b) -- (f b) )\n\n: mapRight ( (Pair a b) (b -- c) -- (Pair a c) )\n  (Pair x y) f ->\n    x y f call Pair\n\n# Mappable (Pair a)\n  map = mapRight\n\n: use ( (Pair Int Str) (Str -- Bool) -- (Pair Int Bool) )\n  map\n",
         );
         err(
             "; Maybe a = Nothing | Just a\n\n& Comparable a\n  eq ( a a -- Bool )\n\n& Mappable f\n  map ( (f a) (a -- b) -- (f b) )\n\n: mapCmp ( Comparable b => (Maybe a) (a -- b) -- (Maybe b) )\n  drop drop Nothing\n\n# Mappable Maybe\n  map = mapCmp\n",

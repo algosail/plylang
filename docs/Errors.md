@@ -27,9 +27,9 @@ Fix: treat the message as a compiler bug. Report the full text.
 
 `unexpected character`
 
-The character is not part of Ply. A field insert is `+` glued to a name (`+city`). A space, a second `+`, or a mark such as `*` or `@` is this error.
+The character is not part of Ply. `{`, `}`, and `+` are this error. A space or a mark such as `*` or `@` is this error.
 
-Fix: delete the character or rewrite the token. The stack word for Factor's `-rot` is `unrot`.
+Fix: delete the character or rewrite the token. A field of a type with one constructor is `name>>` or `>>name`. The stack word for Factor's `-rot` is `unrot`.
 
 ## PL0002
 
@@ -239,9 +239,9 @@ Fix: write `: name`, `: foreign name`, or `: foreign private name`. A repeated m
 
 `expected ':'`
 
-A word declaration, a record field, or a record-pattern field needed `:`.
+A word declaration or a constructor field needed `:`.
 
-Fix: write the colon. A record field is `name: value`. A record type field is `name : Type`.
+Fix: write the colon. A constructor field is `name : Type`.
 
 ## PL0028
 
@@ -287,9 +287,9 @@ Fix: put `->` between the patterns and the body: `Nothing ->` or `x ->`.
 
 `expected pattern`
 
-An equation has no pattern, or a constructor field or a record-pattern slot is empty.
+An equation has no pattern, or a constructor-pattern slot is empty.
 
-Fix: write a pattern. The rightmost pattern is the top of the stack. `_` discards one value. Parentheses keep one slot: `Just (x)`.
+Fix: write a pattern. The rightmost pattern is the top of the stack. `_` discards one value. Parentheses keep one slot: `(Just x)`.
 
 ## PL0034
 
@@ -303,25 +303,25 @@ Fix: give this equation that many patterns. One pattern is `pattern`; any other 
 
 `expected field name`
 
-A record type, a record literal, or a record pattern needed a field label.
+A constructor with named fields needed a field label.
 
-Fix: write the label. A tail is `| r` or `| Type` after the fields, and a bare `|` is not a label.
+Fix: write the label, `name : Type`. A constructor with one field has no label: `Some a`. `|` separates constructors.
 
 ## PL0036
 
 `expected '}'`
 
-A `{` was not closed.
+Source does not produce this message. `{` is an unexpected character (`PL0001`).
 
-Fix: add the matching `}`.
+Fix: delete `{` and `}`.
 
 ## PL0037
 
 `duplicate field name`
 
-The same label appears twice in one record type, record literal, or record pattern.
+The same label appears twice in one constructor.
 
-Fix: keep one field of that name. Replacing a value at runtime is `=name`, which is a different message when the label is already in the row (`PL0060`).
+Fix: keep one field of that name. Replacing a value is `>>name`. A missing field on a type with one constructor is `PL0120`.
 
 ## PL0038
 
@@ -391,7 +391,7 @@ Fix: write `..s Num -- ..s Num`. `Num ..s` is this error.
 
 `expected type`
 
-A type atom was required: an uppercase name, a lowercase variable, a parenthesized type, or a record type.
+A type atom was required: an uppercase name, a lowercase variable, or a parenthesized type.
 
 Fix: write one of those.
 
@@ -399,17 +399,17 @@ Fix: write one of those.
 
 `expected row variable`
 
-The record tail after `|` must be a lowercase row variable, a type, or a record type.
+Source does not produce this message. `|` separates constructors.
 
-Fix: write `| r`, `| Person`, `| (Person a)`, or `| { name : Str }`.
+Fix: write `Nothing | Just a`. `{` and `}` are an unexpected character (`PL0001`).
 
 ## PL0048
 
 `expected element`
 
-An array slot or a record-field value was required and the next token is not one.
+An array slot was required and the next token is not an element.
 
-Fix: put a literal, a name, or another element in the slot. Arrays are `<1, 2>`. Record literals are `{ name: "Ada" }`.
+Fix: put a literal, a quotation, or a nested array in the slot. Arrays are `< 1 2 3 >`.
 
 ## PL0049
 
@@ -505,15 +505,15 @@ Fix: pass that many arguments. `Maybe` takes one: `Maybe a`.
 
 `duplicate field NAME`
 
-The record row already contains this label. This includes `+name` on a record that already has `name`, and a label that appears again after a tail is expanded.
+Source does not produce this message. A constructor that repeats a label is `PL0037`.
 
-Fix: drop the extra label. To change a value that is already there, use `=name`.
+Fix: keep one field of that name. To change a value that is already there, use `>>name`.
 
 ## PL0061
 
 `type mismatch: expected A, found B`
 
-A type, a stack, or a record row does not match. There is no subtyping. `Int` and `Num` are different types. A closed record and a record with another tail are different.
+A type or a stack does not match. There is no subtyping. `Int` and `Num` are different types.
 
 Fix: change the value or the signature so both sides print as the same type.
 
@@ -521,17 +521,17 @@ Fix: change the value or the signature so both sides print as the same type.
 
 `type mismatch: expected a record, found TYPE`
 
-The position needs a record. `/name`, `=name`, and `+name` read or write a record. A tail after `|` must also elaborate to a record when it is a type.
+Source does not produce this message. `name>>` and `>>name` on a type that is not a data type with one constructor are `PL0063`. `{`, `}`, and `+` are an unexpected character (`PL0001`).
 
-Fix: pass a record, or change the tail to a record type.
+Fix: read a field of a type declared with one constructor.
 
 ## PL0063
 
 `type mismatch: expected a data type, found TYPE`
 
-A constructor pattern was checked against a type that has no constructors. The type may be `Int`, a record, a variable, or another non-data type.
+A constructor pattern, `name>>`, or `>>name` was checked against a type that has no constructors. The type may be `Int`, a type variable, a synonym of a non-data type, or another non-data type.
 
-Fix: match a value of the data type, or change the pattern.
+Fix: use a data type with one constructor, or match with `->`. A sum is `PL0119`. A missing field is `PL0120`.
 
 ## PL0064
 
@@ -585,17 +585,17 @@ Fix: if the source does not mention effects, report the diagnostic as a compiler
 
 `record has no field NAME`
 
-The record type does not have this label. `/name` and `=name` only see labels already in the row. An open tail `| r` does not add a label.
+Source does not produce this message. A type with one constructor that has no field of this name is `PL0120`.
 
-Fix: add the field to the type, or insert it with `+name` on a closed record that does not yet have it.
+Fix: use the field's name, or match with `->`.
 
 ## PL0071
 
 `record tail must be closed`
 
-`+name`, and a check that extends a closed row, needs a record with no open tail.
+Source does not produce this message. `{`, `}`, and `+` are an unexpected character (`PL0001`).
 
-Fix: close the row in the signature, or accept extra labels with `| r` instead of inserting one.
+Fix: declare the fields on the constructor and replace one with `>>name`.
 
 ## PL0072
 
@@ -966,3 +966,35 @@ Fix: write `: main ( -- Unit )` and a body that returns `Unit`, or rename the wo
 `; foreign` names a type whose values come from JavaScript. The declaration ends after the name and its parameters. `=`, `==`, or a constructor name after that is this error.
 
 Fix: write `; foreign Hub a`. A type that has constructors is an ordinary `;` declaration.
+
+## PL0117
+
+`a constructor with several fields names each one`
+
+Two or more fields were written as types only, as in `Pair a b`. The kind stays on the left of `=`. Each field on the right has a name and a type.
+
+Fix: write `Pair frs : a, snd : b`. A constructor with one field stays a bare type: `Some a`.
+
+## PL0118
+
+`a single field has no name`
+
+A constructor with one field was written `value : Type`. The name of that field belongs in the equation, not in the declaration.
+
+Fix: write `Some a` or `Effect ( -- a )`.
+
+## PL0119
+
+`field NAME needs a type with one constructor`
+
+`name>>` or `>>name` was used on a sum. `None` has no fields, so the reader cannot pick a field of `Option`.
+
+Fix: match with `->` and read the field in the branch that has it.
+
+## PL0120
+
+`TYPE has no field NAME`
+
+The type has one constructor, and that constructor has no field of this name. A one-field constructor such as `Effect` has no `name>>`.
+
+Fix: use the field's name, or match the one field with `->`.

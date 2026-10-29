@@ -334,15 +334,25 @@ impl Parser {
     fn parse_ctor(&mut self) -> Result<Ctor, Diagnostic> {
         let start = self.cur().span;
         let name = self.expect_upper(Error::ExpectedConstructor)?;
-        let mut fields = Vec::new();
-        loop {
-            if self.stops_ctor_field() {
-                break;
+        if self.named_fields_ahead() {
+            let fields = self.parse_named_ctor_fields()?;
+            if fields.len() < 2 {
+                return Err(self.error_at(start, Error::SingleFieldUnnamed));
             }
-            if self.starts_type_item() {
-                fields.push(self.parse_type_item()?);
-            } else {
-                break;
+            return Ok(Ctor {
+                span: start.merge(self.last_span),
+                name,
+                fields,
+            });
+        }
+        let mut fields = Vec::new();
+        if !self.stops_ctor_field() && self.starts_type_item() {
+            fields.push(CtorField {
+                name: None,
+                ty: self.parse_type_item()?,
+            });
+            if !self.stops_ctor_field() && self.starts_type_item() {
+                return Err(self.error_at(start, Error::SeveralFieldsNeedNames));
             }
         }
         Ok(Ctor {
@@ -350,6 +360,66 @@ impl Parser {
             name,
             fields,
         })
+    }
+
+    /// `frs : a, snd : b`. A newline may sit before the first name and after a comma.
+    fn parse_named_ctor_fields(&mut self) -> Result<Vec<CtorField>, Diagnostic> {
+        let mut fields: Vec<CtorField> = Vec::new();
+        loop {
+            self.skip_newlines();
+            if !self.named_field_here() {
+                break;
+            }
+            let name_span = self.cur().span;
+            let name = self.expect_lower(Error::ExpectedFieldName)?;
+            if fields.iter().any(|field| field.name.as_deref() == Some(name.as_str())) {
+                return Err(self.error_at(name_span, Error::DuplicateFieldName));
+            }
+            self.expect(&TokenKind::Colon, Error::ExpectedColon)?;
+            let ty = self.parse_type_item()?;
+            fields.push(CtorField { name: Some(name), ty });
+            self.skip_newlines();
+            if self.eat(&TokenKind::Comma) {
+                continue;
+            }
+            if self.named_field_here() {
+                continue;
+            }
+            break;
+        }
+        Ok(fields)
+    }
+
+    fn named_field_here(&self) -> bool {
+        self.is_lower_ident()
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .is_some_and(|token| matches!(token.kind, TokenKind::Colon))
+    }
+
+    /// A named field may start on the next line. A positional field may not.
+    fn named_fields_ahead(&self) -> bool {
+        let mut index = self.pos;
+        loop {
+            let Some(token) = self.tokens.get(index) else {
+                return false;
+            };
+            if matches!(token.kind, TokenKind::Newline) {
+                index += 1;
+                continue;
+            }
+            let TokenKind::Ident(name) = &token.kind else {
+                return false;
+            };
+            if !is_lower(name) {
+                return false;
+            }
+            return matches!(
+                self.tokens.get(index + 1).map(|token| &token.kind),
+                Some(TokenKind::Colon)
+            );
+        }
     }
 
     fn stops_ctor_field(&self) -> bool {
@@ -1723,36 +1793,45 @@ mod tests {
     }
 
     #[test]
-    fn brackets_are_arrays_and_braces_are_records() {
+    fn parses_named_constructor_fields() {
+        let text = ok("; Pair a b = Pair frs : a, snd : b\n");
+        assert!(text.contains("Pair frs : a, snd : b"), "{text}");
+        let wrapped = ok("; Entry = Entry\n  id : Num,\n  at : Num\n");
+        assert!(wrapped.contains("Entry id : Num, at : Num"), "{wrapped}");
+        assert_eq!(
+            err("; Pair a b = Pair a b\n", ParseMode::Source),
+            "a constructor with several fields names each one"
+        );
+        assert_eq!(
+            err("; Box a = Box value : a\n", ParseMode::Source),
+            "a single field has no name"
+        );
+        assert_eq!(
+            err("; Option a = None | Some value : a\n", ParseMode::Source),
+            "a single field has no name"
+        );
+    }
+
+    #[test]
+    fn brackets_are_arrays() {
         let array = ok(": arr ( -- (Array Num) )\n  < 1 2 3 >\n");
         assert!(array.contains("< 1 2 3 >"), "{array}");
         assert_eq!(ok(&array), array);
         let empty = ok(": none ( -- (Array Int) )\n  <>\n");
         assert!(empty.contains("<>"), "{empty}");
         assert_eq!(ok(&empty), empty);
-        let record = ok(": p ( -- { name : Str } )\n  { name: \"Ada\" }\n");
-        assert!(record.contains("{ name: \"Ada\" }"), "{record}");
-        assert_eq!(ok(&record), record);
-        let blank = ok(": p ( -- { } )\n  {}\n");
-        assert!(blank.contains("{}"), "{blank}");
-        assert_eq!(ok(&blank), blank);
-        let updated = ok(": older ( { age : Num } -- { age : Num } )\n  37 =age\n");
-        assert!(updated.contains("=age"), "{updated}");
-        let read = ok(": get ( { name : Str | r } -- Str )\n  /name\n");
-        assert!(read.contains("/name"), "{read}");
+        let read = ok("; Person = Person name : Str, age : Num\n: get ( Person -- Str )\n  name>>\n");
+        assert!(read.contains("name>>"), "{read}");
         assert_eq!(
             err(": bad ( -- (Array Num) )\n  < 1 dup >\n", ParseMode::Source),
             "expected element"
         );
         assert_eq!(
-            err(": bad ( -- { } )\n  { 1 2 3 }\n", ParseMode::Source),
-            "expected field name"
+            err(": bad ( -- Str )\n  { name: \"Ada\" }\n", ParseMode::Source),
+            "unexpected character"
         );
         assert_eq!(
-            err(
-                ": bad ( -- { name : Str } )\n  { name: \"A\", name: \"B\" }\n",
-                ParseMode::Source
-            ),
+            err("; Person = Person name : Str, name : Int\n", ParseMode::Source),
             "duplicate field name"
         );
     }
@@ -1772,8 +1851,8 @@ mod tests {
         assert_eq!(ok(&text), text);
         let wrapped = ok(": add ( (Int) (Int) -- Int )\n  iadd\n");
         assert!(wrapped.contains(": add ( Int Int -- Int )"), "{wrapped}");
-        let data = ok("; Pair = Mk Int Int\n");
-        assert!(data.contains("; Pair = Mk Int Int"), "{data}");
+        let data = ok("; Pair = Mk frs : Int, snd : Int\n");
+        assert!(data.contains("; Pair = Mk frs : Int, snd : Int"), "{data}");
         assert_eq!(ok(&data), data);
         let applied = ok(": just ( a. (Maybe a) Int -- a )\n  drop\n");
         assert!(applied.contains("(Maybe a) Int -- a"), "{applied}");
@@ -1991,13 +2070,9 @@ mod tests {
     }
 
     #[test]
-    fn records_and_import_all() {
-        let text = ok(
-            "~ \"Data/Either\" (..)\n\n: getName ( { name : Str | r } -- Str )\n  /name\n",
-        );
+    fn import_all_prints() {
+        let text = ok("~ \"Data/Either\" (..)\n\n: getName ( Str -- Str )\n  dup\n");
         assert!(text.contains("~ \"Data/Either\" (..)"), "{text}");
-        assert!(text.contains("{ name : Str | r }"), "{text}");
-        assert!(text.contains("/name"), "{text}");
         assert_eq!(
             err(
                 ": print ( Str -- ! { console } )\n  drop\n",
@@ -2159,7 +2234,7 @@ mod tests {
         );
         assert_eq!(
             err(
-                ": bad ( Bool -- Str )\n  true -> \"true\"\n  =age\n",
+                ": bad ( Bool -- Str )\n  true -> \"true\"\n  >>age\n",
                 ParseMode::Source
             ),
             "expected pattern"
@@ -2198,95 +2273,6 @@ mod tests {
     }
 
     #[test]
-    fn a_record_pattern_reads_named_fields() {
-        let text = ok(
-            ": nameOf ( { name : Str | r } -- Str )\n  { name : n } -> n\n",
-        );
-        assert!(text.contains("{ name : n } -> n"), "{text}");
-        let split = ok(
-            ": pick ( { name : Str, age : Int } -- Str )\n  { name : n,\n    age : _ } -> n\n",
-        );
-        assert!(split.contains("{ name : n, age : _ } -> n"), "{split}");
-        let nested = ok(
-            ": inner ( { who : { name : Str } } -- Str )\n  { who : { name : n } } -> n\n  (Mk { name : n }) -> n\n  < { name : n } > -> n\n",
-        );
-        assert!(nested.contains("{ who : { name : n } } -> n"), "{nested}");
-        assert!(nested.contains("(Mk { name : n }) -> n"), "{nested}");
-        assert!(nested.contains("< { name : n } > -> n"), "{nested}");
-        assert_eq!(
-            err(
-                ": bad ( { name : Str | r } -- Str )\n  { name : n | r } -> n\n",
-                ParseMode::Source
-            ),
-            "expected field name"
-        );
-        assert_eq!(
-            err(
-                ": bad ( { name : Str | r } -- Str )\n  { | r } -> \"\"\n",
-                ParseMode::Source
-            ),
-            "expected field name"
-        );
-        assert_eq!(
-            err(
-                ": bad ( { name : Str } -- Str )\n  { name } -> \"\"\n",
-                ParseMode::Source
-            ),
-            "expected ':'"
-        );
-        assert_eq!(
-            err(
-                ": bad ( { name : Str } -- Str )\n  { name : n, name : m } -> n\n",
-                ParseMode::Source
-            ),
-            "duplicate field name"
-        );
-        assert_eq!(
-            err(
-                ": bad ( { name : Str } -- Str )\n  { name : n\n",
-                ParseMode::Source
-            ),
-            "expected '}'"
-        );
-    }
-
-    #[test]
-    fn a_record_type_tail_prints_what_was_written() {
-        let text = ok(
-            "- Person { name : Str, age : Num }\n- PersonWithCity { city : Str | Person }\n- Boxed a { city : Str | (Person a) }\n- Open { name : Str | r }\n: inParis ( Person -- PersonWithCity )\n  \"Paris\" +city\n",
-        );
-        assert!(
-            text.contains("- PersonWithCity { city : Str | Person }"),
-            "{text}"
-        );
-        assert!(
-            text.contains("- Boxed a { city : Str | (Person a) }"),
-            "{text}"
-        );
-        assert!(text.contains("- Open { name : Str | r }"), "{text}");
-        assert!(text.contains("\"Paris\" +city"), "{text}");
-        assert_eq!(ok(&text), text);
-        assert_eq!(
-            err(
-                "- Person a { name : a }\n- Bad a { city : Str | Person a }\n",
-                ParseMode::Source
-            ),
-            "expected '}'"
-        );
-        assert_eq!(
-            err(
-                "- Bad { city : Str | Person | r }\n",
-                ParseMode::Source
-            ),
-            "expected '}'"
-        );
-        assert_eq!(
-            err("- Bad { city : Str | }\n", ParseMode::Source),
-            "expected row variable"
-        );
-    }
-
-    #[test]
     fn an_instance_prints_every_class_on_one_head() {
         let text = ok(
             "# Comparable, Sortable (Box a)\n  eq = eqBox\n  compare = cmpBox\n",
@@ -2317,17 +2303,10 @@ mod tests {
         assert!(comma.contains("Liftable m => Chainable m =>"), "{comma}");
         let arrows = ok(": f ( Liftable m => Chainable m => a -- a )\n  dup\n");
         assert!(arrows.contains("Liftable m => Chainable m =>"), "{arrows}");
-        let record = ok(
-            ": f ( Eq { name : Str, age : Int } => { name : Str, age : Int } -- Bool )\n  drop\n",
-        );
-        assert!(record.contains("{ name : Str, age : Int }"), "{record}");
-        let both = ok(
-            ": f ( Eq { name : Str, age : Int }, Ord a => a -- a )\n  dup\n",
-        );
-        assert!(
-            both.contains("Eq { name : Str, age : Int } => Ord a =>"),
-            "{both}"
-        );
+        let product = ok(": f ( Eq Person => Person -- Bool )\n  drop\n");
+        assert!(product.contains("Eq Person => Person -- Bool"), "{product}");
+        let both = ok(": f ( Eq Person, Ord a => a -- a )\n  dup\n");
+        assert!(both.contains("Eq Person => Ord a =>"), "{both}");
         assert_eq!(
             err("& Comparable => Sortable a\n  compare ( a a -- Bool )\n", ParseMode::Source),
             "expected class argument"

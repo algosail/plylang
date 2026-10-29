@@ -372,12 +372,12 @@ mod tests {
 
     #[test]
     fn jumps_to_a_synonym() {
-        let source = "- Person { name : Str }\n\n: older ( Person -- Person )\n  dup /name\n";
-        let declared = jump(source, at(source, "Person"));
-        let used = jump(source, at(source, "Person --"));
+        let source = "; Person = Person name : Str, age : Num\n- Human Person\n\n: older ( Human -- Human )\n  dup name>>\n";
+        let declared = jump(source, at(source, "Human"));
+        let used = jump(source, at(source, "Human --"));
         assert_eq!(declared.span, used.span);
-        assert_eq!(slice(source, used.span), "Person");
-        let field = at(source, "/name");
+        assert_eq!(slice(source, used.span), "Human");
+        let field = at(source, "name>>");
         assert!(definition(source, Path::new("M.ply"), field.0, field.1).is_none());
     }
 

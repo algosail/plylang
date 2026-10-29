@@ -22,6 +22,12 @@ pub(super) struct PreparedClauses {
     pub infos: Vec<ClauseInfo>,
 }
 
+pub(super) struct CtorShape {
+    pub fields: Vec<TyId>,
+    pub names: Vec<Option<String>>,
+    pub newtype: bool,
+}
+
 /// What a slot can still be. `Open` is an infinite scalar with some literals removed.
 /// `Array` is every length when `open`, except lengths listed in `apart`.
 /// An apart length with no rows is covered. `open: false` means only those lengths remain.
@@ -172,12 +178,13 @@ impl Checker {
                 Ok(())
             }
             Pattern::Unpack(name) => {
-                let (fields, _) = self.ctor_shape(name, ty, span)?;
-                pushes.extend(fields);
+                let shape = self.ctor_shape(name, ty, span)?;
+                pushes.extend(shape.fields);
                 Ok(())
             }
             Pattern::Ctor(name, patterns) => {
-                let (fields, _) = self.ctor_shape(name, ty, span)?;
+                let shape = self.ctor_shape(name, ty, span)?;
+                let fields = shape.fields;
                 if patterns.len() != fields.len() {
                     let count = fields.len();
                     return Err(self.error(span, Error::PatternArity { name: name.to_string(), count }));
@@ -243,13 +250,13 @@ impl Checker {
         Ok(self.find_ty(elem))
     }
 
-    /// Field types of `name` applied to `ty`, and whether the data is a newtype.
+    /// Field types of `name` applied to `ty`, the field names, and whether the data is a newtype.
     pub(super) fn ctor_shape(
         &mut self,
         name: &str,
         ty: TyId,
         span: Span,
-    ) -> Result<(Vec<TyId>, bool), Diagnostic> {
+    ) -> Result<CtorShape, Diagnostic> {
         let ty = self.expose(ty);
         let (data_name, args) = match self.tys[ty.0 as usize].clone() {
             TyNode::Ctor(data_name, args) => (data_name, args),
@@ -279,7 +286,11 @@ impl Checker {
             ));
         };
         let fields = self.instantiate_fields(&data.params, &args, &ctor.fields);
-        Ok((fields, data.newtype))
+        Ok(CtorShape {
+            fields,
+            names: ctor.names.clone(),
+            newtype: data.newtype,
+        })
     }
 
     fn exhaust(

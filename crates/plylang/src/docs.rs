@@ -268,9 +268,21 @@ fn format_data(data: &Data) -> String {
             out.push_str(" | ");
         }
         out.push_str(&ctor.name);
-        for field in &ctor.fields {
-            out.push(' ');
-            out.push_str(&type_string(field));
+        if ctor.fields.iter().any(|field| field.name.is_some()) {
+            for (index, field) in ctor.fields.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push(' ');
+                out.push_str(field.name.as_deref().unwrap_or("_"));
+                out.push_str(" : ");
+                out.push_str(&type_string(&field.ty));
+            }
+        } else {
+            for field in &ctor.fields {
+                out.push(' ');
+                out.push_str(&type_string(&field.ty));
+            }
         }
     }
     out
@@ -410,7 +422,7 @@ mod tests {
         );
         temp.write(
             "src/Data/List.ply",
-            ".. Finite sequences.\n\n; List a = Nil | Cons a (List a)\n\n: nil ( -- (List a) )\n  Nil\n\n.. How many elements.\n: foreign length ( (List a) -- Num )\n",
+            ".. Finite sequences.\n\n; List a = Nil | Cons head : a, tail : (List a)\n\n: nil ( -- (List a) )\n  Nil\n\n.. How many elements.\n: foreign length ( (List a) -- Num )\n",
         );
         temp.write(
             "src/Data/Maybe.ply",
@@ -418,7 +430,7 @@ mod tests {
         );
         temp.write(
             "src/Data/List/NonEmpty.ply",
-            ".. At least one element.\n\n- NonEmpty a { head : a, tail : (List a) }\n\n.. The first element.\n: head ( (NonEmpty a) -- a )\n  /head\n",
+            ".. At least one element.\n\n; NonEmpty a = NonEmpty head : a, tail : (List a)\n\n.. The first element.\n: head ( (NonEmpty a) -- a )\n  head>>\n",
         );
         write_docs(&temp.0, None).unwrap_or_else(|error| panic!("{}", error.render()));
         let page = fs::read_to_string(temp.0.join("DOCS.md")).unwrap();
@@ -513,7 +525,7 @@ Finite sequences.
 #### List
 
 ```ply
-; List a = Nil | Cons a (List a)
+; List a = Nil | Cons head : a, tail : (List a)
 ```
 
 ### Words
@@ -569,7 +581,7 @@ At least one element.
 #### NonEmpty
 
 ```ply
-- NonEmpty a { head : a, tail : (List a) }
+; NonEmpty a = NonEmpty head : a, tail : (List a)
 ```
 
 ### Words

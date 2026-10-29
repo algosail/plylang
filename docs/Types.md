@@ -4,7 +4,7 @@ Seven types are installed in every module. A data declaration or a synonym canno
 
 A name with no parameter is written bare. `Num` and `(Num)` are the same type. A parameter is written in parentheses: `(Array Num)`.
 
-A record is an unnamed row of fields. A quotation is a stack effect between `[` and `]`. Those forms are not names in this list.
+A function type is a stack effect, `( -- a )`. It is not a name in this list.
 
 ## Int
 
@@ -51,7 +51,7 @@ One parameter, written `(Array a)`. A literal lists the elements between `<` and
   < 1 2 3 >
 ```
 
-An element is a literal, a quotation, a nested array, or a record.
+An element is a literal, a quotation, or a nested array.
 
 JavaScript emits an array.
 

@@ -157,6 +157,7 @@ impl Checker {
                         .map(|ctor| AnfCtor {
                             name: ctor.name.clone(),
                             fields: ctor.fields.len(),
+                            names: ctor.fields.iter().map(|field| field.name.clone()).collect(),
                             newtype: data.newtype,
                         })
                         .collect(),
@@ -1283,7 +1284,8 @@ impl Checker {
                 Ok(())
             }
             Pattern::Unpack(name) => {
-                let (fields, newtype) = self.ctor_shape(name, ty, span)?;
+                let shape = self.ctor_shape(name, ty, span)?;
+                let newtype = shape.newtype;
                 if !newtype {
                     conds.push(Cond {
                         root,
@@ -1291,13 +1293,14 @@ impl Checker {
                         test: PatTest::Tag(name.clone()),
                     });
                 }
-                let width = fields.len();
-                for (index, field) in fields.into_iter().enumerate() {
+                let width = shape.fields.len();
+                let names = shape.names;
+                for (index, field) in shape.fields.into_iter().enumerate() {
                     let id = if newtype {
                         self.materialize(arm, root, steps)
                     } else {
                         let mut child = steps.to_vec();
-                        child.push(Access::Field { index, width });
+                        child.push(Self::field_step(index, width, names.get(index)));
                         self.materialize(arm, root, &child)
                     };
                     self.note_fn(id, field);
@@ -1307,9 +1310,10 @@ impl Checker {
                 Ok(())
             }
             Pattern::Ctor(name, patterns) => {
-                let (fields, newtype) = self.ctor_shape(name, ty, span)?;
-                if patterns.len() != fields.len() {
-                    let count = fields.len();
+                let shape = self.ctor_shape(name, ty, span)?;
+                let newtype = shape.newtype;
+                if patterns.len() != shape.fields.len() {
+                    let count = shape.fields.len();
                     return Err(self.error(
                         span,
                         Error::PatternArity { name: name.to_string(), count },
@@ -1322,11 +1326,12 @@ impl Checker {
                         test: PatTest::Tag(name.clone()),
                     });
                 }
-                let width = fields.len();
-                for (index, field) in fields.into_iter().enumerate() {
+                let width = shape.fields.len();
+                let names = shape.names;
+                for (index, field) in shape.fields.into_iter().enumerate() {
                     let mut child = steps.to_vec();
                     if !newtype {
-                        child.push(Access::Field { index, width });
+                        child.push(Self::field_step(index, width, names.get(index)));
                     }
                     self.lower_pattern(
                         &patterns[index],
@@ -1388,6 +1393,14 @@ impl Checker {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// A named field is `obj.name`. A positional field is `obj.value` or `obj.valueN`.
+    fn field_step(index: usize, width: usize, name: Option<&Option<String>>) -> Access {
+        match name.cloned().flatten() {
+            Some(name) => Access::Prop(name),
+            None => Access::Field { index, width },
         }
     }
 
@@ -1990,7 +2003,7 @@ mod tests {
 : foreign nadd ( Num Num -- Num )
 
 ; Maybe a = Nothing | Just a
-; Pair a b = Pair a b
+; Pair a b = Pair frs : a, snd : b
 
 : double ( Int -- Int )
   dup iadd
@@ -2083,7 +2096,7 @@ if (fact(0n) !== 1n) throw new Error("fact0");
 if (fact(5n) !== 120n) throw new Error("fact5 " + fact(5n));
 if (wrapped !== 2n) throw new Error("pair");
 const pair = Pair(1n, 2n);
-if (pair.value0 !== 1n || pair.value1 !== 2n || pair.values !== undefined) throw new Error("pair fields");
+if (pair.frs !== 1n || pair.snd !== 2n || pair.value0 !== undefined) throw new Error("pair fields");
 if (unit() !== undefined) throw new Error("unit");
 if (label() !== "hi") throw new Error("string");
 if (flag(true) !== false) throw new Error("not");
@@ -2542,48 +2555,69 @@ if (chainInc(Nothing).tag !== "Nothing") throw new Error("chain nothing");
     }
 
     #[test]
-    fn record_field_is_property_access() {
+    fn a_product_field_is_property_access() {
         assert_eq!(
-            js(": nameOf ( { age : Int, name : Str } -- Str )\n  /name"),
-            "export function nameOf(v0) {\n  const v1 = v0.name;\n  return v1;\n}\n"
+            js("; Person = Person name : Str, age : Num\n\n: nameOf ( Person -- Str )\n  name>>"),
+            "export const Person = (v0, v1) => ({ tag: \"Person\", name: v0, age: v1 });\n\nexport function nameOf(v0) {\n  const v1 = v0.name;\n  return v1;\n}\n"
         );
     }
 
     #[test]
-    fn javascript_reads_record_fields() {
+    fn named_constructor_field_is_a_property() {
+        assert_eq!(
+            js("; Entry = Entry id : Num, at : Num\n\n: get ( Entry -- Num )\n  at>>\n"),
+            "export const Entry = (v0, v1) => ({ tag: \"Entry\", id: v0, at: v1 });\n\nexport function get(v0) {\n  const v1 = v0.at;\n  return v1;\n}\n"
+        );
         run(
             r#"
-; Person = Mk { name : Str, age : Int }
+: foreign nadd ( Num Num -- Num )
 
-: foreign person ( -- { name : Str, age : Int } )
+; Entry = Entry id : Num, at : Num
 
-: nameOf ( { age : Int, name : Str } -- Str )
-  /name
-
-: ageOf ( { name : Str, age : Int } -- Int )
-  /age
-
-: keepName ( { name : Str } -- { name : Str } Str )
-  dup /name
-
-: quoted ( { name : Str } -- Str )
-  [ /name ] call
-
-: fromMk ( Person -- Str )
-  Mk -> /name
-
-: personName ( -- Str )
-  person /name
+: shift ( Entry -- Entry )
+  dup at>> 1 nadd >>at
 "#,
             r#"
-function person() { return { name: "Ada", age: 36n }; }
-const value = { name: "Ada", age: 36n };
+function nadd(a, b) { return a + b; }
+const first = Entry(1, 10);
+const next = shift(first);
+if (first.at !== 10 || first.id !== 1) throw new Error("old " + JSON.stringify(first));
+if (next.at !== 11 || next.id !== 1 || next.tag !== "Entry") throw new Error("next " + JSON.stringify(next));
+"#,
+        );
+    }
+
+    #[test]
+    fn javascript_reads_product_fields() {
+        run(
+            r#"
+; Person = Person name : Str, age : Int
+
+: foreign person ( -- Person )
+
+: nameOf ( Person -- Str )
+  name>>
+
+: ageOf ( Person -- Int )
+  age>>
+
+: keepName ( Person -- Person Str )
+  dup name>>
+
+: quoted ( Person -- Str )
+  [ name>> ] call
+
+: personName ( -- Str )
+  person name>>
+"#,
+            r#"
+function person() { return { tag: "Person", name: "Ada", age: 36n }; }
+const value = { tag: "Person", name: "Ada", age: 36n };
 if (nameOf(value) !== "Ada") throw new Error("name");
 if (ageOf(value) !== 36n) throw new Error("age");
-const both = keepName({ name: "Ada" });
+const both = keepName(value);
 if (both[0].name !== "Ada" || both[1] !== "Ada") throw new Error("dup");
 if (quoted(value) !== "Ada") throw new Error("quote");
-if (fromMk(Mk(value)) !== "Ada") throw new Error("mk");
 if (personName() !== "Ada") throw new Error("foreign");
 "#,
         );
@@ -2710,21 +2744,19 @@ if (got !== "11,12,21,22") throw new Error("apply " + got);
     }
 
     #[test]
-    fn call_runs_a_function_read_from_a_record() {
+    fn call_runs_a_function_read_from_a_field() {
         run(
             r#"
-- Task { go : (Num -- Num) }
+; Task = Task (Num -- Num)
 
 : runTask ( Task Num -- Num )
-  task n ->
-    n task /go call
+  (Task go) n -> n go call
 
 : later ( Task Num -- ( -- Num ) )
-  task n ->
-    [ n task /go call ]
+  (Task go) n -> n go [ call ] cons cons
 "#,
             r#"
-const task = { go: (n) => n + 1 };
+const task = Task((n) => n + 1);
 if (runTask(task, 3) !== 4) throw new Error("runTask");
 if (later(task, 3)() !== 4) throw new Error("later");
 "#,
@@ -2790,7 +2822,7 @@ export function say(v2) {
     }
 
     #[test]
-    fn javascript_runs_arrays_and_records() {
+    fn javascript_runs_arrays_and_products() {
         run(
             r#"
 : foreign nadd ( Num Num -- Num )
@@ -2810,11 +2842,13 @@ export function say(v2) {
 : grow ( (Array Num) -- (Array Num) )
   3 push
 
-: person ( -- { name : Str, age : Num } )
-  { name: "Ada", age: 36 }
+; Person = Person name : Str, age : Num
 
-: older ( { name : Str, age : Num } -- { name : Str, age : Num } )
-  37 =age
+: person ( -- Person )
+  "Ada" 36 Person
+
+: older ( Person -- Person )
+  37 >>age
 
 : bump ( Num Num -- Num Num )
   [ 1 nadd ] dip
@@ -2833,7 +2867,7 @@ const grown = grow(base);
 if (base.length !== 2 || grown.length !== 3 || grown[2] !== 3) throw new Error("push");
 const p = person();
 const q = older(p);
-if (p.age !== 36 || q.age !== 37 || q.name !== "Ada") throw new Error("record");
+if (p.age !== 36 || q.age !== 37 || q.name !== "Ada" || p.tag !== "Person") throw new Error("product");
 const pair = bump(20, 5);
 if (pair[0] !== 21 || pair[1] !== 5) throw new Error("dip " + pair);
 "#,
@@ -2841,54 +2875,11 @@ if (pair[0] !== 21 || pair[1] !== 5) throw new Error("dip " + pair);
     }
 
     #[test]
-    fn javascript_runs_field_insert() {
-        let code = js(
-            r#"
-- Person { name : Str, age : Num }
-- PersonWithCity { city : Str | Person }
-
-: inParis ( Person -- PersonWithCity )
-  "Paris" +city
-
-: withCity ( Person Str -- PersonWithCity )
-  +city
-
-: moved ( Person -- { name : Str, age : Num, city : Str, zip : Str } )
-  "Paris" +city "75001" +zip
-"#,
-        );
-        assert!(code.contains("({ ..."), "{code}");
-        assert!(code.contains("city:"), "{code}");
-        run(
-            r#"
-- Person { name : Str, age : Num }
-- PersonWithCity { city : Str | Person }
-
-: inParis ( Person -- PersonWithCity )
-  "Paris" +city
-
-: withCity ( Person Str -- PersonWithCity )
-  +city
-
-: moved ( Person -- { name : Str, age : Num, city : Str, zip : Str } )
-  "Paris" +city "75001" +zip
-"#,
-            r#"
-const person = { name: "Ada", age: 36 };
-const paris = inParis(person);
-if (person.city !== undefined || paris.city !== "Paris" || paris.name !== "Ada" || paris.age !== 36) {
-  throw new Error("inParis " + JSON.stringify(paris));
-}
-const london = withCity({ name: "Grace", age: 30 }, "London");
-if (london.city !== "London" || london.name !== "Grace" || london.age !== 30) {
-  throw new Error("withCity " + JSON.stringify(london));
-}
-const movedTo = moved({ name: "Ada", age: 36 });
-if (movedTo.city !== "Paris" || movedTo.zip !== "75001" || movedTo.name !== "Ada") {
-  throw new Error("moved " + JSON.stringify(movedTo));
-}
-"#,
-        );
+    fn javascript_rejects_a_record() {
+        let braces = parse(": bad ( -- Str )\n  { name: \"Ada\" }\n", ParseMode::Source).unwrap_err();
+        assert_eq!(braces.message, "unexpected character");
+        let plus = parse(": bad ( Int -- Int )\n  +city\n", ParseMode::Source).unwrap_err();
+        assert_eq!(plus.message, "unexpected character");
     }
 
     #[test]
@@ -2937,29 +2928,24 @@ if (round(7) !== 7) throw new Error("round");
             r#"
 : foreign nadd ( Num Num -- Num )
 
-- Person { name : Str, age : Num }
+; Person = Person name : Str, age : Num
+- Human Person
 
-: olderPerson ( Person -- Person )
-  37 =age
+: olderPerson ( Human -- Human )
+  37 >>age
 
 ; Age == Age Num
 
 : olderAge ( Age -- Age )
   Age -> 1 nadd Age
-
-; Rec == Rec { name : Str, age : Num }
-
-: olderRec ( Rec -- Rec )
-  Rec -> 37 =age Rec
 "#,
             r#"
 function nadd(a, b) { return a + b; }
-const person = olderPerson({ name: "Ada", age: 36 });
-if (person.name !== "Ada" || person.age !== 37) throw new Error("synonym");
+const person = Person("Ada", 36);
+const older = olderPerson(person);
+if (person.age !== 36 || older.name !== "Ada" || older.age !== 37) throw new Error("synonym");
 if (Age(36) !== 36) throw new Error("identity");
 if (olderAge(36) !== 37) throw new Error("age");
-const rec = olderRec({ name: "Ada", age: 36 });
-if (rec.name !== "Ada" || rec.age !== 37) throw new Error("newtype record");
 "#,
         );
     }
@@ -3094,54 +3080,28 @@ if (nested([[]]) !== 0 || nested([]) !== 0 || nested([[1, 2]]) !== 0) throw new 
     }
 
     #[test]
-    fn javascript_runs_record_patterns() {
+    fn javascript_runs_named_field_patterns() {
         let code = js(
-            ": nameOf ( { name : Str | r } -- Str )\n  { name : n } -> n\n",
+            "; Person = Person name : Str, year : Int\n\n: nameOf ( Person -- Str )\n  (Person n _) -> n\n",
         );
         assert!(code.contains(".name"), "{code}");
         assert!(!code.contains(".value"), "{code}");
         run(
             r#"
-; Maybe a = Nothing | Just a
+; Person = Person name : Str, year : Int
 
-: nameOf ( { name : Str | r } -- Str )
-  { name : n } -> n
+: nameOf ( Person -- Str )
+  (Person n _) -> n
 
-: born ( { name : Str, year : Int } -- Str )
-  { year : 1815n, name : n } -> n
-  { name : n } -> n
-
-: parisName ( { who : (Maybe { name : Str, city : Str }) } -- Str )
-  { who : (Just { city : "Paris", name : n }) } -> n
-  { who : (Just { name : n }) } -> n
-  _ -> ""
-
-; Person = Mk { name : Str, age : Int }
-
-: personName ( Person -- Str )
-  (Mk { name : n }) -> n
-
-: headName ( { people : (Array { name : Str }) } -- Str )
-  { people : < { name : n } > } -> n
-  _ -> ""
-
-: touch ( { name : Str | r } -- Bool )
-  {} -> true
+: born ( Person -- Str )
+  (Person n 1815n) -> n
+  (Person n _) -> n
 "#,
             r#"
-if (nameOf({ name: "Ada", age: 36 }) !== "Ada") throw new Error("name");
-if (born({ name: "Ada", year: 1815n }) !== "Ada") throw new Error("ada");
-if (born({ name: "Grace", year: 1906n }) !== "Grace") throw new Error("grace");
-const ada = { tag: "Just", value: { name: "Ada", city: "Paris" } };
-const grace = { tag: "Just", value: { name: "Grace", city: "London" } };
-if (parisName({ who: ada }) !== "Ada") throw new Error("paris");
-if (parisName({ who: grace }) !== "Grace") throw new Error("london");
-if (parisName({ who: { tag: "Nothing" } }) !== "") throw new Error("nobody");
-if (personName({ tag: "Mk", value: { name: "Ada", age: 36 } }) !== "Ada") throw new Error("mk");
-if (headName({ people: [{ name: "Ada" }] }) !== "Ada") throw new Error("head");
-if (headName({ people: [] }) !== "") throw new Error("no head");
-if (headName({ people: [{ name: "Ada" }, { name: "Grace" }] }) !== "") throw new Error("long");
-if (touch({ name: "Ada", age: 36 }) !== true) throw new Error("touch");
+const ada = Person("Ada", 36n);
+if (nameOf(ada) !== "Ada") throw new Error("name");
+if (born(Person("Ada", 1815n)) !== "Ada") throw new Error("ada");
+if (born(Person("Grace", 1906n)) !== "Grace") throw new Error("grace");
 "#,
         );
     }

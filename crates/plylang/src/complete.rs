@@ -1,6 +1,7 @@
-//! Completions at the cursor: words, types, import paths, import names, and record fields.
+//! Completions at the cursor: words, types, import paths, import names, and product fields.
 //! A file that does not parse still completes from the lines above the cursor.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::ast::{
@@ -76,7 +77,7 @@ pub fn complete(source: &str, path: &Path, line: u32, character: u32) -> Vec<Com
             let module = parsed_module(source, path, offset);
             let mut items = word_names(path, module.as_ref(), replace);
             for (name, detail) in reader_fields(path, source, offset) {
-                let label = format!("/{name}");
+                let label = format!("{name}>>");
                 push(
                     &mut items,
                     entry(&label, &label, CompletionKind::Field, &detail, "", "1", replace),
@@ -547,7 +548,7 @@ fn ctor_detail(data: &Data, ctor: &Ctor) -> String {
         vars: data.params.clone(),
         constraints: Vec::new(),
         effect: StackEffect {
-            input: Stack { tail: StackTail::Implicit, items: ctor.fields.clone() },
+            input: Stack { tail: StackTail::Implicit, items: ctor.field_tys() },
             output: Stack { tail: StackTail::Implicit, items: vec![result] },
             effects: None,
         },
@@ -1006,7 +1007,7 @@ fn scan_line(source: &str, offset: usize) -> (bool, bool) {
 }
 
 struct FieldEdit {
-    /// Byte index of `=` in `=name`.
+    /// Byte index of `>>` in `>>name`.
     mark: usize,
     /// Byte index just after the field name, including characters after the cursor.
     name_end: usize,
@@ -1031,8 +1032,8 @@ fn complete_fields(source: &str, path: &Path, offset: usize) -> Option<Vec<Compl
     Some(items)
 }
 
-/// `=` plus the field name around the cursor. The `=` itself stays put.
-/// `/name` is a reader and is not completed here. `=>` is not a setter.
+/// `>>` plus the field name around the cursor. The `>>` itself stays put.
+/// `name>>` is a reader and is not completed here. `=>` is not a setter.
 fn field_edit(source: &str, offset: usize) -> Option<FieldEdit> {
     let bytes = source.as_bytes();
     if offset > bytes.len() {
@@ -1045,14 +1046,14 @@ fn field_edit(source: &str, offset: usize) -> Option<FieldEdit> {
     if name_start < offset && !is_ident_start_byte(bytes[name_start]) {
         return None;
     }
-    // Cursor between `=` and `>` of `=>`.
-    if name_start == offset && bytes.get(name_start) == Some(&b'>') {
+    if name_start < 2 || bytes[name_start - 1] != b'>' || bytes[name_start - 2] != b'>' {
         return None;
     }
-    if name_start == 0 || bytes[name_start - 1] != b'=' {
+    // `name>>` is a reader. The setter is `>>` that does not follow an ident.
+    if name_start >= 3 && is_ident_byte(bytes[name_start - 3]) {
         return None;
     }
-    let mark = name_start - 1;
+    let mark = name_start - 2;
     let mut name_end = offset;
     while name_end < bytes.len() && is_ident_byte(bytes[name_end]) {
         name_end += 1;
@@ -1072,8 +1073,9 @@ fn in_body(source: &str, hash: usize) -> bool {
     matches!(walk(&before).state, Place::Body)
 }
 
-/// Labels of the record on top of the stack. An unsolved top uses records written in this def.
+/// Fields of the one-constructor type under `>>name`. An unsolved top uses types in this def.
 fn fields_at(path: &Path, source: &str, edit: &FieldEdit) -> Vec<(String, String)> {
+    let env = field_env(path, source, edit.mark);
     let mut probe = String::new();
     probe.push_str(&source[..edit.mark]);
     probe.push(' ');
@@ -1082,10 +1084,10 @@ fn fields_at(path: &Path, source: &str, edit: &FieldEdit) -> Vec<(String, String
     probe.push(' ');
     probe.push_str(&source[edit.name_end..]);
     if let Some(before) = stack_before(path, &probe, marker as u32) {
-        // The new value is on top. The record is under it, or on top when the value is not written yet.
+        // The new value is on top. The product is under it, or on top when the value is not written yet.
         let slot = under_top(&before).or_else(|| top_slot(&before));
         if let Some(top) = slot {
-            if let Some(fields) = record_fields(top) {
+            if let Some(fields) = fields_of_printed(top, &env, 0) {
                 return fields;
             }
             if !is_open_stack(top) {
@@ -1093,11 +1095,11 @@ fn fields_at(path: &Path, source: &str, edit: &FieldEdit) -> Vec<(String, String
             }
         }
     }
-    signature_fields(path, source, edit.mark)
+    signature_fields(path, source, edit.mark, &env)
 }
 
-/// `/name` for the record on top, offered while a word or `/` reader is being typed.
-/// A setter `=name` is handled by `field_edit` and yields nothing here.
+/// `name>>` for the value on top, offered while a word or a reader is being typed.
+/// A setter `>>name` is handled by `field_edit` and yields nothing here.
 fn reader_fields(path: &Path, source: &str, offset: usize) -> Vec<(String, String)> {
     let bytes = source.as_bytes();
     let end = offset.min(bytes.len());
@@ -1105,23 +1107,28 @@ fn reader_fields(path: &Path, source: &str, offset: usize) -> Vec<(String, Strin
     while name_start > 0 && is_ident_byte(bytes[name_start - 1]) {
         name_start -= 1;
     }
+    // The cursor may sit on the `>>` of `name>>`.
+    if name_start == end && end >= 2 && bytes[end - 1] == b'>' && bytes[end - 2] == b'>' {
+        name_start = end - 2;
+        while name_start > 0 && is_ident_byte(bytes[name_start - 1]) {
+            name_start -= 1;
+        }
+    }
     if name_start < end && !is_ident_start_byte(bytes[name_start]) {
         return Vec::new();
     }
-    if name_start > 0 && bytes[name_start - 1] == b'=' {
+    if name_start >= 2 && bytes[name_start - 1] == b'>' && bytes[name_start - 2] == b'>' {
         return Vec::new();
     }
     let mut name_end = end;
     while name_end < bytes.len() && is_ident_byte(bytes[name_end]) {
         name_end += 1;
     }
-    // `/na` is one field token. The probe must not keep the slash, or it fails to lex.
-    let mut cut = name_start;
-    if cut > 0 && bytes[cut - 1] == b'/' {
-        cut -= 1;
+    if name_end + 1 < bytes.len() && bytes[name_end] == b'>' && bytes[name_end + 1] == b'>' {
+        name_end += 2;
     }
     let mut probe = String::new();
-    probe.push_str(&source[..cut]);
+    probe.push_str(&source[..name_start]);
     let marker = probe.len();
     probe.push_str("dup ");
     probe.push_str(&source[name_end..]);
@@ -1131,7 +1138,8 @@ fn reader_fields(path: &Path, source: &str, offset: usize) -> Vec<(String, Strin
     let Some(top) = top_slot(&before) else {
         return Vec::new();
     };
-    record_fields(top).unwrap_or_default()
+    let env = field_env(path, source, name_start);
+    fields_of_printed(top, &env, 0).unwrap_or_default()
 }
 
 fn stack_before(path: &Path, source: &str, marker: u32) -> Option<String> {
@@ -1141,7 +1149,12 @@ fn stack_before(path: &Path, source: &str, marker: u32) -> Option<String> {
         .map(|site| site.before)
 }
 
-fn signature_fields(path: &Path, source: &str, hash: usize) -> Vec<(String, String)> {
+fn signature_fields(
+    path: &Path,
+    source: &str,
+    hash: usize,
+    env: &FieldEnv,
+) -> Vec<(String, String)> {
     let Some(module) = module_around(path, source, hash) else {
         return Vec::new();
     };
@@ -1152,7 +1165,7 @@ fn signature_fields(path: &Path, source: &str, hash: usize) -> Vec<(String, Stri
         return Vec::new();
     };
     let mut fields = Vec::new();
-    collect_scheme(&def.scheme, &mut fields);
+    collect_scheme(&def.scheme, env, &mut fields);
     fields
 }
 
@@ -1170,45 +1183,307 @@ fn module_around(path: &Path, source: &str, hash: usize) -> Option<Module> {
     parse(&head, mode).ok()
 }
 
-fn collect_scheme(scheme: &Scheme, out: &mut Vec<(String, String)>) {
-    collect_stack(&scheme.effect.input, out);
-    collect_stack(&scheme.effect.output, out);
+fn collect_scheme(scheme: &Scheme, env: &FieldEnv, out: &mut Vec<(String, String)>) {
+    collect_stack(&scheme.effect.input, env, out);
+    collect_stack(&scheme.effect.output, env, out);
     for constraint in &scheme.constraints {
         for arg in &constraint.args {
-            collect_type(arg, out);
+            collect_type(arg, env, out);
         }
     }
 }
 
-fn collect_stack(stack: &Stack, out: &mut Vec<(String, String)>) {
+fn collect_stack(stack: &Stack, env: &FieldEnv, out: &mut Vec<(String, String)>) {
     for item in &stack.items {
-        collect_type(item, out);
+        collect_type(item, env, out);
     }
 }
 
-fn collect_type(ty: &Type, out: &mut Vec<(String, String)>) {
-    match ty {
-        Type::Record(row) => {
-            for (name, field) in &row.fields {
-                out.push((name.clone(), type_string(field)));
-                collect_type(field, out);
+fn collect_type(ty: &Type, env: &FieldEnv, out: &mut Vec<(String, String)>) {
+    if let Some(fields) = fields_of_type(ty, &HashMap::new(), env, 0) {
+        for field in fields {
+            if out.iter().any(|(name, _)| name == &field.0) {
+                continue;
             }
-            if let Some(ty) = row.tail_ty() {
-                collect_type(ty, out);
-            }
+            out.push(field);
         }
-        Type::App(head, args) => {
-            collect_type(head, out);
+    }
+    match ty {
+        Type::App(_, args) => {
             for arg in args {
-                collect_type(arg, out);
+                collect_type(arg, env, out);
             }
         }
         Type::Fun(effect) => {
-            collect_stack(&effect.input, out);
-            collect_stack(&effect.output, out);
+            collect_stack(&effect.input, env, out);
+            collect_stack(&effect.output, env, out);
+        }
+        Type::Record(row) => {
+            for (_, field) in &row.fields {
+                collect_type(field, env, out);
+            }
         }
         Type::Var(_) | Type::Ctor(_) => {}
     }
+}
+
+struct ProductDecl {
+    name: String,
+    params: Vec<String>,
+    fields: Vec<(String, Type)>,
+}
+
+struct SynonymDecl {
+    name: String,
+    params: Vec<String>,
+    rhs: Type,
+}
+
+struct FieldEnv {
+    products: Vec<ProductDecl>,
+    synonyms: Vec<SynonymDecl>,
+}
+
+/// Data and synonyms of this file and of the modules it imports.
+fn field_env(path: &Path, source: &str, hash: usize) -> FieldEnv {
+    let Some(module) = module_around(path, source, hash) else {
+        return FieldEnv { products: Vec::new(), synonyms: Vec::new() };
+    };
+    let mut env = FieldEnv { products: Vec::new(), synonyms: Vec::new() };
+    add_fields(&mut env, &module);
+    for import in &module.imports {
+        if let Some(provider) = load_provider(path, &import.path) {
+            add_fields(&mut env, &provider);
+        }
+    }
+    env
+}
+
+fn add_fields(env: &mut FieldEnv, module: &Module) {
+    for item in &module.items {
+        match item {
+            Item::Data(data) => {
+                if env.products.iter().any(|have| have.name == data.name) {
+                    continue;
+                }
+                if data.foreign || data.ctors.len() != 1 {
+                    continue;
+                }
+                let ctor = &data.ctors[0];
+                if ctor.fields.len() < 2 || ctor.fields.iter().any(|field| field.name.is_none()) {
+                    continue;
+                }
+                env.products.push(ProductDecl {
+                    name: data.name.clone(),
+                    params: data.params.clone(),
+                    fields: ctor
+                        .fields
+                        .iter()
+                        .filter_map(|field| {
+                            field.name.clone().map(|name| (name, field.ty.clone()))
+                        })
+                        .collect(),
+                });
+            }
+            Item::Synonym(synonym) => {
+                if env.synonyms.iter().any(|have| have.name == synonym.name) {
+                    continue;
+                }
+                env.synonyms.push(SynonymDecl {
+                    name: synonym.name.clone(),
+                    params: synonym.params.clone(),
+                    rhs: synonym.rhs.clone(),
+                });
+            }
+            Item::Def(_) | Item::Class(_) | Item::Instance(_) => {}
+        }
+    }
+}
+
+/// `None` when the slot is still `_` or `.._`. A known non-product is an empty list.
+fn fields_of_printed(ty: &str, env: &FieldEnv, depth: usize) -> Option<Vec<(String, String)>> {
+    let (head, args) = split_printed(ty)?;
+    if head.is_empty() {
+        return Some(Vec::new());
+    }
+    Some(fields_of_head(&head, &args, env, depth).unwrap_or_default())
+}
+
+fn fields_of_head(
+    head: &str,
+    args: &[String],
+    env: &FieldEnv,
+    depth: usize,
+) -> Option<Vec<(String, String)>> {
+    if depth > 8 {
+        return Some(Vec::new());
+    }
+    if let Some(product) = env.products.iter().find(|item| item.name == head) {
+        if args.len() != product.params.len() {
+            return Some(Vec::new());
+        }
+        let mut map = HashMap::new();
+        for (param, arg) in product.params.iter().zip(args.iter()) {
+            map.insert(param.clone(), arg.clone());
+        }
+        return Some(
+            product
+                .fields
+                .iter()
+                .map(|(name, ty)| (name.clone(), show_subst(ty, &map)))
+                .collect(),
+        );
+    }
+    if let Some(synonym) = env.synonyms.iter().find(|item| item.name == head) {
+        if args.len() != synonym.params.len() {
+            return Some(Vec::new());
+        }
+        let mut map = HashMap::new();
+        for (param, arg) in synonym.params.iter().zip(args.iter()) {
+            map.insert(param.clone(), arg.clone());
+        }
+        return fields_of_type(&synonym.rhs, &map, env, depth + 1);
+    }
+    None
+}
+
+fn fields_of_type(
+    ty: &Type,
+    map: &HashMap<String, String>,
+    env: &FieldEnv,
+    depth: usize,
+) -> Option<Vec<(String, String)>> {
+    match ty {
+        Type::Var(name) | Type::Ctor(name) => {
+            let shown = map.get(name).cloned().unwrap_or_else(|| name.clone());
+            fields_of_printed(&shown, env, depth)
+        }
+        Type::App(head, args) => {
+            let head = show_subst(head, map);
+            if head.contains('(') || head.contains(' ') {
+                return Some(Vec::new());
+            }
+            let args: Vec<String> = args.iter().map(|arg| show_subst(arg, map)).collect();
+            Some(fields_of_head(&head, &args, env, depth).unwrap_or_default())
+        }
+        Type::Fun(_) | Type::Record(_) => Some(Vec::new()),
+    }
+}
+
+fn split_printed(ty: &str) -> Option<(String, Vec<String>)> {
+    let ty = ty.trim();
+    if ty == "_" || ty == ".._" {
+        return None;
+    }
+    if let Some(inner) = ty.strip_prefix('(').and_then(|rest| rest.strip_suffix(')')) {
+        if inner.contains("--") {
+            return Some((String::new(), Vec::new()));
+        }
+        let parts = split_args(inner);
+        let Some(head) = parts.first() else {
+            return Some((String::new(), Vec::new()));
+        };
+        if head.is_empty() || head.starts_with('(') {
+            return Some((String::new(), Vec::new()));
+        }
+        return Some((head.clone(), parts.into_iter().skip(1).collect()));
+    }
+    if ty.contains(' ') || ty.contains('(') {
+        return Some((String::new(), Vec::new()));
+    }
+    Some((ty.to_string(), Vec::new()))
+}
+
+fn split_args(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (index, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b' ' if depth == 0 => {
+                if index > start {
+                    let part = text[start..index].trim();
+                    if !part.is_empty() {
+                        parts.push(part.to_string());
+                    }
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < bytes.len() {
+        let part = text[start..].trim();
+        if !part.is_empty() {
+            parts.push(part.to_string());
+        }
+    }
+    parts
+}
+
+fn show_subst(ty: &Type, map: &HashMap<String, String>) -> String {
+    match ty {
+        Type::Var(name) | Type::Ctor(name) => map.get(name).cloned().unwrap_or_else(|| name.clone()),
+        Type::App(head, args) => {
+            let mut out = format!("({}", show_subst(head, map));
+            for arg in args {
+                out.push(' ');
+                out.push_str(&show_subst(arg, map));
+            }
+            out.push(')');
+            out
+        }
+        Type::Fun(effect) => format!("({})", show_effect(effect, map)),
+        Type::Record(row) => type_string(&Type::Record(row.clone())),
+    }
+}
+
+fn show_effect(effect: &StackEffect, map: &HashMap<String, String>) -> String {
+    let input = show_stack(&effect.input, map);
+    let output = show_stack(&effect.output, map);
+    let mut out = if input.is_empty() && output.is_empty() {
+        "--".to_string()
+    } else if input.is_empty() {
+        format!("-- {output}")
+    } else if output.is_empty() {
+        format!("{input} --")
+    } else {
+        format!("{input} -- {output}")
+    };
+    if let Some(effects) = &effect.effects {
+        out.push_str(" ! ");
+        if effects.labels.is_empty() && effects.tail.is_none() {
+            out.push_str("{}");
+        } else {
+            out.push_str("{ ");
+            out.push_str(&effects.labels.join(", "));
+            if let Some(name) = &effects.tail {
+                if !effects.labels.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str("| ");
+                out.push_str(name);
+            }
+            out.push_str(" }");
+        }
+    }
+    out
+}
+
+fn show_stack(stack: &Stack, map: &HashMap<String, String>) -> String {
+    let mut parts = Vec::new();
+    match &stack.tail {
+        StackTail::Implicit => {}
+        StackTail::Empty => parts.push(".".to_string()),
+        StackTail::Var(name) => parts.push(format!("..{name}")),
+    }
+    for item in &stack.items {
+        parts.push(show_subst(item, map));
+    }
+    parts.join(" ")
 }
 
 fn top_slot(stack: &str) -> Option<&str> {
@@ -1235,7 +1510,7 @@ fn top_slot(stack: &str) -> Option<&str> {
     last.map(str::trim).filter(|slot| !slot.is_empty())
 }
 
-/// The slot under the top. `=name` reads the record there: the new value is on top.
+/// The slot under the top. `>>name` reads the product there: the new value is on top.
 fn under_top(stack: &str) -> Option<&str> {
     let bytes = stack.as_bytes();
     let mut depth = 0i32;
@@ -1260,49 +1535,6 @@ fn under_top(stack: &str) -> Option<&str> {
         previous = last;
     }
     previous.map(str::trim).filter(|slot| !slot.is_empty())
-}
-
-fn record_fields(ty: &str) -> Option<Vec<(String, String)>> {
-    let ty = ty.trim();
-    if !ty.starts_with('{') || !ty.ends_with('}') {
-        return None;
-    }
-    let inner = &ty[1..ty.len() - 1];
-    let bytes = inner.as_bytes();
-    let mut fields = Vec::new();
-    let mut depth = 0i32;
-    let mut part_start = 0;
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'{' | b'(' => depth += 1,
-            b'}' | b')' => depth -= 1,
-            b'|' if depth == 0 => break,
-            b',' if depth == 0 => {
-                take_field(&inner[part_start..index], &mut fields);
-                part_start = index + 1;
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    take_field(&inner[part_start..index], &mut fields);
-    Some(fields)
-}
-
-fn take_field(part: &str, out: &mut Vec<(String, String)>) {
-    let part = part.trim();
-    if part.is_empty() {
-        return;
-    }
-    let Some(colon) = part.find(" : ") else {
-        return;
-    };
-    let name = part[..colon].trim();
-    if name.is_empty() || !name.bytes().all(is_ident_byte) {
-        return;
-    }
-    out.push((name.to_string(), part[colon + 3..].trim().to_string()));
 }
 
 fn is_open_stack(top: &str) -> bool {
@@ -1560,9 +1792,13 @@ mod tests {
     }
 
     #[test]
-    fn completes_record_fields() {
-        let source = ": get ( { age : Int, name : Str } -- { age : Int, name : Str } )\n  1 =";
-        let (line, character) = at(source, "1 =");
+    fn completes_fields_of_a_type() {
+        let source = "\
+; Person = Person name : Str, age : Num
+
+: get ( Person -- Person )
+  1 >>";
+        let (line, character) = at(source, "1 >>");
         let items = complete(source, Path::new("M.ply"), line, character);
         assert_eq!(
             items.iter().map(|item| item.label.clone()).collect::<Vec<_>>(),
@@ -1574,50 +1810,121 @@ mod tests {
         assert_eq!(name.kind, CompletionKind::Field);
         assert_eq!(&source[name.replace.start as usize..name.replace.end as usize], "");
 
-        let source = ": get ( { age : Int, name : Str } -- { age : Int, name : Str } )\n  1 =na";
-        let (line, character) = at(source, "=na");
+        let source = "\
+; Person = Person name : Str, age : Num
+
+: get ( Person -- Person )
+  1 >>na";
+        let (line, character) = at(source, ">>na");
         let items = complete(source, Path::new("M.ply"), line, character);
         let name = items.iter().find(|item| item.label == "name").unwrap();
         assert_eq!(&source[name.replace.start as usize..name.replace.end as usize], "na");
         assert_eq!(name.insert, "name");
 
-        let open = ": get ( a. { name : a | r } -- { name : a | r } )\n  1 =";
-        let name = complete(open, Path::new("M.ply"), at(open, "1 =").0, at(open, "1 =").1)
+        let pair = "\
+; Pair a b = Pair frs : a, snd : b
+
+: get ( (Pair Int Str) -- (Pair Int Str) )
+  1 >>";
+        let frs = complete(pair, Path::new("M.ply"), at(pair, "1 >>").0, at(pair, "1 >>").1)
+            .into_iter()
+            .find(|item| item.label == "frs")
+            .unwrap();
+        assert_eq!(frs.detail, "Int");
+        let snd = complete(pair, Path::new("M.ply"), at(pair, "1 >>").0, at(pair, "1 >>").1)
+            .into_iter()
+            .find(|item| item.label == "snd")
+            .unwrap();
+        assert_eq!(snd.detail, "Str");
+
+        let human = "\
+; Person = Person name : Str, age : Num
+- Human Person
+
+: get ( Human -- Human )
+  1 >>";
+        let name = complete(human, Path::new("M.ply"), at(human, "1 >>").0, at(human, "1 >>").1)
             .into_iter()
             .find(|item| item.label == "name")
             .unwrap();
-        assert_eq!(name.detail, "a");
+        assert_eq!(name.detail, "Str");
 
-        let reading = ": get ( { age : Int, name : Str } -- Str )\n  na";
+        let reading = "\
+; Person = Person name : Str, age : Num
+
+: get ( Person -- Str )
+  na";
         let reader = complete(reading, Path::new("M.ply"), at(reading, "na").0, at(reading, "na").1)
             .into_iter()
-            .find(|item| item.label == "/name")
+            .find(|item| item.label == "name>>")
             .unwrap();
-        assert_eq!(reader.insert, "/name");
+        assert_eq!(reader.insert, "name>>");
         assert_eq!(reader.detail, "Str");
         assert_eq!(reader.kind, CompletionKind::Field);
 
-        let slash = ": get ( { age : Int, name : Str } -- Str )\n  /na";
-        let reader = complete(slash, Path::new("M.ply"), at(slash, "/na").0, at(slash, "/na").1)
-            .into_iter()
-            .find(|item| item.label == "/name")
-            .unwrap();
-        assert_eq!(reader.insert, "/name");
-        assert_eq!(&slash[reader.replace.start as usize..reader.replace.end as usize], "/na");
+        let slash = "\
+; Person = Person name : Str, age : Num
 
-        assert!(labels(": bad ( Int -- Int )\n  1 =", "1 =").is_empty());
-        assert!(labels(": get ( { name : Str } -- Str )\n  /name =", "/name =").is_empty());
-        assert_eq!(
-            labels(": get ( { name : Str } -- Str )\n  [ = ] call\n", "[ ="),
-            vec!["name".to_string()]
-        );
+: get ( Person -- Str )
+  na>>";
+        let reader = complete(slash, Path::new("M.ply"), at(slash, "na>>").0, at(slash, "na>>").1)
+            .into_iter()
+            .find(|item| item.label == "name>>")
+            .unwrap();
+        assert_eq!(reader.insert, "name>>");
+        assert_eq!(&slash[reader.replace.start as usize..reader.replace.end as usize], "na>>");
+
+        assert!(labels(": bad ( Int -- Int )\n  1 >>", "1 >>").is_empty());
+        assert!(labels(
+            "; Person = Person name : Str, age : Num\n\n: get ( Person -- Str )\n  name>> >>",
+            "name>> >>"
+        )
+        .is_empty());
         assert_eq!(
             labels(
-                "; Person = Mk { name : Str, age : Int }\n\n: fromMk ( Person -- Str )\n  Mk -> 1 =",
-                "Mk -> 1 ="
+                "; Person = Person name : Str, age : Num\n\n: get ( Person -- Str )\n  [ >> ] call\n",
+                "[ >>"
             ),
             vec!["age".to_string(), "name".to_string()]
         );
-        assert!(labels(": get ( { name : Str } -- Str )\n  = ! age", "= !").is_empty());
+        assert!(labels(
+            "; Shape = Circle | Rect w : Num, h : Num\n\n: get ( Shape -- Num )\n  1 >>",
+            "1 >>"
+        )
+        .is_empty());
+        assert!(labels(
+            "; Box a = Box a\n\n: get ( a. (Box a) -- a )\n  1 >>",
+            "1 >>"
+        )
+        .is_empty());
+        assert!(labels(
+            "; Person = Person name : Str, age : Num\n\n: get ( Person -- Str )\n  >> ! age",
+            ">> !"
+        )
+        .is_empty());
+
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("plylang-complete-fields-{nanos}"));
+        let _cleanup = Cleanup(root.clone());
+        fs::create_dir_all(root.join("src/Data")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{ "name": "@algosail/c", "ply": { "source": "src", "out": "dist", "language": 1 } }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/Data/Entry.ply"),
+            "; Entry = Entry id : Num, at : Num\n- Clock Entry\n",
+        )
+        .unwrap();
+        let app = root.join("src/App.ply");
+        fs::write(&app, "").unwrap();
+        let imported = "~ \"Data/Entry\" (Clock)\n\n: get ( Clock -- Clock )\n  1 >>";
+        let items = complete(imported, &app, at(imported, "1 >>").0, at(imported, "1 >>").1);
+        assert_eq!(
+            items.iter().map(|item| item.label.clone()).collect::<Vec<_>>(),
+            vec!["at".to_string(), "id".to_string()]
+        );
+        assert_eq!(items.iter().find(|item| item.label == "at").unwrap().detail, "Num");
     }
 }

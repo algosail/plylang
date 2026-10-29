@@ -2710,7 +2710,7 @@ mod tests {
 "#,
             ),
         );
-        temp.write("src/Data/Num.ply", "; Box a = Mk a a\n");
+        temp.write("src/Data/Num.ply", "; Box a = Mk one : a, two : a\n");
         temp.write(
             "src/Data/Other.ply",
             "; Box a = Box a\n\n: wrap ( a. a -- (Box a) )\n  Box\n",
@@ -2732,7 +2732,7 @@ mod tests {
 "#,
             ),
         );
-        again.write("src/Data/Num.ply", "; Box a = Mk a a\n");
+        again.write("src/Data/Num.ply", "; Box a = Mk one : a, two : a\n");
         again.write(
             "src/App.ply",
             "~ \"Data/Num\" (Box)\n~ \"Data/Num\" (Mk)\n\n: pair ( a. a a -- (Box a) )\n  Mk\n",

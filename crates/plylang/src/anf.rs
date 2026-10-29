@@ -25,6 +25,8 @@ pub struct AnfData {
 pub struct AnfCtor {
     pub name: String,
     pub fields: usize,
+    /// Parallel to the field count. `None` is a positional field (`value` / `valueN`).
+    pub names: Vec<Option<String>>,
     /// The constructor is the identity function. An equation reads the value itself.
     pub newtype: bool,
 }
@@ -220,10 +222,20 @@ fn ctor_export(ctor: &AnfCtor) -> String {
     }
     let params: Vec<String> = (0..ctor.fields).map(|i| format!("v{i}")).collect();
     let list = params.join(", ");
-    let fields = (0..ctor.fields)
-        .map(|i| format!("value{i}: v{i}"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let named = ctor.names.len() == ctor.fields && ctor.names.iter().all(|name| name.is_some());
+    let fields = if named {
+        ctor.names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| format!("{}: v{index}", name.as_deref().unwrap()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        (0..ctor.fields)
+            .map(|index| format!("value{index}: v{index}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     format!(
         "export const {name} = ({list}) => ({{ tag: \"{}\", {fields} }});",
         ctor.name

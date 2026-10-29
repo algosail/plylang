@@ -72,7 +72,7 @@ The same permutations as in Factor follow, with names made of letters: `dupd`, `
 
 ## Quotation
 
-`[ ... ]` is a value. It does not capture the stack outside, and it does not run by itself. Square brackets are a quotation. An array is written in angle brackets, a record in braces.
+`[ ... ]` is a value. It does not capture the stack outside, and it does not run by itself. Square brackets are a quotation. An array is written in angle brackets.
 
 ```text
 : call ( ..s (..s -- ..t) -- ..t )
@@ -127,7 +127,7 @@ When the first line of a body is patterns and `->`, the whole body is equations.
 
 `true` together with `false` covers `Bool`. `Num`, `Int`, and `Str` need a final branch with a name or `_`.
 
-A bare constructor puts its fields on the stack from left to right, the last field on top. Parentheses hold one slot: `(Just x)` names the field and does not put it until the name is mentioned.
+A bare constructor puts its fields on the stack from left to right, the last field on top. Parentheses hold one slot: `(Just x)` names the field and does not put it until the name is mentioned. `(Person n _)` names the first field of `Person` and discards the second.
 
 An array in a pattern has a fixed length. `<>` matches only the empty array. One length does not cover every `Array`.
 
@@ -135,13 +135,6 @@ An array in a pattern has a fixed length. `<>` matches only the empty array. One
 : isEmpty ( (Array a) -- Bool )
   <> -> true
   _ -> false
-```
-
-A record in a pattern reads the named fields. The tail `| r` is written in the type of the slot, not in the pattern. `{}` fits any record of that slot.
-
-```ply
-: nameOf ( { name : Str | r } -- Str )
-  { name : n } -> n
 ```
 
 ## Data
@@ -165,14 +158,28 @@ The empty body of the `Nothing` branch leaves the fallback value. For `Just` the
 A list with its own structure is a separate type. The head sits in the constructor, and the tail is another value of that type.
 
 ```ply
-; List a = Nil | Cons a (List a)
+; List a = Nil | Cons head : a, tail : (List a)
 ```
 
-In JavaScript a constructor with no fields is `{ tag: "Nothing" }`. One field is the function `(value) => ({ tag: "Just", value })`. Several fields are `value0`, `value1`, from left to right.
+Zero fields and one field have no names. `Nothing` stores nothing. `Just a` stores one value, and the equation names it. Two or more fields are `name : Type`, separated by commas. A second positional type is [PL0117](docs/Errors.md#pl0117). One named field is [PL0118](docs/Errors.md#pl0118).
+
+```ply
+; Pair a b = Pair frs : a, snd : b
+
+: frs ( a b. (Pair a b) -- a )
+  frs>>
+
+: setSnd ( a b. (Pair a b) b -- (Pair a b) )
+  >>snd
+```
+
+`Pair` the word takes the fields in that order, last on top. `frs>>` consumes the pair and leaves the field. When the pair is still needed, copy it first: `dup frs>>`. `>>snd` takes the new field above the pair and returns a new pair. The previous pair is a separate value. A sum has no reader: `->` picks the constructor. `name>>` on `Maybe` is [PL0119](docs/Errors.md#pl0119). `frs>>` on `Int`, on a type variable, or on a synonym of `Num` is [PL0063](docs/Errors.md#pl0063). A missing field is [PL0120](docs/Errors.md#pl0120).
+
+In JavaScript a constructor with no fields is `{ tag: "Nothing" }`. One field is `(value) => ({ tag: "Just", value })`. Named fields are properties: `(v0, v1) => ({ tag: "Pair", frs: v0, snd: v1 })`.
 
 ## Array
 
-`< 1 2 3 >` is an array of three numbers, of type `(Array Num)`. Index 0 is the left element. The empty array is `<>`. A word is not written inside the angle brackets: an element is a literal, a quotation, a nested array, or a record.
+`< 1 2 3 >` is an array of three numbers, of type `(Array Num)`. Index 0 is the left element. The empty array is `<>`. A word is not written inside the angle brackets: an element is a literal, a quotation, or a nested array.
 
 A word that walks an array is imported. In the example the quotation sits on top. The name comes from one module, and the instance for the array comes from another.
 
@@ -187,58 +194,19 @@ A word that walks an array is imported. In the example the quotation sits on top
 
 Empty parentheses bring the instances of a module and bring no names. The result is `2`, `3`, `4`.
 
-## Record
-
-A record is an unnamed set of fields. Field order does not matter: `{ name : Str, age : Num }` and `{ age : Num, name : Str }` are one type.
-
-```ply
-: person ( -- { name : Str, age : Num } )
-  { name: "Ada", age: 36 }
-
-: nameOf ( { name : Str | r } -- Str )
-  /name
-
-: older ( { name : Str, age : Num } -- { name : Str, age : Num } )
-  37 =age
-```
-
-`/name` reads a field. An open tail `| r` accepts extra labels, so `nameOf` also takes a record with an `age` field. A closed record `{ name : Str }` accepts no extra field.
-
-`=age` replaces a field that is already there and returns a new record. The old JavaScript object stays as it was. `+city` adds a label that is not there yet. The record under `+name` must be closed.
-
-```ply
-- Person { name : Str, age : Num }
-- PersonWithCity { city : Str | Person }
-
-: inParis ( Person -- PersonWithCity )
-  "Paris" +city
-```
-
-`| Person` substitutes the fields of a closed record. `| (Person a)` does the same when the synonym has an argument: the parentheses are required. The empty record is `{}`.
-
-When the record is still needed after a read, copy it: `dup /name`.
-
-A named type and a record do different jobs. A constructor may carry a record whole.
-
-```ply
-; Person = Mk { name : Str, age : Num }
-
-: personName ( Person -- Str )
-  Mk -> /name
-```
-
 ## A name for a type
 
 `-` names a type that already exists. The right-hand side follows immediately. It is the same type, and the name has no constructor.
 
 ```ply
-- Person { name : Str, age : Num }
+; Person = Person name : Str, age : Num
+- Human Person
 
-: older ( Person -- Person )
-  37 =age
+: older ( Human -- Human )
+  37 >>age
 ```
 
-Parameters are written as they are on a type: `- Pair a b { left : a, right : b }`. In a slot a synonym is saturated, `(Pair Num Str)`.
+Parameters are written as they are on a type: `- Twin a (Pair a a)`. In a slot a synonym is saturated, `(Twin Num)`.
 
 ## Wrapper
 

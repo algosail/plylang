@@ -149,8 +149,6 @@ impl<'a> Lexer<'a> {
             }
             '[' => TokenKind::LBrack,
             ']' => TokenKind::RBrack,
-            '{' => TokenKind::LBrace,
-            '}' => TokenKind::RBrace,
             ':' => TokenKind::Colon,
             ',' => TokenKind::Comma,
             '|' => TokenKind::Pipe,
@@ -162,29 +160,24 @@ impl<'a> Lexer<'a> {
                 self.bump();
                 TokenKind::EqEq
             }
-            // `=name` writes a field. `eq = eqInt` keeps a spaced `=`.
-            '=' if self.peek().is_some_and(is_ident_start) => {
-                let name = self.glued_name(start);
-                return Ok(self.make(TokenKind::FieldSet(name), start, self.index));
-            }
             '=' => TokenKind::Eq,
             '<' => TokenKind::LAngle,
+            // `>>name` replaces a field. `>` and `>>` without a name stay angles.
+            '>' if self.peek() == Some('>') && self.peek_at(1).is_some_and(is_ident_start) => {
+                self.bump();
+                let name_at = self.index;
+                while self.peek().is_some_and(is_ident_continue) {
+                    self.bump();
+                }
+                let name = self.source[name_at..self.index].to_string();
+                return Ok(self.make(TokenKind::FieldSet(name), start, self.index));
+            }
             '>' => TokenKind::RAngle,
             // Declaration runes. `-` at column 0 is a synonym; other dashes stay in `dash`.
             '~' => TokenKind::Import,
             ';' => TokenKind::Data,
             '&' => TokenKind::Class,
             '#' => TokenKind::Instance,
-            // `/name` reads a field. `//` stays an unexpected character.
-            '/' if self.peek().is_some_and(is_ident_start) => {
-                let name = self.glued_name(start);
-                return Ok(self.make(TokenKind::Field(name), start, self.index));
-            }
-            // `+name` inserts a field. `+1`, `++`, `+=`, and a spaced `+` do not.
-            '+' if self.peek().is_some_and(is_ident_start) => {
-                let name = self.glued_name(start);
-                return Ok(self.make(TokenKind::FieldInsert(name), start, self.index));
-            }
             '.' if self.group_depth == 0 => return self.doc_line(start),
             '.' => return self.dot(start),
             '"' => return self.string(start),
@@ -193,6 +186,13 @@ impl<'a> Lexer<'a> {
             ch if is_ident_start(ch) => {
                 while self.peek().is_some_and(is_ident_continue) {
                     self.bump();
+                }
+                // `name>>` reads a field. A space before `>>` leaves the name and two angles.
+                if self.peek() == Some('>') && self.peek_at(1) == Some('>') {
+                    let text = self.source[start..self.index].to_string();
+                    self.bump();
+                    self.bump();
+                    return Ok(self.make(TokenKind::Field(text), start, self.index));
                 }
                 let text = self.source[start..self.index].to_string();
                 keyword(&text).unwrap_or(TokenKind::Ident(text))
@@ -256,14 +256,6 @@ impl<'a> Lexer<'a> {
             }
         }
         Ok(self.make(TokenKind::String(value), start, self.index))
-    }
-
-    /// The prefix character is already consumed. The name is glued to it.
-    fn glued_name(&mut self, start: usize) -> String {
-        while self.peek().is_some_and(is_ident_continue) {
-            self.bump();
-        }
-        self.source[start + 1..self.index].to_string()
     }
 
     fn dot(&mut self, start: usize) -> Result<Token, Diagnostic> {
@@ -419,12 +411,12 @@ mod tests {
 
     #[test]
     fn literals_and_tails() {
-        let kinds = spell("-42 1.5 1e10 /name (..s . ..)");
+        let kinds = spell("-42 1.5 1e10 name>> (..s . ..)");
         assert!(kinds.iter().any(|kind| kind == "Number(\"-42\")"));
         assert!(kinds.iter().any(|kind| kind == "Number(\"1.5\")"));
         assert!(kinds.iter().any(|kind| kind == "Number(\"1e10\")"));
         assert_eq!(
-            spell("(1.) 1n -1n 1name =age"),
+            spell("(1.) 1n -1n 1name >>age"),
             vec![
                 "LParen".to_string(),
                 "Number(\"1\")".to_string(),
@@ -440,14 +432,13 @@ mod tests {
         assert!(kinds.iter().any(|kind| kind == "Tail(\"s\")"));
         assert!(kinds.iter().any(|kind| kind == "Field(\"name\")"));
         assert_eq!(
-            spell("+city =age /name"),
+            spell(">>age name>>"),
             vec![
-                "FieldInsert(\"city\")".to_string(),
                 "FieldSet(\"age\")".to_string(),
                 "Field(\"name\")".to_string(),
             ]
         );
-        for source in ["+ city", "+", "+1", "+=", "++"] {
+        for source in ["+city", "+ city", "+", "+1", "+=", "++", "{ name: 1 }", "}"] {
             let error = tokenize(source).unwrap_err();
             assert_eq!(error.message, "unexpected character", "{source}");
         }
@@ -457,7 +448,7 @@ mod tests {
         assert!(inside.iter().any(|kind| kind == "Tail(\"s\")"), "{inside:?}");
         assert!(!inside.iter().any(|kind| kind.starts_with("Doc")), "{inside:?}");
         assert_eq!(
-            spell("< < dup > > <= => =age /name eq = eqInt"),
+            spell("< < dup > > <= => >>age name>> eq = eqInt"),
             vec![
                 "LAngle".to_string(),
                 "LAngle".to_string(),

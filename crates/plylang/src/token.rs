@@ -18,11 +18,12 @@ pub enum TokenKind {
     String(String),
     /// `..name`
     Tail(String),
-    /// `/name` reads a record field.
+    /// `name>>` reads a field.
     Field(String),
-    /// `=name` replaces a record field. The record stays below the new value.
+    /// `>>name` replaces a field and returns a new value.
     FieldSet(String),
-    /// `+name` inserts a record field. The record stays below the new value.
+    /// Kept so error numbers stay put. The lexer does not produce this token.
+    #[allow(dead_code)]
     FieldInsert(String),
     /// `..` in an import list.
     All,
@@ -50,7 +51,9 @@ pub enum TokenKind {
     LAngle,
     /// `>` closes an array.
     RAngle,
+    /// Kept so error numbers stay put. The lexer does not produce this token.
     LBrace,
+    /// Kept so error numbers stay put. The lexer does not produce this token.
     RBrace,
     Import,
     Language,

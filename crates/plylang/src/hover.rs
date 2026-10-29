@@ -349,7 +349,7 @@ fn ctor_scheme(data: &Data, ctor: &Ctor) -> String {
         effect: StackEffect {
             input: Stack {
                 tail: StackTail::Implicit,
-                items: ctor.fields.clone(),
+                items: ctor.field_tys(),
             },
             output: Stack {
                 tail: StackTail::Implicit,
@@ -413,12 +413,12 @@ mod tests {
 
     #[test]
     fn hovers_a_type_synonym() {
-        let source = ".. A person.\n- Person { name : Str, age : Num }\n\n: older ( Person -- Person )\n  37 =age\n";
-        let at = at(source, "Person --");
+        let source = "; Person = Person name : Str, age : Num\n.. A person.\n- Human Person\n\n: older ( Human -- Human )\n  37 >>age\n";
+        let at = at(source, "Human --");
         let hovered = hover(source, Path::new("M.ply"), at.0, at.1).unwrap();
         assert_eq!(
             hovered.contents,
-            "```ply\n- Person { name : Str, age : Num }\n```\n\nA person."
+            "```ply\n- Human Person\n```\n\nA person."
         );
     }
 
@@ -584,16 +584,19 @@ mod tests {
     #[test]
     fn hovers_a_synonym_by_name_on_the_stack() {
         let source = "\
-- Person { name : Str, age : Num }
+; Person = Person name : Str, age : Num
+- Human Person
 
-: older ( Person -- Person )
-  37 =age
+: older ( Human -- Human )
+  37 >>age
 
-: usePerson ( Person -- Person )
+: usePerson ( Human -- Human )
   older
 
-- Inner { n : Num }
-- Outer { inner : Inner, name : Str }
+; Inner = Inner n : Num, tag : Num
+- Wrapped Inner
+
+; Outer = Outer inner : Wrapped, name : Str
 
 : outer ( Outer -- Outer )
   dup drop
@@ -601,7 +604,7 @@ mod tests {
 : useOuter ( Outer -- Outer )
   outer
 
-- Pair a b { left : a, right : b }
+; Pair a b = Pair left : a, right : b
 
 : pair ( (Pair Int Str) -- (Pair Int Str) )
   dup drop
@@ -620,23 +623,23 @@ mod tests {
 : usePlain ( Age -- Int )
   plain
 
-: row ( { inner : Inner, name : Str } -- Str )
-  /name
+: read ( Outer -- Str )
+  name>>
 
-: useRow ( { inner : Inner, name : Str } -- Str )
-  row
+: useRead ( Outer -- Str )
+  read
 ";
         let older = source.rfind("older").unwrap();
         let (line, character) = at_offset(source, older);
         let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
         assert_eq!(
             hovered.contents,
-            "```ply\n: older ( Person -- Person )\n```\n\n```ply\nPerson -- Person\n```"
+            "```ply\n: older ( Human -- Human )\n```\n\n```ply\nHuman -- Human\n```"
         );
-        let between = source.find("37 =age").unwrap();
+        let between = source.find("37 >>age").unwrap();
         let (line, character) = at_offset(source, between + "37".len());
         let gap = hover(source, Path::new("M.ply"), line, character).unwrap();
-        assert_eq!(gap.contents, "```ply\nPerson Num\n```");
+        assert_eq!(gap.contents, "```ply\nHuman Num\n```");
 
         let outer = source.rfind("outer").unwrap();
         let (line, character) = at_offset(source, outer);
@@ -677,11 +680,11 @@ mod tests {
             hovered.contents
         );
 
-        let row = source.rfind("\n  row").unwrap() + 3;
+        let row = source.rfind("\n  read").unwrap() + 3;
         let (line, character) = at_offset(source, row);
         let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
         assert!(
-            hovered.contents.ends_with("```ply\n{ inner : Inner, name : Str } -- Str\n```"),
+            hovered.contents.ends_with("```ply\nOuter -- Str\n```"),
             "{}",
             hovered.contents
         );
