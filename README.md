@@ -81,6 +81,7 @@ The same permutations as in Factor follow, with names made of letters: `dupd`, `
 : bi ( ..s a (a -- b) (a -- c) -- ..s b c )
 : if ( ..s Bool (..s -- ..t) (..s -- ..t) -- ..t )
 : quote ( ..s a -- ..s (-- a) )
+: cons ( ..r a (..s a -- ..t) -- ..r (..s -- ..t) )
 ```
 
 `call` takes a quotation and runs it on the rest. `dip` hides the value under the quotation, runs the quotation, and returns what it hid to the top. `dip2` and `dip3` hide two and three values. `keep` runs the quotation and returns the value it took. `keep2` returns two.
@@ -90,6 +91,8 @@ The same permutations as in Factor follow, with names made of letters: `dupd`, `
 `if` takes a `Bool` and two quotations. The `true` branch is placed first and the `false` branch second, so `false` ends up on top. The branches agree on the stack.
 
 `quote` wraps the top. `42 quote` is a quotation of type `(-- Num)`.
+
+`cons` pushes a value and then runs a quotation. The value sits under the quotation, so `5 [ 1 add ] cons` is a quotation of type `(-- Num)` that pushes five and then adds one. The call site does not name that value.
 
 ```ply
 ~ "Num" (eq, sub, mul)
@@ -374,7 +377,7 @@ A word named `main` whose scheme is `( -- Unit )` is the program of that module.
 
 The exit code is 0 for success, 1 for a diagnostic, and 2 for bad arguments. `--help` prints the same lines. Messages are in English: `file:line:column: error: PLxxxx: message`, and the next line is a link to the matching section of `docs/Errors.md`.
 
-What enters a word's function is its own prefix, from the bottom upward. One result is returned by itself. Several results come back as a JavaScript array: that is the calling convention, and it is not an `(Array a)` value. The words from `dup` through `over2` do not become calls. `call`, `dip`, `keep`, `bi`, `if`, and their neighbors inline the body of the quotation.
+What enters a word's function is its own prefix, from the bottom upward. One result is returned by itself. Several results come back as a JavaScript array: that is the calling convention, and it is not an `(Array a)` value. The words from `dup` through `over2` do not become calls. `call`, `dip`, `keep`, `bi`, `if`, and their neighbors inline the body of the quotation. `cons` builds a quotation that pushes the value under it and then runs it.
 
 ## Building
 

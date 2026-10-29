@@ -5,6 +5,10 @@
 //! caller's locals into the callee. A shuffle reuses those operands. A visible
 //! quotation is inlined, so a tail it does not consume stays in the caller
 //! even when two `if` branches were written with different arities.
+//!
+//! A quotation literal stays pending until the word that uses it has ascribed
+//! its input. `cons` only records the captured value. The body is lowered
+//! later, so `call` inside it sees that value's arity.
 
 use std::collections::HashMap;
 
@@ -18,7 +22,7 @@ use crate::diagnostic::Diagnostic;
 use crate::codes::Error;
 use crate::span::Span;
 
-use super::{Checker, Dict, StackId, StackNode, TyId, TyNode};
+use super::{Checker, Dict, EffectId, StackId, StackNode, TyId, TyNode};
 
 pub(crate) fn to_anf(module: &Module) -> Result<AnfModule, Diagnostic> {
     Checker::new().lower_module(module)
@@ -32,6 +36,23 @@ pub fn javascript(module: &Module) -> Result<String, Diagnostic> {
 enum Operand {
     Local(LocalId),
     Quote(QuoteForm),
+    /// The body waits until a use ascribes `input`.
+    Pending(PendingForm),
+}
+
+#[derive(Clone)]
+struct PendingForm {
+    span: Span,
+    terms: Vec<Term>,
+    env: Vec<HashMap<String, LocalId>>,
+    /// Schemes in scope when the quotation was built. Realizing restores them
+    /// so a name closed over by the body is still a word.
+    locals: Vec<HashMap<String, super::SemScheme>>,
+    input: StackId,
+    output: StackId,
+    effect: EffectId,
+    /// Values `cons` pushed, first cons first. Each was the top input then.
+    captures: Vec<LocalId>,
 }
 
 struct Frame {
@@ -83,9 +104,17 @@ impl Frame {
         self.pop_n(checker, 1).pop().expect("pop one")
     }
 
-    fn force(&mut self, checker: &mut Checker, operand: Operand) -> LocalId {
+    fn force(
+        &mut self,
+        checker: &mut Checker,
+        operand: Operand,
+    ) -> Result<LocalId, Diagnostic> {
         match operand {
-            Operand::Local(id) => id,
+            Operand::Local(id) => Ok(id),
+            Operand::Pending(pending) => {
+                let quote = checker.realize(pending)?;
+                self.force(checker, Operand::Quote(quote))
+            }
             Operand::Quote(quote) => {
                 let id = checker.fresh_local();
                 checker
@@ -95,7 +124,7 @@ impl Frame {
                     binds: vec![id],
                     value: Value::Quote(quote),
                 });
-                id
+                Ok(id)
             }
         }
     }
@@ -104,6 +133,7 @@ impl Frame {
 impl Checker {
     fn lower_module(&mut self, module: &Module) -> Result<AnfModule, Diagnostic> {
         self.prepare(module)?;
+        self.check_bodies(module)?;
         self.lower_prepared(module)
     }
 
@@ -214,7 +244,7 @@ impl Checker {
         self.assumption_locals.clear();
         finished?;
         self.escaped_effect(def.name_span)?;
-        let result = drain_results(self, &mut frame);
+        let result = drain_results(self, &mut frame)?;
         let concrete = self.cons_len(output);
         if result.len() != concrete {
             panic!(
@@ -256,14 +286,26 @@ impl Checker {
             TermNode::Word(name) => self.lower_word(term.span, name, stack, frame)?,
             TermNode::Lit(lit) => self.lower_lit(lit, stack, frame),
             TermNode::Quote(terms) => {
-                let (fun, operand) = self.lower_quotation(terms, &frame.env)?;
-                frame.stack.push(operand);
+                let input = self.stack_var();
+                let output = self.stack_var();
+                let effect = self.effect_var();
+                let fun = self.ty_fun(input, output, effect);
+                frame.stack.push(Operand::Pending(PendingForm {
+                    span: term.span,
+                    terms: terms.clone(),
+                    env: frame.env.clone(),
+                    locals: self.locals.clone(),
+                    input,
+                    output,
+                    effect,
+                    captures: Vec::new(),
+                }));
                 self.stack_cons(stack, fun)
             }
             TermNode::Field(name) => {
                 let output = self.project_field(term.span, name, stack)?;
                 let operand = frame.pop_one(self);
-                let base = frame.force(self, operand);
+                let base = frame.force(self, operand)?;
                 let id = self.fresh_local();
                 frame.lets.push(Let {
                     binds: vec![id],
@@ -323,8 +365,8 @@ impl Checker {
         let output = self.set_field(span, name, stack)?;
         let value = frame.pop_one(self);
         let base = frame.pop_one(self);
-        let value = frame.force(self, value);
-        let base = frame.force(self, base);
+        let value = frame.force(self, value)?;
+        let base = frame.force(self, base)?;
         let id = self.fresh_local();
         frame.lets.push(Let {
             binds: vec![id],
@@ -348,8 +390,8 @@ impl Checker {
         let output = self.insert_field(span, name, stack)?;
         let value = frame.pop_one(self);
         let base = frame.pop_one(self);
-        let value = frame.force(self, value);
-        let base = frame.force(self, base);
+        let value = frame.force(self, value)?;
+        let base = frame.force(self, base)?;
         let id = self.fresh_local();
         frame.lets.push(Let {
             binds: vec![id],
@@ -437,42 +479,108 @@ impl Checker {
             _ => return Err(self.error(term.span, Error::ExpectedElement)),
         };
         let operand = inner.stack.pop().expect("element");
-        let local = inner.force(self, operand);
+        let local = inner.force(self, operand)?;
         frame.lets.extend(inner.lets);
         Ok((ty, local))
     }
 
-    fn lower_quotation(
-        &mut self,
-        terms: &[Term],
-        env: &[HashMap<String, LocalId>],
-    ) -> Result<(TyId, Operand), Diagnostic> {
-        let local = self.effect_var();
-        let saved = self.ambient.replace(local);
-        let input = self.stack_var();
-        let mut env = env.to_vec();
+    /// Lower a quotation after its input has been ascribed.
+    ///
+    /// The body runs on a private copy of that spine, the same way the checker
+    /// does, so two quotations that share an input do not extend one stack.
+    /// Captures replace the top parameters. A body that never pops the value
+    /// keeps it under the outputs.
+    fn realize(&mut self, pending: PendingForm) -> Result<QuoteForm, Diagnostic> {
+        let private_in = self.copy_spine(pending.input);
+        let types = self.cons_tys(private_in);
+        let mut params = Vec::with_capacity(types.len());
+        let mut stack = Vec::with_capacity(types.len());
+        for ty in types {
+            let id = self.fresh_local();
+            self.note_fn(id, ty);
+            params.push(id);
+            stack.push(Operand::Local(id));
+        }
+        // A captured quotation's arity lives on its local. The type's own
+        // prefix stops at the link the body wrote, so it often reads as (0, 0).
+        for (offset, capture) in pending.captures.iter().enumerate() {
+            if offset >= params.len() {
+                break;
+            }
+            let param = params[params.len() - 1 - offset];
+            if let Some(arity) = self.fn_arity.get(capture).copied() {
+                self.fn_arity.insert(param, arity);
+            }
+        }
+        let saved_ambient = self.ambient.replace(pending.effect);
+        let saved_locals = std::mem::replace(&mut self.locals, pending.locals);
+        let mut env = pending.env;
         env.push(HashMap::new());
         let mut frame = Frame {
-            stack: Vec::new(),
-            params: Vec::new(),
-            flexible: true,
+            stack,
+            params,
+            flexible: self.tail_is_open(private_in),
             lets: Vec::new(),
             env,
         };
         self.locals.push(HashMap::new());
-        let lowered = self.lower_terms(terms, input, &mut frame);
+        let lowered = self.lower_terms(&pending.terms, private_in, &mut frame);
         self.locals.pop();
-        self.ambient = saved;
+        self.locals = saved_locals;
+        self.ambient = saved_ambient;
         let output = lowered?;
-        let result = drain_results(self, &mut frame);
-        let quote = QuoteForm {
-            params: frame.params,
-            body: Expr {
-                lets: frame.lets,
-                result,
-            },
+        self.unify_stack(private_in, pending.input)
+            .map_err(|message| self.error(pending.span, message))?;
+        self.unify_stack(output, pending.output)
+            .map_err(|message| self.error(pending.span, message))?;
+        let result = drain_results(self, &mut frame)?;
+        let body = Expr {
+            lets: frame.lets,
+            result,
         };
-        Ok((self.ty_fun(input, output, local), Operand::Quote(quote)))
+        Ok(self.substitute_captures(pending.captures, frame.params, body))
+    }
+
+    fn substitute_captures(
+        &mut self,
+        captures: Vec<LocalId>,
+        mut params: Vec<LocalId>,
+        body: Expr,
+    ) -> QuoteForm {
+        let mut map = HashMap::new();
+        let mut spilled = Vec::new();
+        for capture in captures {
+            match params.pop() {
+                Some(param) => {
+                    map.insert(param, capture);
+                }
+                None => spilled.push(capture),
+            }
+        }
+        let mut body = self.freshen_expr(&body, &mut map);
+        for capture in spilled {
+            body.result.insert(0, capture);
+        }
+        QuoteForm { params, body }
+    }
+
+    /// A variable tail can still grow. An empty or rigid tail cannot.
+    fn tail_is_open(&self, stack: StackId) -> bool {
+        let mut current = self.find_stack(stack);
+        loop {
+            match &self.stacks[current.0 as usize] {
+                StackNode::Cons(rest, _) => current = self.find_stack(*rest),
+                StackNode::Var | StackNode::Template => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    fn realize_operand(&mut self, operand: Operand) -> Result<Operand, Diagnostic> {
+        match operand {
+            Operand::Pending(pending) => Ok(Operand::Quote(self.realize(pending)?)),
+            other => Ok(other),
+        }
     }
 
     /// Quotation header `x y ->` binds the deepest value to `x` and the top to `y`.
@@ -495,7 +603,10 @@ impl Checker {
             let (rest, ty) = self.pop_slot(current, span)?;
             current = rest;
             let operand = frame.pop_one(self);
-            let id = frame.force(self, operand);
+            let id = frame.force(self, operand)?;
+            if let Some(arity) = self.bind_arity.get(&(span, name.clone())) {
+                self.fn_arity.insert(id, *arity);
+            }
             let scheme = self.binding_scheme(ty);
             bound.push((name.clone(), id, scheme));
         }
@@ -524,43 +635,61 @@ impl Checker {
             frame.stack.push(Operand::Local(id));
             return Ok(output);
         }
+        if name == "call" {
+            if let Some(output) = self.lower_unsolved_call(span, stack, frame)? {
+                return Ok(output);
+            }
+        }
         let (input, output, constraints) = self.instantiate_use(span, name, stack)?;
         let lowering = builtin::word(name).map(|word| word.lowering);
         match lowering {
             Some(Lowering::Call) => {
-                self.known_arity(input, span)?;
-                let produced = self.lower_call(frame);
+                // The scheme has ascribed the function. A local produced by
+                // `curry` already has that function type; record its arity
+                // before `call` reads the local.
+                self.note_call_arity(frame, input);
+                if !self.arity_ready(input) && !self.frame_call_ready(frame) {
+                    return Err(self.error(span, Error::QuotationArityUnknown));
+                }
+                let produced = self.lower_call(frame)?;
                 // `call` returns `..t`, so the result types sit in that tail.
                 // A result may itself be a quotation. A later `call` needs its arity.
                 self.note_produced(output, produced, frame);
                 return Ok(output);
             }
             Some(Lowering::Dip { under }) => {
-                self.lower_dip(frame, under as usize);
+                self.lower_dip(frame, under as usize)?;
                 return Ok(output);
             }
             Some(Lowering::Keep { keep }) => {
-                self.lower_keep(frame, keep as usize);
+                self.lower_keep(frame, keep as usize)?;
                 return Ok(output);
             }
             Some(Lowering::Cleave { vals, quots }) => {
-                self.lower_cleave(frame, vals as usize, quots as usize);
+                self.lower_cleave(frame, vals as usize, quots as usize)?;
                 return Ok(output);
             }
             Some(Lowering::Spread { n }) => {
-                self.lower_spread(frame, n as usize);
+                self.lower_spread(frame, n as usize)?;
                 return Ok(output);
             }
             Some(Lowering::Each { n }) => {
-                self.lower_each(frame, n as usize);
+                self.lower_each(frame, n as usize)?;
                 return Ok(output);
             }
             Some(Lowering::If) => {
-                self.lower_if(frame);
+                self.lower_if(frame)?;
                 return Ok(output);
             }
             Some(Lowering::Quote) => {
-                self.lower_quote_word(frame);
+                self.lower_quote_word(frame)?;
+                return Ok(output);
+            }
+            Some(Lowering::Cons) => {
+                // The scheme has ascribed the quotation. A local may only
+                // have that function type, the same way `call` records it.
+                self.note_call_arity(frame, input);
+                self.lower_cons(span, frame)?;
                 return Ok(output);
             }
             Some(Lowering::Shuffle { take, put }) => {
@@ -572,7 +701,7 @@ impl Checker {
         let consumed = self.own_len(input);
         let produced = self.own_len(output);
         let args = frame.pop_n(self, consumed);
-        let args = force_all(self, frame, args);
+        let args = force_all(self, frame, args)?;
         if let Some(width) = self.ctor_width(name) {
             if width != args.len() {
                 panic!(
@@ -795,9 +924,9 @@ impl Checker {
         }
     }
 
-    fn lower_quote_word(&mut self, frame: &mut Frame) {
+    fn lower_quote_word(&mut self, frame: &mut Frame) -> Result<(), Diagnostic> {
         let value = frame.pop_one(self);
-        let id = frame.force(self, value);
+        let id = frame.force(self, value)?;
         frame.stack.push(Operand::Quote(QuoteForm {
             params: Vec::new(),
             body: Expr {
@@ -805,88 +934,191 @@ impl Checker {
                 result: vec![id],
             },
         }));
+        Ok(())
     }
 
-    fn lower_call(&mut self, frame: &mut Frame) -> usize {
+    /// `X [P] cons` lowers to `[X P]`. Parameters are bottom to top, and a
+    /// deeper underflow is spliced in at the bottom, so the last parameter is
+    /// the top input. That parameter is `X`. When `P` never pops, `X` stays
+    /// under what `P` pushes and is inserted at the front of the result.
+    fn lower_cons(&mut self, span: Span, frame: &mut Frame) -> Result<(), Diagnostic> {
         let quote = frame.pop_one(self);
+        let value = frame.pop_one(self);
+        let value = frame.force(self, value)?;
+        let built = match quote {
+            Operand::Pending(mut pending) => {
+                pending.captures.push(value);
+                Operand::Pending(pending)
+            }
+            Operand::Quote(form) => self.cons_quote(form, value),
+            Operand::Local(fun) => self.cons_fun(span, fun, value)?,
+        };
+        frame.stack.push(built);
+        Ok(())
+    }
+
+    fn cons_quote(&mut self, mut form: QuoteForm, value: LocalId) -> Operand {
+        let mut map = HashMap::new();
+        if let Some(top) = form.params.pop() {
+            map.insert(top, value);
+            let body = self.freshen_expr(&form.body, &mut map);
+            return Operand::Quote(QuoteForm {
+                params: form.params,
+                body,
+            });
+        }
+        let mut body = self.freshen_expr(&form.body, &mut map);
+        body.result.insert(0, value);
+        Operand::Quote(QuoteForm {
+            params: form.params,
+            body,
+        })
+    }
+
+    fn cons_fun(
+        &mut self,
+        span: Span,
+        fun: LocalId,
+        value: LocalId,
+    ) -> Result<Operand, Diagnostic> {
+        let Some((arity_in, arity_out)) = self.fn_arity.get(&fun).copied() else {
+            return Err(self.error(span, Error::QuotationArityUnknown));
+        };
+        if arity_in == 0 {
+            let binds = self.fresh_vec(arity_out);
+            let mut result = vec![value];
+            result.extend(binds.iter().copied());
+            return Ok(Operand::Quote(QuoteForm {
+                params: Vec::new(),
+                body: Expr {
+                    lets: vec![Let {
+                        binds,
+                        value: Value::Apply {
+                            fun,
+                            args: Vec::new(),
+                        },
+                    }],
+                    result,
+                },
+            }));
+        }
+        let params = self.fresh_vec(arity_in - 1);
+        let mut args = params.clone();
+        args.push(value);
+        let binds = self.fresh_vec(arity_out);
+        Ok(Operand::Quote(QuoteForm {
+            params,
+            body: Expr {
+                lets: vec![Let {
+                    binds: binds.clone(),
+                    value: Value::Apply { fun, args },
+                }],
+                result: binds,
+            },
+        }))
+    }
+
+    fn lower_call(&mut self, frame: &mut Frame) -> Result<usize, Diagnostic> {
+        let quote = frame.pop_one(self);
+        let quote = self.realize_operand(quote)?;
         let (arity, produced) = self.quote_arity(&quote);
-        let base = take_base(self, frame, arity);
+        let base = take_base(self, frame, arity)?;
         let expr = self.reduce_quote(quote, base);
         frame.lets.extend(expr.lets);
         frame.stack = expr.result.into_iter().map(Operand::Local).collect();
-        produced
+        Ok(produced)
     }
 
-    fn lower_dip(&mut self, frame: &mut Frame, under: usize) {
+    fn lower_dip(&mut self, frame: &mut Frame, under: usize) -> Result<(), Diagnostic> {
         let quote = frame.pop_one(self);
+        let quote = self.realize_operand(quote)?;
         let hidden = frame.pop_n(self, under);
         let (arity, _) = self.quote_arity(&quote);
-        let base = take_base(self, frame, arity);
+        let base = take_base(self, frame, arity)?;
         let expr = self.reduce_quote(quote, base);
         frame.lets.extend(expr.lets);
         frame.stack = expr.result.into_iter().map(Operand::Local).collect();
         frame.stack.extend(hidden);
+        Ok(())
     }
 
-    fn lower_keep(&mut self, frame: &mut Frame, keep: usize) {
+    fn lower_keep(&mut self, frame: &mut Frame, keep: usize) -> Result<(), Diagnostic> {
         let quote = frame.pop_one(self);
+        let quote = self.realize_operand(quote)?;
         let saved = frame.pop_n(self, keep);
-        let saved = force_all(self, frame, saved);
+        let saved = force_all(self, frame, saved)?;
         frame.stack.extend(saved.iter().copied().map(Operand::Local));
         let (arity, _) = self.quote_arity(&quote);
-        let base = take_base(self, frame, arity);
+        let base = take_base(self, frame, arity)?;
         let expr = self.reduce_quote(quote, base);
         frame.lets.extend(expr.lets);
         frame.stack = expr.result.into_iter().map(Operand::Local).collect();
         frame.stack.extend(saved.into_iter().map(Operand::Local));
+        Ok(())
     }
 
     /// Every quotation sees the original tail. Only its produced suffix is kept.
-    fn lower_cleave(&mut self, frame: &mut Frame, vals: usize, quots: usize) {
+    fn lower_cleave(
+        &mut self,
+        frame: &mut Frame,
+        vals: usize,
+        quots: usize,
+    ) -> Result<(), Diagnostic> {
         let quotes = frame.pop_n(self, quots);
         let values = frame.pop_n(self, vals);
-        let values = force_all(self, frame, values);
-        let below = drain_results(self, frame);
+        let values = force_all(self, frame, values)?;
+        let below = drain_results(self, frame)?;
         let mut outputs = Vec::new();
         for quote in quotes {
+            let quote = self.realize_operand(quote)?;
             let mut base = below.clone();
             base.extend(values.iter().copied());
-            outputs.extend(self.produce(frame, quote, base));
+            outputs.extend(self.produce(frame, quote, base)?);
         }
         restore(frame, below, outputs);
+        Ok(())
     }
 
-    fn lower_spread(&mut self, frame: &mut Frame, n: usize) {
+    fn lower_spread(&mut self, frame: &mut Frame, n: usize) -> Result<(), Diagnostic> {
         let quotes = frame.pop_n(self, n);
         let values = frame.pop_n(self, n);
-        let values = force_all(self, frame, values);
-        let below = drain_results(self, frame);
+        let values = force_all(self, frame, values)?;
+        let below = drain_results(self, frame)?;
         let mut outputs = Vec::new();
         for (value, quote) in values.into_iter().zip(quotes) {
+            let quote = self.realize_operand(quote)?;
             let mut base = below.clone();
             base.push(value);
-            outputs.extend(self.produce(frame, quote, base));
+            outputs.extend(self.produce(frame, quote, base)?);
         }
         restore(frame, below, outputs);
+        Ok(())
     }
 
-    fn lower_each(&mut self, frame: &mut Frame, n: usize) {
+    fn lower_each(&mut self, frame: &mut Frame, n: usize) -> Result<(), Diagnostic> {
         let quote = frame.pop_one(self);
+        let quote = self.realize_operand(quote)?;
         let values = frame.pop_n(self, n);
-        let values = force_all(self, frame, values);
-        let below = drain_results(self, frame);
+        let values = force_all(self, frame, values)?;
+        let below = drain_results(self, frame)?;
         let mut outputs = Vec::new();
         for value in values {
             let mut base = below.clone();
             base.push(value);
-            outputs.extend(self.produce(frame, quote.clone(), base));
+            outputs.extend(self.produce(frame, quote.clone(), base)?);
         }
         restore(frame, below, outputs);
+        Ok(())
     }
 
     /// `reduce_quote` returns the untouched tail plus the quotation's outputs.
     /// The suffix is the outputs alone.
-    fn produce(&mut self, frame: &mut Frame, quote: Operand, base: Vec<LocalId>) -> Vec<LocalId> {
+    fn produce(
+        &mut self,
+        frame: &mut Frame,
+        quote: Operand,
+        base: Vec<LocalId>,
+    ) -> Result<Vec<LocalId>, Diagnostic> {
         let (_, produced) = self.quote_arity(&quote);
         let expr = self.reduce_quote(quote, base);
         frame.lets.extend(expr.lets);
@@ -897,19 +1129,21 @@ impl Checker {
             );
         }
         let start = expr.result.len() - produced;
-        expr.result[start..].to_vec()
+        Ok(expr.result[start..].to_vec())
     }
 
-    fn lower_if(&mut self, frame: &mut Frame) {
+    fn lower_if(&mut self, frame: &mut Frame) -> Result<(), Diagnostic> {
         let else_quote = frame.pop_one(self);
         let then_quote = frame.pop_one(self);
         let cond = frame.pop_one(self);
-        let cond = frame.force(self, cond);
+        let then_quote = self.realize_operand(then_quote)?;
+        let else_quote = self.realize_operand(else_quote)?;
+        let cond = frame.force(self, cond)?;
         let arity = self
             .quote_arity(&then_quote)
             .0
             .max(self.quote_arity(&else_quote).0);
-        let base = take_base(self, frame, arity);
+        let base = take_base(self, frame, arity)?;
         let yes = self.reduce_quote(then_quote, base.clone());
         let no = self.reduce_quote(else_quote, base);
         if yes.result.len() != no.result.len() {
@@ -925,6 +1159,7 @@ impl Checker {
             value: Value::If { cond, yes, no },
         });
         frame.stack = binds.into_iter().map(Operand::Local).collect();
+        Ok(())
     }
 
     fn lower_clauses(
@@ -937,7 +1172,7 @@ impl Checker {
         let operands = frame.pop_n(self, prepared.slots.len());
         let mut roots = Vec::with_capacity(operands.len());
         for operand in operands {
-            roots.push(frame.force(self, operand));
+            roots.push(frame.force(self, operand)?);
         }
         let below = frame.stack.clone();
         let mut outputs = Vec::new();
@@ -977,7 +1212,7 @@ impl Checker {
             let checked = self.lower_terms(&clause.body, arm_stack, &mut arm);
             self.locals.pop();
             outputs.push(checked?);
-            let result = drain_results(self, &mut arm);
+            let result = drain_results(self, &mut arm)?;
             choices.push(Choice {
                 conds,
                 body: Expr {
@@ -1194,6 +1429,14 @@ impl Checker {
         }
     }
 
+    fn frame_call_ready(&self, frame: &Frame) -> bool {
+        match frame.stack.last() {
+            Some(Operand::Quote(_)) | Some(Operand::Pending(_)) => true,
+            Some(Operand::Local(id)) => self.fn_arity.contains_key(id),
+            _ => false,
+        }
+    }
+
     fn quote_arity(&self, quote: &Operand) -> (usize, usize) {
         match quote {
             Operand::Quote(quote) => (quote.params.len(), quote.body.result.len()),
@@ -1202,6 +1445,7 @@ impl Checker {
                 .get(id)
                 .copied()
                 .unwrap_or_else(|| panic!("function local v{id} has no recorded arity")),
+            Operand::Pending(_) => panic!("quotation was not realized"),
         }
     }
 
@@ -1244,6 +1488,7 @@ impl Checker {
                     result: base[..split].iter().copied().chain(binds).collect(),
                 }
             }
+            Operand::Pending(_) => panic!("quotation was not realized"),
         }
     }
 
@@ -1253,6 +1498,9 @@ impl Checker {
             let binds = self.fresh_vec(let_.binds.len());
             for (old, new) in let_.binds.iter().zip(&binds) {
                 map.insert(*old, *new);
+                if let Some(arity) = self.fn_arity.get(old).copied() {
+                    self.fn_arity.insert(*new, arity);
+                }
             }
             lets.push(Let {
                 binds,
@@ -1279,6 +1527,9 @@ impl Checker {
                 for old in &quote.params {
                     let new = self.fresh_local();
                     inner.insert(*old, new);
+                    if let Some(arity) = self.fn_arity.get(old).copied() {
+                        self.fn_arity.insert(new, arity);
+                    }
                     params.push(new);
                 }
                 Value::Quote(QuoteForm {
@@ -1487,12 +1738,106 @@ impl Checker {
         }
     }
 
-    fn fun_arity(&self, ty: TyId) -> Option<(usize, usize)> {
+    /// The function's own prefix. A tail linked on later is not part of the arity:
+    /// [`prefix_len`] stops at that link instead of following it.
+    /// Two distinct naked tails are not an arity: the prefix has not been written.
+    /// One shared tail, or an empty tail, is arity `(0, 0)`.
+    pub(crate) fn fun_arity(&self, ty: TyId) -> Option<(usize, usize)> {
         let ty = self.expose(ty);
-        match &self.tys[ty.0 as usize] {
-            TyNode::Fun(input, output, _) => Some((self.cons_len(*input), self.cons_len(*output))),
-            _ => None,
+        let TyNode::Fun(input, output, _) = &self.tys[ty.0 as usize] else {
+            return None;
+        };
+        let input_n = self.prefix_len(*input);
+        let output_n = self.prefix_len(*output);
+        if input_n == 0 && output_n == 0 && self.open_tail(*input) && self.open_tail(*output) {
+            let inn = self.find_stack(*input);
+            let out = self.find_stack(*output);
+            if inn != out {
+                return None;
+            }
         }
+        Some((input_n, output_n))
+    }
+
+    fn open_tail(&self, stack: StackId) -> bool {
+        matches!(
+            self.stacks[self.find_stack(stack).0 as usize],
+            StackNode::Var | StackNode::Template
+        )
+    }
+
+    /// `call` of a local whose function type is fixed by an enclosing quotation.
+    /// The fresh lowering has not ascribed that type yet. The check pass stored
+    /// the arity. Shape the stack from it instead of from `(..s -- ..t)`.
+    fn lower_unsolved_call(
+        &mut self,
+        span: Span,
+        stack: StackId,
+        frame: &mut Frame,
+    ) -> Result<Option<StackId>, Diagnostic> {
+        let Some(Operand::Local(id)) = frame.stack.last().cloned() else {
+            return Ok(None);
+        };
+        let Some(&(arity_in, arity_out)) = self.fn_arity.get(&id) else {
+            return Ok(None);
+        };
+        // A function type that already has a prefix must go through `call`'s
+        // scheme. Replacing it with fresh results would drop a nested
+        // function, and the next `call` would have no arity.
+        // Element types may still be variables. The prefix is what matters.
+        if self.known_fun_on(stack) {
+            return Ok(None);
+        }
+        let output = self.stack_for_arity(stack, arity_in, arity_out, span)?;
+        let produced = self.lower_call(frame)?;
+        if produced != arity_out {
+            panic!("call produces {arity_out}, lowered {produced}");
+        }
+        self.note_produced(output, produced, frame);
+        Ok(Some(output))
+    }
+
+    fn known_fun_on(&self, stack: StackId) -> bool {
+        let id = self.find_stack(stack);
+        let StackNode::Cons(_, ty) = self.stacks[id.0 as usize].clone() else {
+            return false;
+        };
+        self.fun_arity(ty).is_some()
+    }
+
+    /// The operand is a local and the scheme gave it a function type.
+    fn note_call_arity(&mut self, frame: &Frame, input: StackId) {
+        let Some(Operand::Local(id)) = frame.stack.last().cloned() else {
+            return;
+        };
+        if self.fn_arity.contains_key(&id) {
+            return;
+        }
+        let id_stack = self.find_stack(input);
+        let StackNode::Cons(_, ty) = self.stacks[id_stack.0 as usize].clone() else {
+            return;
+        };
+        self.note_fn(id, ty);
+    }
+
+    fn stack_for_arity(
+        &mut self,
+        stack: StackId,
+        arity_in: usize,
+        arity_out: usize,
+        span: Span,
+    ) -> Result<StackId, Diagnostic> {
+        let (under, _) = self.pop_slot(stack, span)?;
+        let mut current = under;
+        for _ in 0..arity_in {
+            let (rest, _) = self.pop_slot(current, span)?;
+            current = rest;
+        }
+        for _ in 0..arity_out {
+            let ty = self.ty_var();
+            current = self.stack_cons(current, ty);
+        }
+        Ok(current)
     }
 }
 
@@ -1510,21 +1855,33 @@ fn restore(frame: &mut Frame, below: Vec<LocalId>, outputs: Vec<LocalId>) {
     frame.stack.extend(outputs.into_iter().map(Operand::Local));
 }
 
-fn drain_results(checker: &mut Checker, frame: &mut Frame) -> Vec<LocalId> {
+fn drain_results(
+    checker: &mut Checker,
+    frame: &mut Frame,
+) -> Result<Vec<LocalId>, Diagnostic> {
     let operands: Vec<_> = frame.stack.drain(..).collect();
     force_all(checker, frame, operands)
 }
 
-fn force_all(checker: &mut Checker, frame: &mut Frame, operands: Vec<Operand>) -> Vec<LocalId> {
-    operands
-        .into_iter()
-        .map(|operand| frame.force(checker, operand))
-        .collect()
+fn force_all(
+    checker: &mut Checker,
+    frame: &mut Frame,
+    operands: Vec<Operand>,
+) -> Result<Vec<LocalId>, Diagnostic> {
+    let mut ids = Vec::with_capacity(operands.len());
+    for operand in operands {
+        ids.push(frame.force(checker, operand)?);
+    }
+    Ok(ids)
 }
 
 /// The whole operand stack, after padding a flexible tail so a quotation can
 /// take `min` arguments from the top.
-fn take_base(checker: &mut Checker, frame: &mut Frame, min: usize) -> Vec<LocalId> {
+fn take_base(
+    checker: &mut Checker,
+    frame: &mut Frame,
+    min: usize,
+) -> Result<Vec<LocalId>, Diagnostic> {
     if frame.stack.len() < min {
         let deficit = min - frame.stack.len();
         if !frame.flexible {
@@ -1789,12 +2146,40 @@ console.log("ok");
 
 : hold ( Int (Int -- Int) -- Int Int )
   keep
+
+: added ( Num -- Num )
+  [ 1 nadd ] cons call
+
+: pushed ( Num -- Num Num )
+  [ 1 ] cons call
+
+: summed ( Num Num -- Num )
+  [ nadd ] cons call
+
+: wrapped ( Num -- Num )
+  [ ] cons call
+
+: closed ( Num (Num -- Num) -- ( -- Num ) )
+  cons
+
+: closed2 ( Num (Num Num -- Num) -- ( Num -- Num ) )
+  cons
+
+: applied ( Num (Num -- Num) -- Num )
+  [ call ] cons call
+
+: applied2 ( Num Num (Num Num -- Num) -- Num )
+  [ call ] cons call
+
+: choose ( Num Num Bool -- Num )
+  [ drop ] [ nip ] [ if ] cons cons call
 "#;
         let code = js(source);
         assert!(
             !code.contains("rot("),
             "shuffle became a call:\n{code}"
         );
+        assert!(!code.contains("cons("), "cons became a call:\n{code}");
         assert_eq!(
             js(": rotated ( Int Int Int -- Int Int Int )\n  rot"),
             "export function rotated(v0, v1, v2) {\n  return [v1, v2, v0];\n}\n"
@@ -1830,6 +2215,19 @@ const [p, q] = applyBi(5, (n) => n * 2, (n) => n + 3);
 if (p !== 10 || q !== 8) throw new Error("dynamic bi " + [p, q]);
 const [held, saved] = hold(5n, (n) => n + 1n);
 if (held !== 6n || saved !== 5n) throw new Error("dynamic keep " + [held, saved]);
+if (added(5) !== 6) throw new Error("cons add " + added(5));
+const [p0, p1] = pushed(5);
+if (p0 !== 5 || p1 !== 1) throw new Error("cons push " + [p0, p1]);
+if (summed(3, 5) !== 8) throw new Error("cons sum " + summed(3, 5));
+if (wrapped(5) !== 5) throw new Error("cons wrap " + wrapped(5));
+const f = closed(5, (n) => n + 1);
+if (f() !== 6) throw new Error("cons fun " + f());
+const g = closed2(5, (a, b) => a * 10 + b);
+if (g(3) !== 35) throw new Error("cons fun2 " + g(3));
+if (applied(5, (n) => n + 1) !== 6) throw new Error("applied " + applied(5, (n) => n + 1));
+if (applied2(3, 5, (a, b) => a * 10 + b) !== 35) throw new Error("applied2");
+if (choose(1, 2, true) !== 1) throw new Error("choose true " + choose(1, 2, true));
+if (choose(1, 2, false) !== 2) throw new Error("choose false " + choose(1, 2, false));
 "#,
         );
     }
@@ -2253,6 +2651,61 @@ function ply_new(v0) {
 }
 export { ply_new as new };
 "
+        );
+    }
+
+    #[test]
+    fn call_runs_each_step_of_a_curried_quotation() {
+        run(
+            r#"
+: foreign nadd ( Num Num -- Num )
+
+: curry ( a b c d. (a b c -- d) -- (a -- (b -- (c -- d))) )
+  f ->
+    [ a -> [ b -> [ c -> a b c f call ] ] ]
+
+: use ( -- Num )
+  3 2 1 [ nadd nadd ] curry call call call
+"#,
+            r#"
+function nadd(a, b) { return a + b; }
+if (use() !== 6) throw new Error("curry " + use());
+"#,
+        );
+    }
+
+    #[test]
+    fn call_runs_a_function_bound_in_the_quotation() {
+        run(
+            r#"
+: foreign nadd ( Num Num -- Num )
+: foreign reduce ( a b. (Array a) b (b a -- b) -- b )
+: foreign push ( (Array a) a -- (Array a) )
+
+: run ( Num (Num -- Num) -- Num )
+  [ x f -> x f call ] call
+
+: applyArray ( a b. (Array a) (Array (a -- b)) -- (Array b) )
+  xs fs ->
+    fs <> [ acc f -> xs acc [ ys x -> ys x f call push ] reduce ] reduce
+
+: use ( -- Num )
+  2 [ 3 nadd ] run
+
+: both ( -- (Array Num) )
+  < 1 2 > < [ 10 nadd ] [ 20 nadd ] > applyArray
+"#,
+            r#"
+function nadd(a, b) { return a + b; }
+function reduce(arr, acc, fn) {
+  for (const x of arr) acc = fn(acc, x);
+  return acc;
+}
+function push(arr, x) { return arr.concat([x]); }
+if (use() !== 5) throw new Error("run " + use());
+const got = both().join(",");
+if (got !== "11,12,21,22") throw new Error("apply " + got);
+"#,
         );
     }
 

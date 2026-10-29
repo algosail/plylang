@@ -5,6 +5,14 @@
 //! quotation stays flexible: `call` has to unify it with the stack under the
 //! quotation. Word schemes instantiate to fresh variables.
 //!
+//! A quotation that is passed to another word keeps a fresh function type until
+//! that word ascribes it. The body is checked then, on a private copy of the
+//! ascribed stack, before the word's own result is matched with the signature.
+//! A binder inside can be `call`ed. `call` ascribes the quotation from the
+//! stack under it before checking the body. `dip`, `keep`, and `if` check the
+//! body before their own stack effect. A quotation ascribed only by the
+//! signature waits until the word's output is unified.
+//!
 //! Effect labels are not part of the language. A quotation still carries an
 //! empty effect row so function types stay uniform. Nothing joins that row,
 //! and a program cannot name a label.
@@ -245,6 +253,19 @@ struct DeferredUse {
     constraints: Vec<SemConstraint>,
 }
 
+/// A quotation whose body is checked once its input is known, or when `call`,
+/// `dip`, `keep`, or `if` runs it. The body sees a private copy of the stack.
+struct PendingQuote {
+    span: Span,
+    fun: TyId,
+    terms: Vec<Term>,
+    input: StackId,
+    output: StackId,
+    effect: EffectId,
+    locals: Vec<HashMap<String, SemScheme>>,
+    checked: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct KindId(u32);
 
@@ -427,6 +448,16 @@ struct Checker {
     assumptions: Vec<SemConstraint>,
     /// Uses whose head is fixed by the result, such as `empty` and `pure`.
     deferred: Vec<DeferredUse>,
+    /// `call` sites whose quotation inputs were still open. Rechecked after the
+    /// body has been unified with the signature.
+    pending_arity: Vec<(StackId, Span)>,
+    /// Quotation bodies waiting until their input type is known.
+    pending_quotes: Vec<PendingQuote>,
+    /// Binder types collected while checking a body. Harvested into [`bind_arity`].
+    bind_tys: Vec<(Span, String, TyId)>,
+    /// Arity of a quotation bound in a body, keyed by the binder span and name.
+    /// Lowering reads this so `call` does not need a wrapper word.
+    bind_arity: HashMap<(Span, String), (usize, usize)>,
     /// Solved form of [`deferred`], keyed by the use span. The second lower pass reads it.
     use_dicts: HashMap<Span, Vec<Dict>>,
     /// Parallel to [`assumptions`] while lowering. Empty during checking.
@@ -478,6 +509,10 @@ impl Checker {
             instances: Vec::new(),
             assumptions: Vec::new(),
             deferred: Vec::new(),
+            pending_arity: Vec::new(),
+            pending_quotes: Vec::new(),
+            bind_tys: Vec::new(),
+            bind_arity: HashMap::new(),
             use_dicts: HashMap::new(),
             assumption_locals: Vec::new(),
             solving: Vec::new(),
@@ -1008,6 +1043,9 @@ impl Checker {
         let saved = self.ambient.replace(effect);
         self.assumptions = constraints;
         self.deferred.clear();
+        self.pending_arity.clear();
+        self.pending_quotes.clear();
+        self.bind_tys.clear();
         self.locals.push(HashMap::new());
         let checked = if def.clauses.is_empty() {
             self.check_terms(&def.body, input)
@@ -1019,6 +1057,9 @@ impl Checker {
             Ok(stack) => stack,
             Err(error) => {
                 self.deferred.clear();
+                self.pending_arity.clear();
+                self.pending_quotes.clear();
+                self.bind_tys.clear();
                 self.ambient = saved;
                 self.assumptions.clear();
                 return Err(error);
@@ -1026,14 +1067,30 @@ impl Checker {
         };
         if let Err(message) = self.unify_stack(stack, output) {
             self.deferred.clear();
+            self.pending_arity.clear();
+            self.pending_quotes.clear();
+            self.bind_tys.clear();
             self.ambient = saved;
             self.assumptions.clear();
             return Err(self.error(def.name_span, message));
+        }
+        // The signature and the words in the body have ascribed quotation types.
+        // Check those bodies before solving instances they mention.
+        if let Err(error) = self.finish_quotes() {
+            self.deferred.clear();
+            self.pending_arity.clear();
+            self.pending_quotes.clear();
+            self.bind_tys.clear();
+            self.ambient = saved;
+            self.assumptions.clear();
+            return Err(error);
         }
         let finished = self.finish_deferred();
         self.ambient = saved;
         self.assumptions.clear();
         finished?;
+        self.finish_arity()?;
+        self.harvest_bind_arity();
         self.escaped_effect(def.name_span)
     }
 
@@ -1053,7 +1110,7 @@ impl Checker {
                 Ok(self.stack_cons(stack, ty))
             }
             TermNode::Quote(terms) => {
-                let fun = self.check_quote(terms)?;
+                let fun = self.check_quote(term.span, terms)?;
                 Ok(self.stack_cons(stack, fun))
             }
             TermNode::Field(name) => self.project_field(term.span, name, stack),
@@ -1082,16 +1139,161 @@ impl Checker {
         result
     }
 
-    fn check_quote(&mut self, terms: &[Term]) -> Result<TyId, Diagnostic> {
-        let local = self.effect_var();
-        let saved = self.ambient.replace(local);
+    /// The body waits. A caller ascribes `input` and `output`, or `call` does,
+    /// and [`finish_quotes`] checks the terms on a private copy of that stack.
+    fn check_quote(&mut self, span: Span, terms: &[Term]) -> Result<TyId, Diagnostic> {
         let input = self.stack_var();
+        let output = self.stack_var();
+        let effect = self.effect_var();
+        let fun = self.ty_fun(input, output, effect);
+        self.pending_quotes.push(PendingQuote {
+            span,
+            fun,
+            terms: terms.to_vec(),
+            input,
+            output,
+            effect,
+            locals: self.locals.clone(),
+            checked: false,
+        });
+        Ok(fun)
+    }
+
+    fn finish_quotes(&mut self) -> Result<(), Diagnostic> {
+        let mut index = 0;
+        while index < self.pending_quotes.len() {
+            if !self.pending_quotes[index].checked {
+                self.check_pending(index)?;
+            }
+            index += 1;
+        }
+        Ok(())
+    }
+
+    /// Run the quotation on its own spine so two quotations that share an
+    /// ascribed input do not extend one stack.
+    fn check_pending(&mut self, index: usize) -> Result<(), Diagnostic> {
+        if self.pending_quotes[index].checked {
+            return Ok(());
+        }
+        self.pending_quotes[index].checked = true;
+        let terms = self.pending_quotes[index].terms.clone();
+        let input = self.pending_quotes[index].input;
+        let output = self.pending_quotes[index].output;
+        let effect = self.pending_quotes[index].effect;
+        let locals = self.pending_quotes[index].locals.clone();
+        let span = self.pending_quotes[index].span;
+        let private_in = self.copy_spine(input);
+        let saved_locals = std::mem::replace(&mut self.locals, locals);
+        let saved_ambient = self.ambient.replace(effect);
         self.locals.push(HashMap::new());
-        let checked = self.check_terms(terms, input);
+        let checked = self.check_terms(&terms, private_in);
         self.locals.pop();
-        self.ambient = saved;
-        let output = checked?;
-        Ok(self.ty_fun(input, output, local))
+        self.ambient = saved_ambient;
+        self.locals = saved_locals;
+        let got = checked?;
+        self.unify_stack(private_in, input)
+            .map_err(|message| self.error(span, message))?;
+        self.unify_stack(got, output)
+            .map_err(|message| self.error(span, message))?;
+        Ok(())
+    }
+
+    /// Cons cells above a private tail. A rigid or empty tail is shared, so
+    /// reading below the signature is still stack underflow. A variable tail
+    /// is fresh: the body must not link a tail another quotation still uses.
+    fn copy_spine(&mut self, stack: StackId) -> StackId {
+        let mut items = Vec::new();
+        let mut current = self.find_stack(stack);
+        let tail = loop {
+            match self.stacks[current.0 as usize].clone() {
+                StackNode::Cons(rest, ty) => {
+                    items.push(ty);
+                    current = self.find_stack(rest);
+                }
+                StackNode::Var | StackNode::Template => break self.stack_var(),
+                _ => break current,
+            }
+        };
+        items.reverse();
+        let mut acc = tail;
+        for ty in items {
+            acc = self.stack_cons(acc, ty);
+        }
+        acc
+    }
+
+    fn top_slot(&self, stack: StackId) -> Option<(StackId, TyId)> {
+        let id = self.find_stack(stack);
+        match self.stacks[id.0 as usize] {
+            StackNode::Cons(rest, ty) => Some((rest, ty)),
+            _ => None,
+        }
+    }
+
+    /// Drop `n` cons cells. `None` when the spine is still open.
+    fn drop_cons(&self, mut stack: StackId, n: usize) -> Option<StackId> {
+        for _ in 0..n {
+            let id = self.find_stack(stack);
+            match self.stacks[id.0 as usize] {
+                StackNode::Cons(rest, _) => stack = rest,
+                _ => return None,
+            }
+        }
+        Some(stack)
+    }
+
+    /// Check a quotation that a combinator is about to run.
+    /// `input` ascribes the stack under it first. `None` leaves the body to
+    /// decide the input, which is what `if` needs for both branches.
+    fn run_quote(&mut self, func: TyId, input: Option<StackId>) -> Result<(), Diagnostic> {
+        let func = self.expose(func);
+        let Some(index) = self
+            .pending_quotes
+            .iter()
+            .position(|quote| quote.fun == func && !quote.checked)
+        else {
+            return Ok(());
+        };
+        if let Some(input) = input {
+            let span = self.pending_quotes[index].span;
+            let quote_input = self.pending_quotes[index].input;
+            self.unify_stack(quote_input, input)
+                .map_err(|message| self.error(span, message))?;
+        }
+        self.check_pending(index)
+    }
+
+    /// `call` and `keep` run the quotation on the stack under it. `dip` hides
+    /// the values between that stack and the quotation. `if` checks both
+    /// branches on their own inputs before the scheme unifies them.
+    fn force_running(&mut self, name: &str, stack: StackId) -> Result<(), Diagnostic> {
+        let Some(word) = builtin::word(name) else {
+            return Ok(());
+        };
+        match word.lowering {
+            builtin::Lowering::Call | builtin::Lowering::Keep { .. } => {
+                if let Some((under, func)) = self.top_slot(stack) {
+                    self.run_quote(func, Some(under))?;
+                }
+            }
+            builtin::Lowering::Dip { under } => {
+                if let Some((below, func)) = self.top_slot(stack) {
+                    let input = self.drop_cons(below, under as usize);
+                    self.run_quote(func, input)?;
+                }
+            }
+            builtin::Lowering::If => {
+                if let Some((below_else, else_q)) = self.top_slot(stack) {
+                    if let Some((_, then_q)) = self.top_slot(below_else) {
+                        self.run_quote(then_q, None)?;
+                        self.run_quote(else_q, None)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Pop one stack slot. An open tail becomes one fresh value over a fresh tail.
@@ -1125,15 +1327,16 @@ impl Checker {
             }
         }
         let mut current = stack;
-        let mut schemes = Vec::with_capacity(names.len());
-        for _ in names.iter().rev() {
+        let mut bound = Vec::with_capacity(names.len());
+        for name in names.iter().rev() {
             let (rest, ty) = self.pop_slot(current, span)?;
-            schemes.push(self.binding_scheme(ty));
+            bound.push((name.clone(), ty, self.binding_scheme(ty)));
             current = rest;
         }
-        schemes.reverse();
-        for (name, scheme) in names.iter().zip(schemes) {
-            self.locals[frame].insert(name.clone(), scheme);
+        bound.reverse();
+        for (name, ty, scheme) in bound {
+            self.bind_tys.push((span, name.clone(), ty));
+            self.locals[frame].insert(name, scheme);
         }
         Ok(current)
     }
@@ -1144,6 +1347,7 @@ impl Checker {
         name: &str,
         stack: StackId,
     ) -> Result<StackId, Diagnostic> {
+        self.force_running(name, stack)?;
         let Some(scheme) = self.lookup(name) else {
             return Err(self.error(span, Error::UndefinedWord(name.to_string())));
         };
@@ -1152,34 +1356,136 @@ impl Checker {
             .map_err(|message| self.error(span, message))?;
         self.join_effect(effect, span)?;
         self.solve_or_defer(&constraints, span)?;
-        if name == "call" {
-            self.known_arity(input, span)?;
+        if name == "call" && !self.arity_ready(input) {
+            self.pending_arity.push((input, span));
         }
+        // `[ dup ] [ drop ] bi` ascribes one result to each quotation. The
+        // bodies disagree with that shape. Report it before the two results
+        // are matched with the signature, or the mismatch hides the occurs check.
+        self.settle_ascribed(stack)?;
         self.pending_here = Some((input, output, effect));
         Ok(output)
     }
 
+    /// Quotations this word just ascribed. An input that is still a naked
+    /// variable was not ascribed: the signature may do that later.
+    fn settle_ascribed(&mut self, stack: StackId) -> Result<(), Diagnostic> {
+        for fun in self.ascribed_on(stack) {
+            let Some(index) = self
+                .pending_quotes
+                .iter()
+                .position(|quote| quote.fun == fun && !quote.checked)
+            else {
+                continue;
+            };
+            self.check_pending(index)?;
+        }
+        Ok(())
+    }
+
+    fn ascribed_on(&self, stack: StackId) -> Vec<TyId> {
+        let mut found = Vec::new();
+        let mut current = stack;
+        for _ in 0..64 {
+            let id = self.find_stack(current);
+            match self.stacks[id.0 as usize].clone() {
+                StackNode::Cons(rest, ty) => {
+                    let fun = self.expose(ty);
+                    if self.ascribed_quote(fun) {
+                        found.push(fun);
+                    }
+                    current = rest;
+                }
+                _ => break,
+            }
+        }
+        found
+    }
+
+    fn ascribed_quote(&self, fun: TyId) -> bool {
+        let Some(quote) = self
+            .pending_quotes
+            .iter()
+            .find(|quote| quote.fun == fun && !quote.checked)
+        else {
+            return false;
+        };
+        self.stack_shaped(quote.input) || self.stack_shaped(quote.output)
+    }
+
+    fn stack_shaped(&self, stack: StackId) -> bool {
+        let id = self.find_stack(stack);
+        !matches!(
+            self.stacks[id.0 as usize],
+            StackNode::Var | StackNode::Template
+        )
+    }
+
     /// `call` needs a finite prefix whose elements are solved types.
-    /// A naked tail has length 0.
-    fn known_arity(&self, call_input: StackId, span: Span) -> Result<(), Diagnostic> {
+    /// A function of two naked, distinct tails is not that prefix.
+    /// An element that is still a variable waits until [`finish_arity`].
+    fn arity_ready(&self, call_input: StackId) -> bool {
         let id = self.find_stack(call_input);
         let StackNode::Cons(_, ty) = self.stacks[id.0 as usize].clone() else {
-            return Ok(());
+            return false;
         };
+        self.quotation_ready(ty)
+    }
+
+    /// The function's own conses, not a tail that was later linked to the caller's stack.
+    fn quotation_ready(&self, ty: TyId) -> bool {
+        let Some(items) = self.fun_input_items(ty) else {
+            return false;
+        };
+        items.iter().all(|item| self.solved(*item))
+    }
+
+    fn fun_input_items(&self, ty: TyId) -> Option<Vec<TyId>> {
+        if self.fun_arity(ty).is_none() {
+            return None;
+        }
         let ty = self.expose(ty);
         let TyNode::Fun(input, _, _) = self.tys[ty.0 as usize].clone() else {
-            return Ok(());
+            return None;
         };
-        let mut current = self.find_stack(input);
+        Some(self.spine_prefix(input))
+    }
+
+    /// Cons cells from the first node of the spine. A link in the tail stops the walk.
+    fn spine_prefix(&self, stack: StackId) -> Vec<TyId> {
+        let mut items = Vec::new();
+        let mut current = self.find_stack(stack);
         loop {
-            match self.stacks[current.0 as usize].clone() {
-                StackNode::Cons(rest, item) => {
-                    if !self.solved(item) {
-                        return Err(self.error(span, Error::QuotationArityUnknown));
-                    }
-                    current = self.find_stack(rest);
+            match &self.stacks[current.0 as usize] {
+                StackNode::Cons(rest, ty) => {
+                    items.push(*ty);
+                    current = *rest;
                 }
-                _ => return Ok(()),
+                _ => {
+                    items.reverse();
+                    return items;
+                }
+            }
+        }
+    }
+
+    fn finish_arity(&mut self) -> Result<(), Diagnostic> {
+        let pending = std::mem::take(&mut self.pending_arity);
+        for (input, span) in pending {
+            if !self.arity_ready(input) {
+                return Err(self.error(span, Error::QuotationArityUnknown));
+            }
+        }
+        Ok(())
+    }
+
+    /// Remember quotation arities that the signature fixed, so lowering can
+    /// `call` them without a wrapper word.
+    fn harvest_bind_arity(&mut self) {
+        let bound = std::mem::take(&mut self.bind_tys);
+        for (span, name, ty) in bound {
+            if let Some(arity) = self.fun_arity(ty) {
+                self.bind_arity.insert((span, name), arity);
             }
         }
     }
@@ -1352,7 +1658,7 @@ impl Checker {
     fn check_element(&mut self, term: &Term) -> Result<TyId, Diagnostic> {
         match &term.node {
             TermNode::Lit(lit) => Ok(self.lit_ty(lit)),
-            TermNode::Quote(terms) => self.check_quote(terms),
+            TermNode::Quote(terms) => self.check_quote(term.span, terms),
             TermNode::Array(elements) => self.check_array(term.span, elements),
             TermNode::Record(fields) => self.check_record(term.span, fields),
             _ => Err(self.error(term.span, Error::ExpectedElement)),
@@ -5106,6 +5412,11 @@ mod tests {
         ok(": r ( a. a (a -- b) (a -- c) (a -- d) -- b c d )\n  tri");
         ok(": r ( a b. a b (a -- c) (b -- d) -- c d )\n  bis");
         ok(": r ( a. a a (a -- b) -- b b )\n  bia");
+        ok(": r ( a. a (a -- b) -- ( -- b) )\n  cons");
+        ok(": r ( a b. b (a b -- c) -- (a -- c) )\n  cons");
+        ok(": r ( a. a -- ( -- a) )\n  [ ] cons");
+        ok(": r ( a. a -- ( -- a Num) )\n  [ 1 ] cons");
+        err(": bad ( a. (a -- b) -- ( -- b) )\n  cons", "stack underflow");
         ok(
             ": foreign nmul ( Num Num -- Num )\n: foreign nadd ( Num Num -- Num )\n\n: both ( Num -- Num Num )\n  [ 2 nmul ] [ 3 nadd ] bi",
         );
@@ -5132,6 +5443,7 @@ mod tests {
             ": bad ( ..s -- ..s )\n  [ [ dup ] call ] drop",
             "quotation arity is not known",
         );
+        ok(": run ( a b. a (a -- b) -- b )\n  [ x f -> x f call ] call");
         err(
             ": bad ( { name : Str, name : Int } -- Str )\n  drop",
             "duplicate field name",

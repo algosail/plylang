@@ -224,6 +224,14 @@ Pops the quotation and runs it on the rest of the stack. Each named input of tha
 
 Wraps the top value in a quotation that pushes it again. `5 quote` has type `(-- Num)`.
 
+### cons
+
+```ply
+..r a (..s a -- ..t) -- ..r (..s -- ..t)
+```
+
+Pushes the value, then runs the quotation. The value sits under the quotation. `5 [ 1 add ] cons` is a quotation that pushes five and then adds one.
+
 ### if
 
 ```ply

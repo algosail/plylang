@@ -22,6 +22,8 @@ pub enum Lowering {
     Each { n: u8 },
     If,
     Quote,
+    /// Push the value under the quotation, then run the quotation.
+    Cons,
     Unit,
 }
 
@@ -224,6 +226,12 @@ pub const WORDS: &[Word] = &[
         "..s a -- ..s (-- a)",
         "Wraps the top value in a quotation that pushes it again. `5 quote` has type `(-- Num)`.",
         Lowering::Quote,
+    ),
+    w(
+        "cons",
+        "..r a (..s a -- ..t) -- ..r (..s -- ..t)",
+        "Pushes the value, then runs the quotation. The value sits under the quotation. `5 [ 1 add ] cons` is a quotation that pushes five and then adds one.",
+        Lowering::Cons,
     ),
     w(
         "if",
