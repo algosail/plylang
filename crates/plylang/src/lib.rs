@@ -13,6 +13,7 @@ mod lexer;
 mod parser;
 mod paths;
 mod span;
+mod test_run;
 mod token;
 
 pub const LANGUAGE_VERSION: u32 = 1;
@@ -31,3 +32,4 @@ pub use hover::{hover, Hover};
 pub use parser::parse;
 pub use paths::{mode_from_path, module_name_from_path, ParseMode};
 pub use span::{byte_offset, utf16_position};
+pub use test_run::test_package;

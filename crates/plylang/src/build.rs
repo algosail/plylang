@@ -16,7 +16,7 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 
 use crate::anf::{js_ident, referenced_words, AnfModule};
-use crate::ast::{scheme_string, Def, Import, Item, Module, Type};
+use crate::ast::{scheme_string, Def, Import, Item, Module, StackTail, Type};
 use crate::check::{
     check, check_with_imports, collect_sites, collect_sites_with_imports, KnownModule,
     ResolvedImport, StackAt,
@@ -39,6 +39,15 @@ pub struct BuildError {
 impl BuildError {
     pub fn render(&self) -> String {
         self.rendered.clone()
+    }
+
+    pub(crate) fn plain(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            message: message.clone(),
+            code: "",
+            rendered: message,
+        }
     }
 }
 
@@ -180,6 +189,88 @@ fn package_javascript(path: &Path) -> Result<Option<String>, BuildError> {
         return Ok(None);
     };
     session.emit_one(id).map(Some)
+}
+
+pub(crate) struct CompiledTest {
+    pub js: String,
+    /// Where the JavaScript must be written so its import paths resolve.
+    pub js_path: PathBuf,
+    /// A source module already written by [`build`]. The runner must not delete it.
+    pub keep: bool,
+    /// Public words `( -- Verdict )`, in source order. The runner calls these.
+    pub words: Vec<TestWord>,
+}
+
+/// One discovered test. `line` is the 1-based line of the word.
+#[derive(Clone)]
+pub(crate) struct TestWord {
+    pub name: String,
+    pub line: u32,
+}
+
+/// The package that contains `start`, and the directory `ply.out` points at.
+pub(crate) fn package_dirs(start: &Path) -> Result<(PathBuf, PathBuf), BuildError> {
+    let found = find_ply_root(start).ok_or_else(|| {
+        BuildError::plain(format!("no ply package at {}", start.display()))
+    })?;
+    let root = fs::canonicalize(&found).map_err(|error| os_error(&found, error))?;
+    let package = read_package(&root)?;
+    Ok((root, package.out))
+}
+
+/// Compile one file in a package. Imports resolve the same way as [`build`].
+/// A file outside `ply.source` is still compiled against that package.
+pub(crate) fn compile_test_file(root: &Path, file: &Path) -> Result<CompiledTest, BuildError> {
+    let mut session = open_session(root)?;
+    let (id, keep) = session.add_test_file(file)?;
+    let js_path = session.test_js_path(id);
+    let words = {
+        let unit = &session.units[id];
+        test_words(&unit.module, &unit.source)
+    };
+    let js = session.emit_one(id)?;
+    Ok(CompiledTest {
+        js,
+        js_path,
+        keep,
+        words,
+    })
+}
+
+/// A test is a public word that takes nothing and returns `Verdict`.
+fn test_words(module: &Module, source: &str) -> Vec<TestWord> {
+    module
+        .items
+        .iter()
+        .filter_map(|item| {
+            let Item::Def(def) = item else {
+                return None;
+            };
+            if def.vis.is_private() || def.vis.is_foreign() || !bare_verdict(def) {
+                return None;
+            }
+            let (line, _) = line_col(source, def.name_span.start);
+            Some(TestWord {
+                name: def.name.clone(),
+                line,
+            })
+        })
+        .collect()
+}
+
+fn bare_verdict(def: &Def) -> bool {
+    let scheme = &def.scheme;
+    if !scheme.vars.is_empty() || !scheme.constraints.is_empty() || scheme.effect.effects.is_some()
+    {
+        return false;
+    }
+    let input = &scheme.effect.input;
+    let output = &scheme.effect.output;
+    let open = |tail: &StackTail| matches!(tail, StackTail::Implicit | StackTail::Empty);
+    open(&input.tail)
+        && open(&output.tail)
+        && input.items.is_empty()
+        && matches!(output.items.as_slice(), [Type::Ctor(name)] if name == "Verdict")
 }
 
 fn snippet_javascript(path: &Path) -> Result<String, BuildError> {
@@ -443,6 +534,63 @@ impl Session {
             .find(|output| output.js_path == js_path)
             .map(|output| output.js.clone())
             .expect("checked local module has javascript"))
+    }
+
+    fn test_js_path(&self, id: usize) -> PathBuf {
+        let module_path = self.units[id].module_path.clone().expect("test module");
+        self.package.out.join(module_path).with_extension("js")
+    }
+
+    /// A source file is compiled in place. A test file outside `ply.source`
+    /// becomes a module whose path is its path relative to the package root.
+    fn add_test_file(&mut self, file: &Path) -> Result<(usize, bool), BuildError> {
+        let canonical = fs::canonicalize(file).map_err(|error| os_error(file, error))?;
+        if let Some(id) = self.by_path.get(&canonical).copied() {
+            return Ok((id, true));
+        }
+        let relative = canonical.strip_prefix(&self.package.root).map_err(|_| {
+            BuildError::plain(format!(
+                "test file is outside the package: {}",
+                canonical.display()
+            ))
+        })?;
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        let Some(module_path) = relative.strip_suffix(".ply") else {
+            return Err(BuildError::plain(format!(
+                "test file is not a .ply file: {}",
+                canonical.display()
+            )));
+        };
+        if module_path.is_empty() || module_path.ends_with(".d") {
+            return Err(BuildError::plain(format!(
+                "test file is not a source file: {}",
+                canonical.display()
+            )));
+        }
+        if let Some(id) = self.by_module.get(module_path).copied() {
+            if self.units[id].path != canonical {
+                return Err(BuildError::plain(format!(
+                    "test file clashes with module {module_path}"
+                )));
+            }
+        }
+        let source = fs::read_to_string(&canonical).map_err(|error| os_error(&canonical, error))?;
+        let module = parse(&source, ParseMode::Source)
+            .map_err(|error| located(&canonical, &source, error))?;
+        let id = self.units.len();
+        self.by_path.insert(canonical.clone(), id);
+        self.units.push(Unit {
+            path: canonical.clone(),
+            display: canonical.display().to_string(),
+            source,
+            module,
+            package_root: self.package.root.clone(),
+            module_path: Some(module_path.to_string()),
+            kind: Kind::Local,
+            color: Color::White,
+            deps: Vec::new(),
+        });
+        Ok((id, false))
     }
 
     fn collect_sources(&mut self) -> Result<(), BuildError> {

@@ -3,16 +3,20 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
+use std::io::IsTerminal;
+
 use plylang::{
-    build, build_exports, check_package, javascript_file, mode_from_path, parse, write_docs,
+    build, build_exports, check_package, javascript_file, mode_from_path, parse, test_package,
+    write_docs,
 };
 
 const USAGE: &[&str] = &[
     "usage: plylang check [dir]",
-    "       plylang build [dir] [--exports]",
-    "       plylang docs [dir] [--out <file>]",
-    "       plylang check --parse <file>",
     "       plylang check --js <file>",
+    "       plylang check --parse <file>",
+    "       plylang build [dir] [--exports]",
+    "       plylang test [pattern]",
+    "       plylang docs [dir] [--out <file>]",
 ];
 
 fn main() -> ExitCode {
@@ -33,6 +37,7 @@ fn main() -> ExitCode {
         "build" => build_command(args),
         "check" => check_command(args),
         "docs" => docs_command(args),
+        "test" => test_command(args),
         _ => {
             usage(true);
             ExitCode::from(2)
@@ -71,6 +76,37 @@ fn docs_command(mut args: impl Iterator<Item = String>) -> ExitCode {
         Path::new(&dir),
         out.as_deref().map(Path::new),
     ))
+}
+
+fn test_command(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut pattern = None;
+    while let Some(arg) = args.next() {
+        if is_help(&arg) {
+            usage(false);
+            return ExitCode::SUCCESS;
+        }
+        if arg.starts_with('-') || pattern.is_some() {
+            usage(true);
+            return ExitCode::from(2);
+        }
+        pattern = Some(arg);
+    }
+    let pattern = pattern.unwrap_or_else(|| "test/**/*.ply".to_string());
+    match test_package(Path::new("."), &pattern) {
+        Ok(report) => {
+            let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+            print!("{}", report.render(color));
+            if report.failed() {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(error) => {
+            eprintln!("{}", error.render());
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn build_command(mut args: impl Iterator<Item = String>) -> ExitCode {

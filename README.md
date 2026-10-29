@@ -330,12 +330,15 @@ A `foreign` word has no body. Its implementation lives in the `ply.foreign` dire
 ```text
 plylang check [dir]
 plylang build [dir] [--exports]
+plylang test [pattern]
 plylang docs [dir] [--out <file>]
 plylang check --parse <file>
 plylang check --js <file>
 ```
 
 `plylang check` checks a package the same way `build` does: every file under `ply.source`, the imports, and `foreign`. It writes no files. The default directory is the current one. After the same check, `plylang build` writes a `.js` file and a `.d.ply` interface into `ply.out`. `plylang build --exports` replaces the `exports` field of `package.json` with entries for the built modules. A key is `./` followed by the module path. `ply` points at the `.d.ply`, and `import` points at the `.js`. The other fields of the file stay as they were. A module of this package is imported by its path under `ply.source`, whether or not `exports` lists it. Another package finds the module through the `exports` entry.
+
+`plylang test` builds the package, then compiles and runs the files that match one pattern. The pattern is relative to the package root. The default is `test/**/*.ply`. `*` matches inside one path segment. `**` matches across directories. Quote the pattern so the shell does not expand `*`. A test is a public word `( -- Verdict )`. The runner calls each one in source order and uses the word as its name. A `private` word is not a test. `expect` compares two values. `pass` and `differ` build a verdict when those values have no `Showable` instance. The words live in `@plylang/test`. A file with no such word may export `suite` with scheme `( -- (Array Verdict) )` instead. A file under `ply.source` stays where `build` wrote it. Any other test file is compiled in that package, written under `ply.out` for the run, and deleted afterwards. The report names each file and each check. A check also prints `file:line` of its word. A failing check prints its text under the name. One check that throws still lets the other checks run. A file that does not compile or does not run prints the diagnostic, and the other files still run. A failed check, a compile error, or a thrown suite exits 1. No file matched exits 1 with `no tests matched`. Color is used when stdout is a terminal and `NO_COLOR` is unset.
 
 A word named `main` whose scheme is `( -- Unit )` is the program of that module. It may be `private`. `build` calls it at the bottom of that module's `.js`, and only when Node started that file. `node dist/App.js` runs the program. An import of the module does not. A `package.json` script can name that file. Several modules may each have a `main`. A module without one is a library. Any other scheme on the name `main` is an error.
 
