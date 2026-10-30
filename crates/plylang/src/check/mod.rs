@@ -44,6 +44,22 @@ pub fn check(module: &Module) -> Result<(), Diagnostic> {
 pub(crate) struct KnownModule {
     pub origin: String,
     pub module: Module,
+    /// File origins of `module.imports`, in order.
+    pub deps: Vec<String>,
+    /// Package root and module path. Empty uses `origin` as the instance identity.
+    pub module_key: String,
+}
+
+#[cfg(test)]
+impl KnownModule {
+    pub(crate) fn new(origin: impl Into<String>, module: Module) -> Self {
+        Self {
+            origin: origin.into(),
+            module,
+            deps: Vec::new(),
+            module_key: String::new(),
+        }
+    }
 }
 
 pub(crate) struct ResolvedImport<'a> {
@@ -79,11 +95,21 @@ struct RawSite {
 }
 
 /// Check `module` after installing imports. Single-file `check` does not call this.
+#[cfg(test)]
 pub(crate) fn check_with_imports(
     module: &Module,
     imports: &[ResolvedImport<'_>],
 ) -> Result<CheckedModule, Diagnostic> {
+    check_with_imports_key(module, imports, "")
+}
+
+pub(crate) fn check_with_imports_key(
+    module: &Module,
+    imports: &[ResolvedImport<'_>],
+    module_key: &str,
+) -> Result<CheckedModule, Diagnostic> {
     let mut checker = Checker::new();
+    checker.module_key = module_key.to_string();
     for imported in imports {
         checker.import_resolved(imported.provider, imported.import, imported.known)?;
     }
@@ -110,11 +136,13 @@ pub(crate) fn collect_sites(module: &Module) -> Vec<StackAt> {
     checker.render_sites()
 }
 
-pub(crate) fn collect_sites_with_imports(
+pub(crate) fn collect_sites_with_imports_key(
     module: &Module,
     imports: &[ResolvedImport<'_>],
+    module_key: &str,
 ) -> Vec<StackAt> {
     let mut checker = Checker::new();
+    checker.module_key = module_key.to_string();
     for imported in imports {
         if checker
             .import_resolved(imported.provider, imported.import, imported.known)
@@ -313,6 +341,8 @@ struct InstanceInfo {
     methods: Vec<InstanceMethod>,
     /// Superclass constraints at this head. Type variables are this instance's.
     supers: Vec<SemConstraint>,
+    /// Module that wrote the `#` line. The same module twice is one instance.
+    origin: String,
 }
 
 #[derive(Clone, Debug)]
@@ -479,6 +509,8 @@ struct Checker {
     guarded: Vec<EffectId>,
     /// Imported signatures may mention a class before it is visible here.
     relax_visibility: bool,
+    /// Identity of the module being checked. Local `#` lines use it.
+    module_key: String,
 }
 
 impl Checker {
@@ -529,6 +561,7 @@ impl Checker {
             frozen_effect: HashSet::new(),
             guarded: Vec::new(),
             relax_visibility: false,
+            module_key: String::new(),
         };
         checker.preload();
         checker
@@ -563,9 +596,10 @@ impl Checker {
                 Item::Synonym(_) | Item::Instance(_) => {}
             }
         }
+        let origin = self.module_key.clone();
         for item in &module.items {
             if let Item::Instance(instance) = item {
-                self.declare_instance(instance, module, true)?;
+                self.declare_instance(instance, module, true, &origin)?;
             }
         }
         Ok(())
@@ -864,7 +898,7 @@ impl Checker {
 
     fn import_with_extra(
         &mut self,
-        provider: &Module,
+        _provider: &Module,
         import: &Import,
         known: &[KnownModule],
     ) -> Result<(), Diagnostic> {
@@ -886,20 +920,58 @@ impl Checker {
                 }
             }
         }
-        let names = if import.all {
-            public_names(provider)
-        } else {
-            import.names.clone()
-        };
         let origin = known
             .first()
             .map(|known_module| known_module.origin.as_str())
             .unwrap_or("");
+        let names = if import.all {
+            surface_names(origin, known)
+        } else {
+            import.names.clone()
+        };
         for name in &names {
-            self.export_imported(provider, name, import, origin)?;
+            self.export_surface_name(origin, name, import, known)?;
         }
-        self.import_instances(provider)?;
+        self.import_instance_surface(origin, known, &mut HashSet::new())?;
         Ok(())
+    }
+
+    /// Bring one published name into scope. A name this module re-exports is
+    /// resolved in the module that declares it.
+    fn export_surface_name(
+        &mut self,
+        origin: &str,
+        name: &str,
+        import: &Import,
+        known: &[KnownModule],
+    ) -> Result<(), Diagnostic> {
+        let Some(known_module) = known_at(known, origin) else {
+            return Err(self.error(
+                import.span,
+                Error::ImportNotExported { path: import.path.to_string(), name: name.to_string() },
+            ));
+        };
+        if module_has_public(&known_module.module, name) {
+            return self.export_imported(&known_module.module, name, import, origin);
+        }
+        for (index, child) in known_module.module.imports.iter().enumerate() {
+            if !child.publish {
+                continue;
+            }
+            let Some(dep) = known_module.deps.get(index) else {
+                continue;
+            };
+            let offers = child.all
+                || child.names.iter().any(|have| have == name)
+                || method_words_of(dep, known).iter().any(|have| have == name);
+            if offers {
+                return self.export_surface_name(dep, name, import, known);
+            }
+        }
+        Err(self.error(
+            import.span,
+            Error::ImportNotExported { path: import.path.to_string(), name: name.to_string() },
+        ))
     }
 
     fn export_imported(
@@ -3919,12 +3991,36 @@ impl Checker {
         Ok(true)
     }
 
-    fn import_instances(&mut self, module: &Module) -> Result<(), Diagnostic> {
-        for item in &module.items {
+    /// Instances written in `origin`, plus instances its public imports publish.
+    fn import_instance_surface(
+        &mut self,
+        origin: &str,
+        known: &[KnownModule],
+        stack: &mut HashSet<String>,
+    ) -> Result<(), Diagnostic> {
+        if !stack.insert(origin.to_string()) {
+            return Ok(());
+        }
+        let Some(known_module) = known_at(known, origin) else {
+            stack.remove(origin);
+            return Ok(());
+        };
+        let key = instance_key(known_module);
+        for item in &known_module.module.items {
             if let Item::Instance(instance) = item {
-                self.declare_instance(instance, module, false)?;
+                self.declare_instance(instance, &known_module.module, false, &key)?;
             }
         }
+        for (index, import) in known_module.module.imports.iter().enumerate() {
+            if !import.publish {
+                continue;
+            }
+            let Some(dep) = known_module.deps.get(index) else {
+                continue;
+            };
+            self.import_instance_surface(dep, known, stack)?;
+        }
+        stack.remove(origin);
         Ok(())
     }
 
@@ -3933,6 +4029,7 @@ impl Checker {
         instance: &Instance,
         module: &Module,
         local: bool,
+        origin: &str,
     ) -> Result<(), Diagnostic> {
         let mut seen_classes = HashSet::new();
         for name in &instance.class_names {
@@ -3978,7 +4075,7 @@ impl Checker {
             }
         }
         for (name, class) in instance.class_names.iter().zip(&classes) {
-            self.declare_class_instance(instance, module, local, name, class)?;
+            self.declare_class_instance(instance, module, local, name, class, origin)?;
         }
         Ok(())
     }
@@ -3992,6 +4089,7 @@ impl Checker {
         local: bool,
         class_name: &str,
         class: &ClassInfo,
+        origin: &str,
     ) -> Result<(), Diagnostic> {
         if local && self.orphan(class_name, &instance.args) {
             return Err(self.error(instance.span, Error::OrphanInstance));
@@ -4078,9 +4176,15 @@ impl Checker {
             args: head,
             methods,
             supers,
+            origin: origin.to_string(),
         };
         for existing in self.instances.clone() {
             if self.overlaps(&existing, &info) {
+                // A public import publishes the same instance again. A second
+                // `#` in this file is still incoherent.
+                if !local && existing.origin == info.origin {
+                    return Ok(());
+                }
                 return Err(self.error(instance.span, Error::IncoherentInstance));
             }
         }
@@ -5278,41 +5382,114 @@ enum Bottom {
     Named(String),
 }
 
-fn public_names(module: &Module) -> Vec<String> {
+fn known_at<'a>(known: &'a [KnownModule], origin: &str) -> Option<&'a KnownModule> {
+    known.iter().find(|known_module| known_module.origin == origin)
+}
+
+fn instance_key(known_module: &KnownModule) -> String {
+    if known_module.module_key.is_empty() {
+        known_module.origin.clone()
+    } else {
+        known_module.module_key.clone()
+    }
+}
+
+fn module_has_public(module: &Module, name: &str) -> bool {
+    crate::surface::own_public_names(module).iter().any(|have| have == name)
+}
+
+/// Public names of `origin`, including names its `~ public` imports publish.
+fn surface_names(origin: &str, known: &[KnownModule]) -> Vec<String> {
     let mut names = Vec::new();
     let mut seen = HashSet::new();
-    let push = |names: &mut Vec<String>, seen: &mut HashSet<String>, name: String| {
+    let mut stack = HashSet::new();
+    collect_surface(origin, known, &mut names, &mut seen, &mut stack);
+    names
+}
+
+fn collect_surface(
+    origin: &str,
+    known: &[KnownModule],
+    names: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    stack: &mut HashSet<String>,
+) {
+    if !stack.insert(origin.to_string()) {
+        return;
+    }
+    let Some(known_module) = known_at(known, origin) else {
+        stack.remove(origin);
+        return;
+    };
+    for (index, import) in known_module.module.imports.iter().enumerate() {
+        if !import.publish {
+            continue;
+        }
+        let Some(dep) = known_module.deps.get(index).map(String::as_str) else {
+            continue;
+        };
+        if import.all {
+            collect_surface(dep, known, names, seen, stack);
+        } else {
+            for name in &import.names {
+                if seen.insert(name.clone()) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        for word in method_words_of(dep, known) {
+            if seen.insert(word.clone()) {
+                names.push(word);
+            }
+        }
+    }
+    for name in crate::surface::own_public_names(&known_module.module) {
         if seen.insert(name.clone()) {
             names.push(name);
         }
-    };
-    for item in &module.items {
-        if let Item::Data(data) = item {
-            push(&mut names, &mut seen, data.name.clone());
-            for ctor in &data.ctors {
-                push(&mut names, &mut seen, ctor.name.clone());
-            }
-        }
-        if let Item::Synonym(synonym) = item {
-            push(&mut names, &mut seen, synonym.name.clone());
-        }
     }
-    for item in &module.items {
-        if let Item::Def(def) = item {
-            if !def.vis.is_private() {
-                push(&mut names, &mut seen, def.name.clone());
-            }
-        }
-    }
-    for item in &module.items {
-        if let Item::Class(class) = item {
-            push(&mut names, &mut seen, class.name.clone());
-            for method in &class.methods {
-                push(&mut names, &mut seen, method.name.clone());
-            }
-        }
-    }
+    stack.remove(origin);
+}
+
+fn method_words_of(origin: &str, known: &[KnownModule]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = HashSet::new();
+    collect_method_words(origin, known, &mut names, &mut seen, &mut stack);
     names
+}
+
+fn collect_method_words(
+    origin: &str,
+    known: &[KnownModule],
+    names: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    stack: &mut HashSet<String>,
+) {
+    if !stack.insert(origin.to_string()) {
+        return;
+    }
+    let Some(known_module) = known_at(known, origin) else {
+        stack.remove(origin);
+        return;
+    };
+    let module = &known_module.module;
+    let public = crate::surface::own_public_names(module);
+    for word in crate::surface::own_method_words(module) {
+        if public.iter().any(|have| have == &word) && seen.insert(word.clone()) {
+            names.push(word);
+        }
+    }
+    for (index, import) in known_module.module.imports.iter().enumerate() {
+        if !import.publish {
+            continue;
+        }
+        let Some(dep) = known_module.deps.get(index).map(String::as_str) else {
+            continue;
+        };
+        collect_method_words(dep, known, names, seen, stack);
+    }
+    stack.remove(origin);
 }
 
 fn find_class_item<'a>(module: &'a Module, name: &str) -> Option<&'a Class> {
@@ -5816,18 +5993,9 @@ mod tests {
         .unwrap();
         let consumer = parse("~ \"Ply/Flatmappable\" (Flatmappable)\n", ParseMode::Source).unwrap();
         let known = vec![
-            super::KnownModule {
-                origin: "Ply/Flatmappable.ply".to_string(),
-                module: flat.clone(),
-            },
-            super::KnownModule {
-                origin: "Ply/Mappable.ply".to_string(),
-                module: mappable,
-            },
-            super::KnownModule {
-                origin: "Ply/Applicable.ply".to_string(),
-                module: applicable,
-            },
+            super::KnownModule::new("Ply/Flatmappable.ply".to_string(), flat.clone()),
+            super::KnownModule::new("Ply/Mappable.ply".to_string(), mappable),
+            super::KnownModule::new("Ply/Applicable.ply".to_string(), applicable),
         ];
         super::check_with_imports(
             &consumer,
@@ -5859,18 +6027,9 @@ mod tests {
         .unwrap();
         let consumer = parse("~ \"Ply/Flatmappable\" (Flatmappable)\n", ParseMode::Source).unwrap();
         let known = vec![
-            super::KnownModule {
-                origin: "/deps/dist/Ply/Flatmappable.d.ply".to_string(),
-                module: flat.clone(),
-            },
-            super::KnownModule {
-                origin: "/deps/dist/Ply/Mappable.d.ply".to_string(),
-                module: mappable,
-            },
-            super::KnownModule {
-                origin: "/deps/dist/Ply/Applicable.d.ply".to_string(),
-                module: applicable,
-            },
+            super::KnownModule::new("/deps/dist/Ply/Flatmappable.d.ply".to_string(), flat.clone()),
+            super::KnownModule::new("/deps/dist/Ply/Mappable.d.ply".to_string(), mappable),
+            super::KnownModule::new("/deps/dist/Ply/Applicable.d.ply".to_string(), applicable),
         ];
         super::check_with_imports(
             &consumer,
@@ -5901,19 +6060,10 @@ mod tests {
         )
         .unwrap();
         let known_number = vec![
-            super::KnownModule {
-                origin: "Ply/Comparable.ply".to_string(),
-                module: comparable.clone(),
-            },
-            super::KnownModule {
-                origin: "Ply/Number.ply".to_string(),
-                module: number.clone(),
-            },
+            super::KnownModule::new("Ply/Number.ply".to_string(), number.clone()),
+            super::KnownModule::new("Ply/Comparable.ply".to_string(), comparable.clone()),
         ];
-        let known_comparable = vec![super::KnownModule {
-            origin: "Ply/Comparable.ply".to_string(),
-            module: comparable.clone(),
-        }];
+        let known_comparable = vec![super::KnownModule::new("Ply/Comparable.ply".to_string(), comparable.clone())];
         super::check_with_imports(
             &consumer,
             &[
@@ -5939,10 +6089,7 @@ mod tests {
             ParseMode::Source,
         )
         .unwrap();
-        let known = vec![super::KnownModule {
-            origin: "Data/Maybe".to_string(),
-            module: provider.clone(),
-        }];
+        let known = vec![super::KnownModule::new("Data/Maybe".to_string(), provider.clone())];
         let check_import = |source: &str| {
             let module = parse(source, ParseMode::Source).unwrap();
             super::check_with_imports(
@@ -5983,14 +6130,8 @@ mod tests {
             ParseMode::Source,
         )
         .unwrap();
-        let known_num = vec![super::KnownModule {
-            origin: "Num.ply".to_string(),
-            module: num.clone(),
-        }];
-        let known_other = vec![super::KnownModule {
-            origin: "Other.ply".to_string(),
-            module: other.clone(),
-        }];
+        let known_num = vec![super::KnownModule::new("Num.ply".to_string(), num.clone())];
+        let known_other = vec![super::KnownModule::new("Other.ply".to_string(), other.clone())];
         let module = parse(
             "~ \"Num\" (Mk)\n~ \"Other\" (wrap)\n\n: id ( Int -- Int )\n  dup drop\n",
             ParseMode::Source,
@@ -6015,10 +6156,7 @@ mod tests {
         assert_eq!(error.message, "duplicate definition Box");
 
         let twin = parse("; Box a = Mk one : a, two : a\n", ParseMode::Source).unwrap();
-        let known_twin = vec![super::KnownModule {
-            origin: "Twin.ply".to_string(),
-            module: twin.clone(),
-        }];
+        let known_twin = vec![super::KnownModule::new("Twin.ply".to_string(), twin.clone())];
         let again = parse(
             "~ \"Num\" (Box)\n~ \"Twin\" (Box)\n\n: id ( Int -- Int )\n  dup drop\n",
             ParseMode::Source,
@@ -6208,10 +6346,7 @@ mod tests {
             ParseMode::Source,
         )
         .unwrap();
-        let known = vec![super::KnownModule {
-            origin: "Data/Person".to_string(),
-            module: provider.clone(),
-        }];
+        let known = vec![super::KnownModule::new("Data/Person".to_string(), provider.clone())];
         let check_import = |source: &str| {
             let module = parse(source, ParseMode::Source).unwrap();
             super::check_with_imports(

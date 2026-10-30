@@ -140,6 +140,13 @@ pub enum Error {
     FieldOfSeveralConstructors(String),
     /// The single constructor does not have this field.
     NoSuchField { type_name: String, name: String },
+    /// A source module imported a package listed only in `devDependencies`.
+    DevDependency(String),
+    /// A utility under `test/` uses the module path of a source module.
+    TestModuleShadow(String),
+    PackageJsonEntry,
+    /// `ply.entry` names a module that is not in the source directory.
+    EntryModule(String),
 }
 
 impl Error {
@@ -369,6 +376,18 @@ impl Error {
             NoSuchField { type_name, name } => {
                 ("PL0120", format!("{type_name} has no field {name}"))
             }
+            DevDependency(path) => ("PL0121", format!("~ \"{path}\" is a devDependency")),
+            TestModuleShadow(path) => (
+                "PL0122",
+                format!("test module {path} is already a source module"),
+            ),
+            PackageJsonEntry => {
+                static_text("PL0123", "package.json ply.entry must be a string")
+            }
+            EntryModule(name) => (
+                "PL0124",
+                format!("ply.entry module {name} is not in the source"),
+            ),
         }
     }
 }
@@ -641,8 +660,28 @@ mod tests {
                 "Entry has no field city",
                 "PL0120",
             ),
+            (
+                Error::DevDependency("@plylang/test/Test".into()),
+                "~ \"@plylang/test/Test\" is a devDependency",
+                "PL0121",
+            ),
+            (
+                Error::TestModuleShadow("Support/Session".into()),
+                "test module Support/Session is already a source module",
+                "PL0122",
+            ),
+            (
+                Error::PackageJsonEntry,
+                "package.json ply.entry must be a string",
+                "PL0123",
+            ),
+            (
+                Error::EntryModule("Stream".into()),
+                "ply.entry module Stream is not in the source",
+                "PL0124",
+            ),
         ];
-        assert_eq!(samples.len(), 120);
+        assert_eq!(samples.len(), 124);
         for (error, message, code) in samples {
             assert_eq!(error.code(), code, "{message}");
             assert_eq!(error.message(), message);

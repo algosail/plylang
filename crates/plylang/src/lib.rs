@@ -13,6 +13,7 @@ mod lexer;
 mod parser;
 mod paths;
 mod span;
+mod surface;
 mod test_run;
 mod token;
 

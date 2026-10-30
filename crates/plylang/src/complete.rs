@@ -8,7 +8,8 @@ use crate::ast::{
     method_line, scheme_string, type_string, Class, Ctor, Data, Def, Item, MethodSig, Module,
     Scheme, Stack, StackEffect, StackTail, Type,
 };
-use crate::build::{available_import_paths, load_provider, stack_sites};
+use crate::build::{available_import_paths, load_provider, load_surface, provider_file, read_module, stack_sites};
+use crate::surface::{self, Found};
 use crate::builtin::{self, Lowering};
 use crate::lexer::tokenize;
 use crate::parser::parse;
@@ -65,7 +66,16 @@ pub fn complete(source: &str, path: &Path, line: u32, character: u32) -> Vec<Com
         Context::None => Vec::new(),
         Context::Keyword => keywords(path.to_string_lossy().ends_with(".d.ply"), replace),
         Context::Modifier { foreign, private } => modifiers(foreign, private, replace),
-        Context::ImportPath { quoted } => import_paths(path, replace, quoted),
+        Context::ImportPath { quoted, publish } => {
+            let mut items = import_paths(path, replace, quoted);
+            if !quoted && !publish {
+                items.insert(
+                    0,
+                    entry("public", "public ", CompletionKind::Keyword, "", "", "0", replace),
+                );
+            }
+            items
+        }
         Context::ImportName { path: import, seen, has_all } => {
             import_names(path, &import, &seen, has_all, replace)
         }
@@ -94,7 +104,7 @@ enum Context {
     None,
     Keyword,
     Modifier { foreign: bool, private: bool },
-    ImportPath { quoted: bool },
+    ImportPath { quoted: bool, publish: bool },
     ImportName { path: String, seen: Vec<String>, has_all: bool },
     Type { vars: Vec<String> },
     Word,
@@ -104,7 +114,10 @@ fn context_of(walked: &Walk, partial: Option<&Token>, at_column_0: bool) -> Cont
     if matches!(partial.map(|token| &token.kind), Some(TokenKind::String(_)))
         && matches!(walked.state, Place::Import)
     {
-        return Context::ImportPath { quoted: true };
+        return Context::ImportPath {
+            quoted: true,
+            publish: walked.saw_public,
+        };
     }
     match walked.state {
         Place::ImportList => Context::ImportName {
@@ -112,7 +125,10 @@ fn context_of(walked: &Walk, partial: Option<&Token>, at_column_0: bool) -> Cont
             seen: walked.seen.clone(),
             has_all: walked.has_all,
         },
-        Place::Import => Context::ImportPath { quoted: false },
+        Place::Import => Context::ImportPath {
+            quoted: false,
+            publish: walked.saw_public,
+        },
         Place::Vis | Place::DefName => Context::Modifier {
             foreign: walked.saw_foreign,
             private: walked.saw_private,
@@ -172,12 +188,22 @@ fn import_names(
         return Vec::new();
     }
     let mut items = Vec::new();
-    if let Some(provider) = load_provider(from, import) {
-        for (name, kind, detail, doc) in provider_exports(&provider) {
-            if seen.iter().any(|have| have == &name) {
-                continue;
+    if let Some(file) = provider_file(from, import) {
+        if let Some(module) = read_module(&file) {
+            let mut load = |start: &Path, path: &str| load_surface(start, path);
+            let names = surface::public_names(&module, &file, &mut load);
+            for name in names {
+                if seen.iter().any(|have| have == &name) {
+                    continue;
+                }
+                let mut load = |start: &Path, path: &str| load_surface(start, path);
+                let Some((_, found)) = surface::lookup(&module, &file, &name, &mut load) else {
+                    continue;
+                };
+                for (kind, detail, doc) in found_exports(&found, &name) {
+                    push(&mut items, entry(&name, &name, kind, &detail, &doc, "2", replace));
+                }
             }
-            push(&mut items, entry(&name, &name, kind, &detail, &doc, "2", replace));
         }
     }
     if !seen.iter().any(|name| name == "..") {
@@ -313,36 +339,48 @@ impl Named {
 fn imported_words(from: &Path, module: &Module) -> Vec<Named> {
     let mut names = Vec::new();
     for import in &module.imports {
-        let Some(provider) = load_provider(from, &import.path) else {
+        let Some(file) = provider_file(from, &import.path) else {
             continue;
         };
-        for name in selected_names(import, &provider) {
-            if let Some(def) = find_def(&provider, &name) {
-                if !def.vis.is_private() {
-                    names.push(Named {
-                        label: def.name.clone(),
-                        kind: CompletionKind::Word,
-                        detail: scheme_string(&def.scheme),
-                        documentation: doc_text(&def.doc),
-                        group: "2",
-                    });
-                }
-            } else if let Some((data, ctor)) = find_ctor(&provider, &name) {
-                names.push(Named {
-                    label: ctor.name.clone(),
-                    kind: CompletionKind::Constructor,
-                    detail: ctor_detail(data, ctor),
-                    documentation: doc_text(&data.doc),
-                    group: "2",
-                });
-            } else if let Some((class, method)) = find_method(&provider, &name) {
-                names.push(Named {
-                    label: method.name.clone(),
+        let Some(provider) = read_module(&file) else {
+            continue;
+        };
+        for name in selected_names(from, import) {
+            let mut load = |start: &Path, path: &str| load_surface(start, path);
+            let Some((_, found)) = surface::lookup(&provider, &file, &name, &mut load) else {
+                continue;
+            };
+            match found {
+                Found::Def(def) if def.name == name && !def.vis.is_private() => names.push(Named {
+                    label: def.name.clone(),
                     kind: CompletionKind::Word,
-                    detail: method_line(class, method),
-                    documentation: doc_text(&class.doc),
+                    detail: scheme_string(&def.scheme),
+                    documentation: doc_text(&def.doc),
                     group: "2",
-                });
+                }),
+                Found::Data(data) => {
+                    if let Some(ctor) = data.ctors.iter().find(|ctor| ctor.name == name) {
+                        names.push(Named {
+                            label: ctor.name.clone(),
+                            kind: CompletionKind::Constructor,
+                            detail: ctor_detail(&data, ctor),
+                            documentation: doc_text(&data.doc),
+                            group: "2",
+                        });
+                    }
+                }
+                Found::Class(class) => {
+                    if let Some(method) = class.methods.iter().find(|method| method.name == name) {
+                        names.push(Named {
+                            label: method.name.clone(),
+                            kind: CompletionKind::Word,
+                            detail: method_line(&class, method),
+                            documentation: doc_text(&class.doc),
+                            group: "2",
+                        });
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -352,97 +390,112 @@ fn imported_words(from: &Path, module: &Module) -> Vec<Named> {
 fn imported_types(from: &Path, module: &Module) -> Vec<Named> {
     let mut names = Vec::new();
     for import in &module.imports {
-        let Some(provider) = load_provider(from, &import.path) else {
+        let Some(file) = provider_file(from, &import.path) else {
             continue;
         };
-        for name in selected_names(import, &provider) {
-            if let Some(data) = find_data(&provider, &name) {
-                names.push(Named {
+        let Some(provider) = read_module(&file) else {
+            continue;
+        };
+        for name in selected_names(from, import) {
+            let mut load = |start: &Path, path: &str| load_surface(start, path);
+            let Some((_, found)) = surface::lookup(&provider, &file, &name, &mut load) else {
+                continue;
+            };
+            match found {
+                Found::Data(data) if data.name == name => names.push(Named {
                     label: data.name.clone(),
                     kind: CompletionKind::Type,
-                    detail: type_detail(data),
+                    detail: type_detail(&data),
                     documentation: doc_text(&data.doc),
                     group: "2",
-                });
-            } else if let Some(class) = find_class(&provider, &name) {
-                names.push(Named {
+                }),
+                Found::Synonym(synonym) if synonym.name == name => names.push(Named {
+                    label: synonym.name.clone(),
+                    kind: CompletionKind::Type,
+                    detail: synonym_detail(&synonym),
+                    documentation: doc_text(&synonym.doc),
+                    group: "2",
+                }),
+                Found::Class(class) if class.name == name => names.push(Named {
                     label: class.name.clone(),
                     kind: CompletionKind::Class,
-                    detail: class_detail(class),
+                    detail: class_detail(&class),
                     documentation: doc_text(&class.doc),
                     group: "2",
-                });
+                }),
+                _ => {}
             }
         }
     }
     names
 }
 
-fn selected_names(import: &crate::ast::Import, provider: &Module) -> Vec<String> {
-    if import.all {
-        provider_exports(provider).into_iter().map(|(name, _, _, _)| name).collect()
-    } else {
-        import.names.clone()
+fn selected_names(from: &Path, import: &crate::ast::Import) -> Vec<String> {
+    if !import.all {
+        return import.names.clone();
     }
+    let Some(file) = provider_file(from, &import.path) else {
+        return Vec::new();
+    };
+    let Some(module) = read_module(&file) else {
+        return Vec::new();
+    };
+    let mut load = |start: &Path, path: &str| load_surface(start, path);
+    surface::public_names(&module, &file, &mut load)
 }
 
-fn provider_exports(module: &Module) -> Vec<(String, CompletionKind, String, String)> {
-    let mut names = Vec::new();
-    for item in &module.items {
-        if let Item::Data(data) = item {
-            names.push((
-                data.name.clone(),
-                CompletionKind::Type,
-                type_detail(data),
-                doc_text(&data.doc),
-            ));
-            for ctor in &data.ctors {
-                names.push((
-                    ctor.name.clone(),
+fn found_exports(found: &Found, name: &str) -> Vec<(CompletionKind, String, String)> {
+    let mut entries = Vec::new();
+    match found {
+        Found::Data(data) => {
+            if data.name == name {
+                entries.push((
+                    CompletionKind::Type,
+                    type_detail(data),
+                    doc_text(&data.doc),
+                ));
+            }
+            if let Some(ctor) = data.ctors.iter().find(|ctor| ctor.name == name) {
+                entries.push((
                     CompletionKind::Constructor,
                     ctor_detail(data, ctor),
                     doc_text(&data.doc),
                 ));
             }
         }
-        if let Item::Synonym(synonym) = item {
-            names.push((
-                synonym.name.clone(),
+        Found::Synonym(synonym) if synonym.name == name => {
+            entries.push((
                 CompletionKind::Type,
                 synonym_detail(synonym),
                 doc_text(&synonym.doc),
             ));
         }
-        if let Item::Class(class) = item {
-            names.push((
-                class.name.clone(),
+        Found::Class(class) if class.name == name => {
+            entries.push((
                 CompletionKind::Class,
                 class_detail(class),
                 doc_text(&class.doc),
             ));
-            for method in &class.methods {
-                names.push((
-                    method.name.clone(),
+        }
+        Found::Class(class) => {
+            if let Some(method) = class.methods.iter().find(|method| method.name == name) {
+                entries.push((
                     CompletionKind::Word,
                     method_line(class, method),
                     doc_text(&class.doc),
                 ));
             }
         }
-    }
-    for item in &module.items {
-        if let Item::Def(def) = item {
-            if !def.vis.is_private() {
-                names.push((
-                    def.name.clone(),
-                    CompletionKind::Word,
-                    scheme_string(&def.scheme),
-                    doc_text(&def.doc),
-                ));
-            }
+        Found::Def(def) if def.name == name && !def.vis.is_private() => {
+            entries.push((
+                CompletionKind::Word,
+                scheme_string(&def.scheme),
+                doc_text(&def.doc),
+            ));
         }
+        _ => {}
     }
-    names
+    entries
 }
 
 fn method_entry(class: &Class, method: &MethodSig, group: &str, replace: Span) -> Completion {
@@ -464,24 +517,6 @@ fn method_entry(class: &Class, method: &MethodSig, group: &str, replace: Span) -
 
 fn class_detail(class: &Class) -> String {
     format!("& {} {}", class.name, class.params.join(" "))
-}
-
-fn find_class<'a>(module: &'a Module, name: &str) -> Option<&'a Class> {
-    module.items.iter().find_map(|item| match item {
-        Item::Class(class) if class.name == name => Some(class),
-        _ => None,
-    })
-}
-
-fn find_method<'a>(module: &'a Module, name: &str) -> Option<(&'a Class, &'a MethodSig)> {
-    module.items.iter().find_map(|item| match item {
-        Item::Class(class) => class
-            .methods
-            .iter()
-            .find(|method| method.name == name)
-            .map(|method| (class, method)),
-        _ => None,
-    })
 }
 
 fn def_entry(def: &Def, group: &str, replace: Span) -> Completion {
@@ -599,27 +634,6 @@ fn parsed_module(source: &str, path: &Path, offset: usize) -> Option<Module> {
     parse(&source[..=cut], mode).ok()
 }
 
-fn find_data<'a>(module: &'a Module, name: &str) -> Option<&'a Data> {
-    module.items.iter().find_map(|item| match item {
-        Item::Data(data) if data.name == name => Some(data),
-        _ => None,
-    })
-}
-
-fn find_def<'a>(module: &'a Module, name: &str) -> Option<&'a Def> {
-    module.items.iter().find_map(|item| match item {
-        Item::Def(def) if def.name == name => Some(def),
-        _ => None,
-    })
-}
-
-fn find_ctor<'a>(module: &'a Module, name: &str) -> Option<(&'a Data, &'a Ctor)> {
-    module.items.iter().find_map(|item| match item {
-        Item::Data(data) => data.ctors.iter().find(|ctor| ctor.name == name).map(|ctor| (data, ctor)),
-        _ => None,
-    })
-}
-
 struct Walk {
     state: Place,
     path: String,
@@ -631,6 +645,7 @@ struct Walk {
     depth: i32,
     saw_foreign: bool,
     saw_private: bool,
+    saw_public: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -697,6 +712,7 @@ fn walk(tokens: &[&Token]) -> Walk {
         depth: 0,
         saw_foreign: false,
         saw_private: false,
+        saw_public: false,
     };
     let mut index = 0;
     while index < tokens.len() {
@@ -707,6 +723,7 @@ fn walk(tokens: &[&Token]) -> Walk {
             walked.depth = 0;
             walked.saw_foreign = false;
             walked.saw_private = false;
+            walked.saw_public = false;
         }
         step(&mut walked, token, next);
         index += 1;
@@ -759,6 +776,7 @@ fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
             _ => {}
         },
         Place::Import => match &token.kind {
+            TokenKind::Public => walked.saw_public = true,
             TokenKind::String(path) => {
                 walked.path = path.clone();
                 walked.state = Place::ImportString;
@@ -1666,6 +1684,11 @@ mod tests {
         assert!(!keywords.iter().any(|label| label == "class"), "{keywords:?}");
         assert!(!keywords.iter().any(|label| label == "instance"), "{keywords:?}");
         assert!(!keywords.iter().any(|label| label == "import"), "{keywords:?}");
+        assert!(!keywords.iter().any(|label| label == "public"), "{keywords:?}");
+        let after_import = labels("~ ", "~ ");
+        assert!(after_import.iter().any(|label| label == "public"), "{after_import:?}");
+        let after_public = labels("~ public ", "~ public ");
+        assert!(!after_public.iter().any(|label| label == "public"), "{after_public:?}");
         assert!(!keywords.iter().any(|label| label == "dup"), "{keywords:?}");
         let after_colon = labels(": ", ": ");
         assert!(after_colon.iter().any(|label| label == "foreign"), "{after_colon:?}");

@@ -1,6 +1,9 @@
-//! `plylang build` compiles a package: resolve imports, write `.js` and `.d.ply`.
-//! `plylang build --exports` then replaces the `exports` field with those modules.
-//! `plylang check` runs that compile and writes nothing.
+//! `plylang build` compiles a package: resolve imports, write `.js` and `.d.ply`,
+//! then align `package.json` `exports` with those modules.
+//! [`build`] is that compile and writes no `exports`. `plylang test` uses it.
+//! [`build_exports`] aligns `exports`: one key per source module, `.` when
+//! `ply.entry` names one, and a key this tool does not own stays.
+//! `--exports` calls the same alignment. `plylang check` writes nothing.
 //! A word named `main` with scheme `( -- Unit )` is called at the bottom of its
 //! module when Node starts that file.
 //!
@@ -18,7 +21,7 @@ use serde_json::Value;
 use crate::anf::{js_ident, referenced_words, AnfModule};
 use crate::ast::{scheme_string, Def, Import, Item, Module, StackTail, Type};
 use crate::check::{
-    check, check_with_imports, collect_sites, collect_sites_with_imports, KnownModule,
+    check, check_with_imports_key, collect_sites, collect_sites_with_imports_key, KnownModule,
     ResolvedImport, StackAt,
 };
 use crate::codes::{error_url, Error};
@@ -90,6 +93,22 @@ pub(crate) struct Package {
     pub(crate) out: PathBuf,
     out_rel: String,
     exports: HashMap<String, String>,
+    /// Module opened by a pathless package import and the `exports` key `.`.
+    entry: Option<String>,
+    dependencies: HashSet<String>,
+    dev_dependencies: HashSet<String>,
+    optional_dependencies: HashSet<String>,
+    peer_dependencies: HashSet<String>,
+}
+
+impl Package {
+    /// Listed in `devDependencies` and in none of the other dependency objects.
+    fn dev_only(&self, name: &str) -> bool {
+        self.dev_dependencies.contains(name)
+            && !self.dependencies.contains(name)
+            && !self.optional_dependencies.contains(name)
+            && !self.peer_dependencies.contains(name)
+    }
 }
 
 struct Output {
@@ -104,6 +123,8 @@ struct Session {
     units: Vec<Unit>,
     by_path: HashMap<PathBuf, usize>,
     by_module: HashMap<String, usize>,
+    /// Utilities under `test/`, keyed by the path a test imports (`Support/Session`).
+    by_test: HashMap<String, usize>,
     exports_cache: HashMap<PathBuf, HashMap<String, String>>,
     topo: Vec<usize>,
     outputs: Vec<Output>,
@@ -131,7 +152,11 @@ pub fn build_exports(dir: &Path) -> Result<(), BuildError> {
 
 fn run_build(dir: &Path, write_exports: bool) -> Result<(), BuildError> {
     let mut session = open_session(dir)?;
-    let entries = export_entries(&session.units, &session.package.out_rel);
+    let entries = export_entries(
+        &session.units,
+        &session.package.out_rel,
+        session.package.entry.as_deref(),
+    );
     if write_exports {
         session.package.exports = entries
             .iter()
@@ -169,11 +194,19 @@ fn open_session(dir: &Path) -> Result<Session, BuildError> {
         units: Vec::new(),
         by_path: HashMap::new(),
         by_module: HashMap::new(),
+        by_test: HashMap::new(),
         exports_cache: HashMap::new(),
         topo: Vec::new(),
         outputs: Vec::new(),
     };
     session.collect_sources()?;
+    if let Some(name) = session.package.entry.clone() {
+        if !session.by_module.contains_key(&name) {
+            let path = session.package.root.join("package.json");
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            return Err(pkg_error(&path, &text, Error::EntryModule(name)));
+        }
+    }
     Ok(session)
 }
 
@@ -229,6 +262,9 @@ pub(crate) fn compile_test_file(root: &Path, file: &Path) -> Result<CompiledTest
         test_words(&unit.module, &unit.source)
     };
     let js = session.emit_one(id)?;
+    // Dependencies under ply.source are already in ply.out. A harness outside
+    // that tree is only compiled here, and the test's JavaScript imports it.
+    session.write_outputs()?;
     Ok(CompiledTest {
         js,
         js_path,
@@ -344,8 +380,10 @@ pub fn stack_sites(path: &Path, source: &str) -> Vec<StackAt> {
     doc.sites()
 }
 
-/// Import paths the package of `from_file` can name: files under `ply.source`,
-/// then `ply` exports of installed dependencies. The current file is left out.
+/// Import paths the package of `from_file` can name: files under the source
+/// directory, utilities under `test/` when `from_file` is a test, then `ply`
+/// exports of installed dependencies. The current file is left out. A source
+/// file does not see a package that is only a devDependency.
 pub(crate) fn available_import_paths(from_file: &Path) -> Vec<String> {
     let Some(root) = find_ply_root(from_file) else {
         return Vec::new();
@@ -369,9 +407,32 @@ pub(crate) fn available_import_paths(from_file: &Path) -> Vec<String> {
         }
         paths.push(module_path);
     }
+    if importer_in_test(&package, from_file) {
+        let test_root = package.root.join("test");
+        let mut helpers = Vec::new();
+        if test_root.is_dir() {
+            let _ = walk_ply(&test_root, &package.out, &mut helpers);
+        }
+        for file in helpers {
+            if canonical(&file) == canonical(from_file) {
+                continue;
+            }
+            let module_path = module_path_of(&test_root, &file);
+            if module_name_from_path(&format!("{module_path}.ply")).is_err() {
+                continue;
+            }
+            if matches!(test_role(&file), Ok(TestRole::Utility)) {
+                paths.push(module_path);
+            }
+        }
+    }
+    let library = path_under(&package.source, from_file);
     let text = fs::read_to_string(root.join("package.json")).unwrap_or_default();
     if let Ok(value) = serde_json::from_str::<Value>(&text) {
         for field in ["dependencies", "devDependencies", "optionalDependencies"] {
+            if library && field == "devDependencies" {
+                continue;
+            }
             let Some(deps) = value.get(field).and_then(Value::as_object) else {
                 continue;
             };
@@ -433,9 +494,25 @@ fn locate_import(from_file: &Path, import_path: &str) -> Option<Located> {
         Spec::Local(module_path) => {
             let root = find_ply_root(from_file)?;
             let package = read_package(&root).ok()?;
-            Some(Located::Local(
-                package.source.join(module_path).with_extension("ply"),
-            ))
+            let source_file = package.source.join(&module_path).with_extension("ply");
+            if importer_in_test(&package, from_file) {
+                if let Some((file, role)) = classify_named_test(&package, &module_path) {
+                    let source_exists = source_file.is_file();
+                    match role {
+                        TestRole::Utility if source_exists => return None,
+                        TestRole::Utility => return Some(Located::Local(file)),
+                        TestRole::Broken if !source_exists => return Some(Located::Local(file)),
+                        TestRole::Entry | TestRole::Broken => {}
+                    }
+                }
+            }
+            if source_file.is_file() {
+                return Some(Located::Local(source_file));
+            }
+            if let Some(file) = interface_file(&package.root, &module_path) {
+                return Some(Located::Local(file));
+            }
+            Some(Located::Local(source_file))
         }
         Spec::Package { name, subpath } => {
             let root = find_installed(from_file, &name)?;
@@ -478,8 +555,8 @@ fn source_beside_interface(root: &Path, manifest: &Value, file: &Path) -> Option
         return None;
     }
     let ply = manifest.get("ply")?;
-    let source_rel = clean_rel(ply.get("source")?.as_str()?);
-    let out_rel = clean_rel(ply.get("out")?.as_str()?);
+    let source_rel = clean_rel(ply.get("source").and_then(Value::as_str).unwrap_or("src"));
+    let out_rel = clean_rel(ply.get("out").and_then(Value::as_str).unwrap_or("dist"));
     if source_rel.is_empty() || out_rel.is_empty() {
         return None;
     }
@@ -593,6 +670,38 @@ impl Session {
         Ok((id, false))
     }
 
+    /// A utility under `test/`. Its module path is the import name, so the
+    /// library build does not publish it and a source module of that name is
+    /// a different file.
+    fn load_test_module(&mut self, file: &Path, module_path: &str) -> Result<usize, BuildError> {
+        if let Some(id) = self.by_test.get(module_path).copied() {
+            return Ok(id);
+        }
+        let canonical = fs::canonicalize(file).map_err(|error| os_error(file, error))?;
+        if let Some(id) = self.by_path.get(&canonical).copied() {
+            self.by_test.insert(module_path.to_string(), id);
+            return Ok(id);
+        }
+        let source = fs::read_to_string(&canonical).map_err(|error| os_error(&canonical, error))?;
+        let module = parse(&source, ParseMode::Source)
+            .map_err(|error| located(&canonical, &source, error))?;
+        let id = self.units.len();
+        self.by_path.insert(canonical.clone(), id);
+        self.by_test.insert(module_path.to_string(), id);
+        self.units.push(Unit {
+            path: canonical.clone(),
+            display: canonical.display().to_string(),
+            source,
+            module,
+            package_root: self.package.root.clone(),
+            module_path: Some(module_path.to_string()),
+            kind: Kind::Local,
+            color: Color::White,
+            deps: Vec::new(),
+        });
+        Ok(id)
+    }
+
     fn collect_sources(&mut self) -> Result<(), BuildError> {
         if !self.package.source.is_dir() {
             return Err(io_error(
@@ -679,19 +788,37 @@ impl Session {
     ) -> Result<usize, BuildError> {
         let package_root = self.units[from].package_root.clone();
         if package_root == self.package.root {
-            return self.by_module.get(module_path).copied().ok_or_else(|| {
-                self.fail(from, span, Error::CannotResolveImport(import_path.to_string()))
-            });
-        }
-        let exports = self.package_exports(&package_root)?;
-        let Some(target) = exports.get(&export_key(module_path)).cloned() else {
+            if importer_in_test(&self.package, &self.units[from].path) {
+                if let Some((file, role)) = classify_named_test(&self.package, module_path) {
+                    let source_exists = self.by_module.contains_key(module_path);
+                    match role {
+                        TestRole::Utility if source_exists => {
+                            return Err(self.fail(
+                                from,
+                                span,
+                                Error::TestModuleShadow(module_path.to_string()),
+                            ));
+                        }
+                        TestRole::Utility => return self.load_test_module(&file, module_path),
+                        TestRole::Broken if !source_exists => {
+                            return self.load_test_module(&file, module_path);
+                        }
+                        TestRole::Broken | TestRole::Entry => {}
+                    }
+                }
+            }
+            if let Some(id) = self.by_module.get(module_path).copied() {
+                return Ok(id);
+            }
             return Err(self.fail(from, span, Error::CannotResolveImport(import_path.to_string())));
-        };
-        let file = target_file(&package_root, &target);
-        if !file.is_file() {
-            return Err(self.fail(from, span, Error::CannotResolveImport(import_path.to_string())));
         }
-        self.load_external(file, package_root)
+        if let Some(file) = self.exported_file(&package_root, module_path) {
+            return self.load_external(file, package_root, Some(module_path.to_string()));
+        }
+        if let Some(file) = interface_file(&package_root, module_path) {
+            return self.load_external(file, package_root, Some(module_path.to_string()));
+        }
+        Err(self.fail(from, span, Error::CannotResolveImport(import_path.to_string())))
     }
 
     fn resolve_package(
@@ -702,6 +829,12 @@ impl Session {
         import_path: &str,
         span: Span,
     ) -> Result<usize, BuildError> {
+        if self.units[from].package_root == self.package.root
+            && path_under(&self.package.source, &self.units[from].path)
+            && self.package.dev_only(name)
+        {
+            return Err(self.fail(from, span, Error::DevDependency(import_path.to_string())));
+        }
         let start = self.units[from].path.clone();
         let Some(pkg_root) = find_installed(&start, name) else {
             return Err(self.fail(from, span, Error::CannotResolveImport(import_path.to_string())));
@@ -714,10 +847,28 @@ impl Session {
         if !file.is_file() {
             return Err(self.fail(from, span, Error::CannotResolveImport(import_path.to_string())));
         }
-        self.load_external(file, pkg_root)
+        let module_path = if subpath.is_empty() {
+            None
+        } else {
+            Some(subpath.to_string())
+        };
+        self.load_external(file, pkg_root, module_path)
     }
 
-    fn load_external(&mut self, file: PathBuf, package_root: PathBuf) -> Result<usize, BuildError> {
+    /// An exports entry, when the key exists and the file is on disk.
+    fn exported_file(&mut self, package_root: &Path, module_path: &str) -> Option<PathBuf> {
+        let exports = self.package_exports(package_root).ok()?;
+        let target = exports.get(&export_key(module_path))?;
+        let file = target_file(package_root, target);
+        file.is_file().then_some(file)
+    }
+
+    fn load_external(
+        &mut self,
+        file: PathBuf,
+        package_root: PathBuf,
+        module_path: Option<String>,
+    ) -> Result<usize, BuildError> {
         let canonical = fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
         if let Some(id) = self.by_path.get(&canonical).copied() {
             return Ok(id);
@@ -733,7 +884,7 @@ impl Session {
             source,
             module,
             package_root,
-            module_path: None,
+            module_path,
             kind: Kind::External,
             color: Color::White,
             deps: Vec::new(),
@@ -780,7 +931,11 @@ impl Session {
             })
             .collect();
         let module = self.units[id].module.clone();
-        let checked = check_with_imports(&module, &resolved)
+        let key = module_key_of(
+            &self.units[id].package_root,
+            self.units[id].module_path.as_deref(),
+        );
+        let checked = check_with_imports_key(&module, &resolved, &key)
             .map_err(|error| self.fail_diagnostic(id, error))?;
         if self.units[id].kind == Kind::External {
             return Ok(());
@@ -819,10 +974,7 @@ impl Session {
             if !seen.insert(id) {
                 continue;
             }
-            out.push(KnownModule {
-                origin: self.units[id].path.display().to_string(),
-                module: self.units[id].module.clone(),
-            });
+            out.push(known_at(&self.units, id));
             for dep in &self.units[id].deps {
                 pending.push(*dep);
             }
@@ -868,10 +1020,22 @@ impl Session {
 
     fn js_header(&self, id: usize, from_js: &Path, anf: &AnfModule) -> String {
         let mut groups: Vec<(String, Vec<String>)> = Vec::new();
-        let imports = &self.units[id].module.imports;
-        let deps = &self.units[id].deps;
-        for (import, dep) in imports.iter().zip(deps) {
-            let names = value_names(&self.units[*dep].module, import);
+        let mut reexports: Vec<(String, Vec<String>)> = Vec::new();
+        let imports = self.units[id].module.imports.clone();
+        let deps = self.units[id].deps.clone();
+        for (import, dep) in imports.iter().zip(&deps) {
+            if import.publish {
+                let names = self.reexport_names(*dep, import);
+                if names.is_empty() {
+                    continue;
+                }
+                let Some(spec) = self.import_spec(import, *dep, from_js) else {
+                    continue;
+                };
+                push_group(&mut reexports, spec, names);
+                continue;
+            }
+            let names = self.imported_values(*dep, import);
             if names.is_empty() {
                 continue;
             }
@@ -888,11 +1052,11 @@ impl Session {
         extra.sort();
         extra.dedup();
         for name in extra {
-            for (import, dep) in imports.iter().zip(deps) {
-                if !public_values(&self.units[*dep].module)
-                    .iter()
-                    .any(|have| have == &name)
-                {
+            if groups.iter().any(|(_, names)| names.iter().any(|have| have == &name)) {
+                continue;
+            }
+            for (import, dep) in imports.iter().zip(&deps) {
+                if !self.value_surface(*dep).iter().any(|have| have == &name) {
                     continue;
                 }
                 let Some(spec) = self.import_spec(import, *dep, from_js) else {
@@ -924,7 +1088,128 @@ impl Session {
                 header.push_str(&format!("export {{ {exported} }};\n"));
             }
         }
+        for (spec, names) in &reexports {
+            header.push_str(&reexport_line(spec, names));
+            header.push('\n');
+        }
         header
+    }
+
+    /// Values this module publishes: its own, the values a `~ public` import
+    /// selects, and method words that are public values.
+    fn value_surface(&self, id: usize) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack = HashSet::new();
+        self.collect_values(id, &mut names, &mut seen, &mut stack);
+        names
+    }
+
+    fn collect_values(
+        &self,
+        id: usize,
+        names: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+        stack: &mut HashSet<usize>,
+    ) {
+        if !stack.insert(id) {
+            return;
+        }
+        let imports = self.units[id].module.imports.clone();
+        let deps = self.units[id].deps.clone();
+        for (import, dep) in imports.iter().zip(&deps) {
+            if !import.publish {
+                continue;
+            }
+            if import.all {
+                self.collect_values(*dep, names, seen, stack);
+            } else {
+                let mut child = Vec::new();
+                let mut child_seen = HashSet::new();
+                self.collect_values(*dep, &mut child, &mut child_seen, stack);
+                for name in &import.names {
+                    if child.iter().any(|have| have == name) {
+                        push_unique(names, seen, name.clone());
+                    }
+                }
+            }
+            for word in self.method_values(*dep) {
+                push_unique(names, seen, word);
+            }
+        }
+        for name in crate::surface::own_public_values(&self.units[id].module) {
+            push_unique(names, seen, name);
+        }
+        stack.remove(&id);
+    }
+
+    fn method_values(&self, id: usize) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack = HashSet::new();
+        self.collect_method_values(id, &mut names, &mut seen, &mut stack);
+        names
+    }
+
+    fn collect_method_values(
+        &self,
+        id: usize,
+        names: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+        stack: &mut HashSet<usize>,
+    ) {
+        if !stack.insert(id) {
+            return;
+        }
+        let public = crate::surface::own_public_values(&self.units[id].module);
+        let words = crate::surface::own_method_words(&self.units[id].module);
+        for word in words {
+            if public.iter().any(|have| have == &word) {
+                push_unique(names, seen, word);
+            }
+        }
+        let imports = self.units[id].module.imports.clone();
+        let deps = self.units[id].deps.clone();
+        for (import, dep) in imports.iter().zip(&deps) {
+            if import.publish {
+                self.collect_method_values(*dep, names, seen, stack);
+            }
+        }
+        stack.remove(&id);
+    }
+
+    fn imported_values(&self, dep: usize, import: &Import) -> Vec<String> {
+        let surface = self.value_surface(dep);
+        if import.all {
+            return surface;
+        }
+        import
+            .names
+            .iter()
+            .filter(|name| surface.iter().any(|have| have == *name))
+            .cloned()
+            .collect()
+    }
+
+    fn reexport_names(&self, dep: usize, import: &Import) -> Vec<String> {
+        let surface = self.value_surface(dep);
+        let mut names = Vec::new();
+        let mut seen = HashSet::new();
+        if import.all {
+            for name in surface {
+                push_unique(&mut names, &mut seen, name);
+            }
+        } else {
+            for name in &import.names {
+                if surface.iter().any(|have| have == name) {
+                    push_unique(&mut names, &mut seen, name.clone());
+                }
+            }
+        }
+        for word in self.method_values(dep) {
+            push_unique(&mut names, &mut seen, word);
+        }
+        names
     }
 
     /// `src/Ply/Int.ply` is implemented by `foreign/Ply/Int.js`.
@@ -984,6 +1269,7 @@ struct DocUnit {
     path: PathBuf,
     module: Module,
     package_root: PathBuf,
+    module_path: Option<String>,
     /// `Data.Num` from the path, or the file name for a package outside this one.
     label: String,
     color: Color,
@@ -1021,13 +1307,14 @@ impl OpenDoc {
             .unwrap_or_else(|| file_label(&file));
         let id = self.units.len();
         self.by_file.insert(file.clone(), id);
-        if let Some(module_path) = module_path {
+        if let Some(module_path) = module_path.clone() {
             self.by_module.insert(module_path, id);
         }
         self.units.push(DocUnit {
             path: file,
             module,
             package_root,
+            module_path,
             label,
             color: Color::White,
             deps: Vec::new(),
@@ -1082,18 +1369,68 @@ impl OpenDoc {
     ) -> Result<usize, Diagnostic> {
         let package_root = self.units[from].package_root.clone();
         if package_root == self.package.root {
+            if importer_in_test(&self.package, &self.units[from].path) {
+                if let Some((file, role)) = classify_named_test(&self.package, module_path) {
+                    let source_exists = self
+                        .package
+                        .source
+                        .join(module_path)
+                        .with_extension("ply")
+                        .is_file();
+                    match role {
+                        TestRole::Utility if source_exists => {
+                            return Err(Diagnostic::new(
+                                span,
+                                Error::TestModuleShadow(module_path.to_string()),
+                            ));
+                        }
+                        TestRole::Utility => {
+                            return self.load(
+                                file,
+                                package_root,
+                                Some(module_path.to_string()),
+                                span,
+                                import_path,
+                            );
+                        }
+                        TestRole::Broken if !source_exists => {
+                            return self.load(
+                                file,
+                                package_root,
+                                Some(module_path.to_string()),
+                                span,
+                                import_path,
+                            );
+                        }
+                        TestRole::Broken | TestRole::Entry => {}
+                    }
+                }
+            }
             if let Some(id) = self.by_module.get(module_path).copied() {
                 return Ok(id);
             }
             let file = self.package.source.join(module_path).with_extension("ply");
             return self.load(file, package_root, Some(module_path.to_string()), span, import_path);
         }
-        let exports = self.package_exports(&package_root, span, import_path)?;
-        let Some(target) = exports.get(&export_key(module_path)).cloned() else {
-            return Err(missing(span, import_path));
-        };
-        let file = target_file(&package_root, &target);
-        self.load(file, package_root, None, span, import_path)
+        if let Some(file) = self.exported_file(&package_root, module_path, span, import_path)? {
+            return self.load(
+                file,
+                package_root,
+                Some(module_path.to_string()),
+                span,
+                import_path,
+            );
+        }
+        if let Some(file) = interface_file(&package_root, module_path) {
+            return self.load(
+                file,
+                package_root,
+                Some(module_path.to_string()),
+                span,
+                import_path,
+            );
+        }
+        Err(missing(span, import_path))
     }
 
     fn resolve_package(
@@ -1110,6 +1447,12 @@ impl OpenDoc {
             .find(|(_, id)| **id == from)
             .map(|(path, _)| path.clone())
             .unwrap_or_else(|| self.package.root.clone());
+        if self.units[from].package_root == self.package.root
+            && path_under(&self.package.source, &self.units[from].path)
+            && self.package.dev_only(name)
+        {
+            return Err(Diagnostic::new(span, Error::DevDependency(import_path.to_string())));
+        }
         let Some(pkg_root) = find_installed(&start, name) else {
             return Err(missing(span, import_path));
         };
@@ -1118,7 +1461,12 @@ impl OpenDoc {
             return Err(missing(span, import_path));
         };
         let file = target_file(&pkg_root, &target);
-        self.load(file, pkg_root, None, span, import_path)
+        let module_path = if subpath.is_empty() {
+            None
+        } else {
+            Some(subpath.to_string())
+        };
+        self.load(file, pkg_root, module_path, span, import_path)
     }
 
     fn load(
@@ -1195,7 +1543,11 @@ impl OpenDoc {
                 known: &knowns[index],
             })
             .collect();
-        check_with_imports(&self.units[0].module, &resolved).map(|_| ())
+        let key = module_key_of(
+            &self.units[0].package_root,
+            self.units[0].module_path.as_deref(),
+        );
+        check_with_imports_key(&self.units[0].module, &resolved, &key).map(|_| ())
     }
 
     fn sites(&self) -> Vec<StackAt> {
@@ -1216,7 +1568,11 @@ impl OpenDoc {
                 known: &knowns[index],
             })
             .collect();
-        let sites = collect_sites_with_imports(&self.units[0].module, &resolved);
+        let key = module_key_of(
+            &self.units[0].package_root,
+            self.units[0].module_path.as_deref(),
+        );
+        let sites = collect_sites_with_imports_key(&self.units[0].module, &resolved, &key);
         if sites.is_empty() {
             collect_sites(&self.units[0].module)
         } else {
@@ -1232,15 +1588,27 @@ impl OpenDoc {
             if !seen.insert(id) {
                 continue;
             }
-            out.push(KnownModule {
-                origin: self.units[id].path.display().to_string(),
-                module: self.units[id].module.clone(),
-            });
+            out.push(known_doc(&self.units, id));
             for dep in &self.units[id].deps {
                 pending.push(*dep);
             }
         }
         out
+    }
+
+    fn exported_file(
+        &mut self,
+        package_root: &Path,
+        module_path: &str,
+        span: Span,
+        import_path: &str,
+    ) -> Result<Option<PathBuf>, Diagnostic> {
+        let exports = self.package_exports(package_root, span, import_path)?;
+        let Some(target) = exports.get(&export_key(module_path)) else {
+            return Ok(None);
+        };
+        let file = target_file(package_root, target);
+        Ok(file.is_file().then_some(file))
     }
 }
 
@@ -1270,19 +1638,23 @@ fn read_package(root: &Path) -> Result<Package, BuildError> {
     let Some(ply) = value.get("ply") else {
         return Err(pkg_error(&path, &text, Error::PackageJsonNoPly));
     };
-    let Some(source_rel) = ply.get("source").and_then(Value::as_str) else {
-        return Err(pkg_error(
-            &path,
-            &text,
-            Error::PackageJsonSource,
-        ));
+    let source_rel = match ply.get("source") {
+        None => "src".to_string(),
+        Some(value) => {
+            let Some(text_rel) = value.as_str() else {
+                return Err(pkg_error(&path, &text, Error::PackageJsonSource));
+            };
+            clean_rel(text_rel)
+        }
     };
-    let Some(out_rel) = ply.get("out").and_then(Value::as_str) else {
-        return Err(pkg_error(
-            &path,
-            &text,
-            Error::PackageJsonOut,
-        ));
+    let out_rel = match ply.get("out") {
+        None => "dist".to_string(),
+        Some(value) => {
+            let Some(text_rel) = value.as_str() else {
+                return Err(pkg_error(&path, &text, Error::PackageJsonOut));
+            };
+            clean_rel(text_rel)
+        }
     };
     let Some(language) = ply.get("language").and_then(Value::as_u64) else {
         return Err(pkg_error(
@@ -1306,8 +1678,6 @@ fn read_package(root: &Path) -> Result<Package, BuildError> {
             Error::LanguageTooNew { version: language, compiler: LANGUAGE_VERSION },
         ));
     }
-    let source_rel = clean_rel(source_rel);
-    let out_rel = clean_rel(out_rel);
     if source_rel.is_empty() || out_rel.is_empty() || source_rel == out_rel {
         return Err(pkg_error(
             &path,
@@ -1316,7 +1686,22 @@ fn read_package(root: &Path) -> Result<Package, BuildError> {
         ));
     }
     let foreign = match ply.get("foreign") {
-        None => None,
+        None => {
+            let rel = "foreign";
+            let dir = root.join(rel);
+            if dir.is_dir() {
+                if rel == source_rel
+                    || rel == out_rel
+                    || nests(rel, &source_rel)
+                    || nests(rel, &out_rel)
+                {
+                    return Err(pkg_error(&path, &text, Error::ForeignSameDirectory));
+                }
+                Some(dir)
+            } else {
+                None
+            }
+        }
         Some(value) => {
             let Some(rel) = value.as_str() else {
                 return Err(pkg_error(
@@ -1341,6 +1726,18 @@ fn read_package(root: &Path) -> Result<Package, BuildError> {
             Some(root.join(rel))
         }
     };
+    let entry = match ply.get("entry") {
+        None => None,
+        Some(value) => {
+            let Some(name) = value.as_str() else {
+                return Err(pkg_error(&path, &text, Error::PackageJsonEntry));
+            };
+            let name = clean_rel(name);
+            module_name_from_path(&format!("{name}.ply"))
+                .map_err(|error| pkg_error(&path, &text, error))?;
+            Some(name)
+        }
+    };
     let name = value
         .get("name")
         .and_then(Value::as_str)
@@ -1354,8 +1751,21 @@ fn read_package(root: &Path) -> Result<Package, BuildError> {
         out: root.join(&out_rel),
         out_rel,
         exports: export_map(&value),
+        entry,
+        dependencies: name_set(&value, "dependencies"),
+        dev_dependencies: name_set(&value, "devDependencies"),
+        optional_dependencies: name_set(&value, "optionalDependencies"),
+        peer_dependencies: name_set(&value, "peerDependencies"),
         root: root.to_path_buf(),
     })
+}
+
+fn name_set(value: &Value, field: &str) -> HashSet<String> {
+    value
+        .get(field)
+        .and_then(Value::as_object)
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 pub(crate) fn open_package(dir: &Path) -> Result<Package, BuildError> {
@@ -1443,7 +1853,7 @@ struct ExportEntry {
     js: String,
 }
 
-fn export_entries(units: &[Unit], out_rel: &str) -> Vec<ExportEntry> {
+fn export_entries(units: &[Unit], out_rel: &str, entry: Option<&str>) -> Vec<ExportEntry> {
     let mut entries = Vec::new();
     for unit in units {
         if unit.kind != Kind::Local {
@@ -1452,11 +1862,26 @@ fn export_entries(units: &[Unit], out_rel: &str) -> Vec<ExportEntry> {
         let Some(module_path) = &unit.module_path else {
             continue;
         };
+        // A test file's path starts at the package root (`test/Data/State`).
+        // Source modules are the ones `exports` names.
+        if module_path.starts_with("test/") {
+            continue;
+        }
         entries.push(ExportEntry {
             key: export_key(module_path),
             ply: format!("./{out_rel}/{module_path}.d.ply"),
             js: format!("./{out_rel}/{module_path}.js"),
         });
+    }
+    if let Some(name) = entry {
+        let key = export_key(name);
+        if let Some(module) = entries.iter().find(|item| item.key == key) {
+            entries.push(ExportEntry {
+                key: ".".to_string(),
+                ply: module.ply.clone(),
+                js: module.js.clone(),
+            });
+        }
     }
     entries.sort_by(|left, right| left.key.cmp(&right.key));
     entries
@@ -1469,9 +1894,10 @@ fn write_package_exports(root: &Path, entries: &[ExportEntry]) -> Result<(), Bui
     let updated = match find_exports(&text) {
         Ok(ExportsSpot::Found { start, end }) => {
             let indent = line_indent(&text, start);
+            let existing = serde_json::from_str::<Value>(&text[start..end]).unwrap_or(Value::Null);
             let mut out = String::new();
             out.push_str(&text[..start]);
-            out.push_str(&render_exports(entries, &indent));
+            out.push_str(&render_merged(entries, &existing, &indent));
             out.push_str(&text[end..]);
             out
         }
@@ -1552,6 +1978,95 @@ fn insert_exports(text: &str, close: usize, entries: &[ExportEntry]) -> String {
     out.push('\n');
     out.push('}');
     out.push_str(&text[close + '}'.len_utf8()..]);
+    out
+}
+
+/// Tool-owned module keys are replaced. A stale `{ ply, import }` key for a
+/// module that is gone is removed. `.` is replaced only when `entries` names
+/// it, which is when `ply.entry` is set. Every other key stays.
+fn render_merged(entries: &[ExportEntry], existing: &Value, indent: &str) -> String {
+    let preserved = preserved_exports(existing, entries);
+    if preserved.is_empty() {
+        return render_exports(entries, indent);
+    }
+    if entries.is_empty() {
+        return render_preserved_only(&preserved, indent);
+    }
+    let owned = render_exports(entries, indent);
+    let key_indent = format!("{indent}{indent}");
+    let close = format!("\n{indent}}}");
+    let Some(head) = owned.strip_suffix(&close) else {
+        return owned;
+    };
+    let mut out = head.to_string();
+    out.push(',');
+    out.push('\n');
+    for (index, (key, value)) in preserved.iter().enumerate() {
+        out.push_str(&key_indent);
+        out.push_str(&json_string(key));
+        out.push_str(": ");
+        out.push_str(&serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()));
+        if index + 1 != preserved.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str(indent);
+    out.push('}');
+    out
+}
+
+fn preserved_exports(existing: &Value, entries: &[ExportEntry]) -> Vec<(String, Value)> {
+    let Some(object) = existing.as_object() else {
+        return Vec::new();
+    };
+    let owned: HashSet<&str> = entries.iter().map(|entry| entry.key.as_str()).collect();
+    let mut kept = Vec::new();
+    for (key, value) in object {
+        if owned.contains(key.as_str()) {
+            continue;
+        }
+        if is_stale_module_export(key, value) {
+            continue;
+        }
+        kept.push((key.clone(), value.clone()));
+    }
+    kept
+}
+
+/// `./Old` written as exactly `{ "ply", "import" }` for a module this build
+/// does not emit. `.` is never stale: without `ply.entry` a hand-written root
+/// stays, and with `ply.entry` the key is owned and replaced above.
+fn is_stale_module_export(key: &str, value: &Value) -> bool {
+    let Some(rest) = key.strip_prefix("./") else {
+        return false;
+    };
+    if module_name_from_path(&format!("{rest}.ply")).is_err() {
+        return false;
+    }
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.len() == 2
+        && object.get("ply").and_then(Value::as_str).is_some()
+        && object.get("import").and_then(Value::as_str).is_some()
+}
+
+fn render_preserved_only(preserved: &[(String, Value)], indent: &str) -> String {
+    let key_indent = format!("{indent}{indent}");
+    let mut out = String::from("{\n");
+    for (index, (key, value)) in preserved.iter().enumerate() {
+        out.push_str(&key_indent);
+        out.push_str(&json_string(key));
+        out.push_str(": ");
+        out.push_str(&serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()));
+        if index + 1 != preserved.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str(indent);
+    out.push('}');
     out
 }
 
@@ -1813,6 +2328,108 @@ fn find_installed(start: &Path, name: &str) -> Option<PathBuf> {
     }
 }
 
+/// A file under `test/` that is not itself under the source directory.
+fn importer_in_test(package: &Package, file: &Path) -> bool {
+    path_under(&package.root.join("test"), file) && !path_under(&package.source, file)
+}
+
+fn path_under(dir: &Path, file: &Path) -> bool {
+    if !dir.exists() {
+        return false;
+    }
+    canonical(file).starts_with(&canonical(dir))
+}
+
+enum TestRole {
+    /// Public `( -- Verdict )` or public `suite`. Not a module.
+    Entry,
+    /// A module only a test can import.
+    Utility,
+    /// The file did not parse. The runner still reports it as a test.
+    Broken,
+}
+
+fn test_role(file: &Path) -> std::io::Result<TestRole> {
+    let source = fs::read_to_string(file)?;
+    Ok(role_of_source(&source))
+}
+
+fn role_of_source(source: &str) -> TestRole {
+    match parse(source, ParseMode::Source) {
+        Err(_) => TestRole::Broken,
+        Ok(module) if is_test_entry(&module) => TestRole::Entry,
+        Ok(_) => TestRole::Utility,
+    }
+}
+
+/// A test entry is a public `( -- Verdict )` or a public word named `suite`.
+fn is_test_entry(module: &Module) -> bool {
+    module.items.iter().any(|item| {
+        let Item::Def(def) = item else {
+            return false;
+        };
+        if def.vis.is_private() {
+            return false;
+        }
+        def.name == "suite" || (!def.vis.is_foreign() && bare_verdict(def))
+    })
+}
+
+/// `test/{module}.ply` when that file can be imported, or when it fails to parse.
+/// A test entry is not a module.
+fn classify_named_test(package: &Package, module_path: &str) -> Option<(PathBuf, TestRole)> {
+    if module_name_from_path(&format!("{module_path}.ply")).is_err() {
+        return None;
+    }
+    let file = package
+        .root
+        .join("test")
+        .join(module_path)
+        .with_extension("ply");
+    if !file.is_file() {
+        return None;
+    }
+    let role = test_role(&file).ok()?;
+    Some((file, role))
+}
+
+/// Parse failure counts as an entry so the runner shows the diagnostic.
+pub(crate) fn file_is_test_entry(path: &Path) -> Result<bool, BuildError> {
+    let source = fs::read_to_string(path).map_err(|error| os_error(path, error))?;
+    Ok(!matches!(role_of_source(&source), TestRole::Utility))
+}
+
+/// A utility whose path is already a source module fails the test run.
+pub(crate) fn reject_shadowed_test_modules(root: &Path) -> Result<(), BuildError> {
+    let package = read_package(root)?;
+    let test_root = package.root.join("test");
+    if !test_root.is_dir() {
+        return Ok(());
+    }
+    let mut files = Vec::new();
+    walk_ply(&test_root, &package.out, &mut files).map_err(|error| os_error(&test_root, error))?;
+    files.sort();
+    for file in files {
+        let module_path = module_path_of(&test_root, &file);
+        if module_name_from_path(&format!("{module_path}.ply")).is_err() {
+            continue;
+        }
+        let source = fs::read_to_string(&file).map_err(|error| os_error(&file, error))?;
+        if !matches!(role_of_source(&source), TestRole::Utility) {
+            continue;
+        }
+        let src = package.source.join(&module_path).with_extension("ply");
+        if src.is_file() {
+            return Err(located(
+                &file,
+                &source,
+                Diagnostic::new(Span::new(0, 0), Error::TestModuleShadow(module_path)),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn find_ply_root(start: &Path) -> Option<PathBuf> {
     let mut dir = if start.is_dir() {
         start.to_path_buf()
@@ -1824,7 +2441,7 @@ fn find_ply_root(start: &Path) -> Option<PathBuf> {
         if package_json.is_file() {
             if let Ok(text) = fs::read_to_string(&package_json) {
                 if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                    if value.get("ply").and_then(|ply| ply.get("source")).is_some() {
+                    if value.get("ply").and_then(Value::as_object).is_some() {
                         return Some(dir);
                     }
                 }
@@ -1881,6 +2498,79 @@ pub(crate) fn module_path_of(source: &Path, file: &Path) -> String {
         .strip_suffix(".ply")
         .unwrap_or(&relative)
         .to_string()
+}
+
+fn known_at(units: &[Unit], id: usize) -> KnownModule {
+    let origin = units[id].path.display().to_string();
+    let module = units[id].module.clone();
+    let package_root = units[id].package_root.clone();
+    let module_path = units[id].module_path.clone();
+    let deps = units[id]
+        .deps
+        .iter()
+        .map(|dep| units[*dep].path.display().to_string())
+        .collect();
+    known_module(&origin, module, &package_root, module_path.as_deref(), deps)
+}
+
+fn known_doc(units: &[DocUnit], id: usize) -> KnownModule {
+    let origin = units[id].path.display().to_string();
+    let module = units[id].module.clone();
+    let package_root = units[id].package_root.clone();
+    let module_path = units[id].module_path.clone();
+    let deps = units[id]
+        .deps
+        .iter()
+        .map(|dep| units[*dep].path.display().to_string())
+        .collect();
+    known_module(&origin, module, &package_root, module_path.as_deref(), deps)
+}
+
+fn known_module(
+    origin: &str,
+    module: Module,
+    package_root: &Path,
+    module_path: Option<&str>,
+    deps: Vec<String>,
+) -> KnownModule {
+    KnownModule {
+        origin: origin.to_string(),
+        module,
+        deps,
+        module_key: module_key_of(package_root, module_path),
+    }
+}
+
+/// Package root and module path. The same module is the same instance origin
+/// whether the file on disk is source or a generated interface.
+fn module_key_of(package_root: &Path, module_path: Option<&str>) -> String {
+    match module_path {
+        Some(path) if !path.is_empty() => format!("{}\n{path}", package_root.display()),
+        _ => String::new(),
+    }
+}
+
+/// `{ply.out}/{module}.d.ply` when that file exists. A package specifier still
+/// resolves only through `exports`. This is the sibling of a local import.
+fn interface_file(package_root: &Path, module_path: &str) -> Option<PathBuf> {
+    if module_path.is_empty() {
+        return None;
+    }
+    let text = fs::read_to_string(package_root.join("package.json")).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let out = value.get("ply")?.get("out")?.as_str()?;
+    let out = clean_rel(out);
+    if out.is_empty() {
+        return None;
+    }
+    let file = package_root.join(out).join(format!("{module_path}.d.ply"));
+    file.is_file().then_some(file)
+}
+
+pub(crate) fn load_surface(from: &Path, import_path: &str) -> Option<(PathBuf, Module)> {
+    let file = provider_file(from, import_path)?;
+    let module = read_module(&file)?;
+    Some((file, module))
 }
 
 fn clean_rel(path: &str) -> String {
@@ -1985,38 +2675,6 @@ fn local_runtime_names(module: &Module) -> HashSet<String> {
     names
 }
 
-fn value_names(module: &Module, import: &Import) -> Vec<String> {
-    let public = public_values(module);
-    if import.all {
-        return public;
-    }
-    import
-        .names
-        .iter()
-        .filter(|name| public.iter().any(|public| public == *name))
-        .cloned()
-        .collect()
-}
-
-fn public_values(module: &Module) -> Vec<String> {
-    let mut names = Vec::new();
-    for item in &module.items {
-        if let Item::Data(data) = item {
-            for ctor in &data.ctors {
-                names.push(ctor.name.clone());
-            }
-        }
-    }
-    for item in &module.items {
-        if let Item::Def(def) = item {
-            if !def.vis.is_private() {
-                names.push(def.name.clone());
-            }
-        }
-    }
-    names
-}
-
 fn foreign_names(module: &Module) -> Vec<(String, bool)> {
     module
         .items
@@ -2028,6 +2686,12 @@ fn foreign_names(module: &Module) -> Vec<(String, bool)> {
             _ => None,
         })
         .collect()
+}
+
+fn push_unique(names: &mut Vec<String>, seen: &mut HashSet<String>, name: String) {
+    if seen.insert(name.clone()) {
+        names.push(name);
+    }
 }
 
 fn push_group(groups: &mut Vec<(String, Vec<String>)>, spec: String, names: Vec<String>) {
@@ -2058,6 +2722,10 @@ fn import_binding(name: &str) -> String {
     } else {
         format!("{name} as {local}")
     }
+}
+
+fn reexport_line(spec: &str, names: &[String]) -> String {
+    format!("export {{ {} }} from \"{spec}\";", names.join(", "))
 }
 
 fn export_binding(name: &str) -> String {
@@ -2537,7 +3205,10 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{build, build_exports, check_package, exported_arity, relative_specifier, JsExport};
+    use super::{
+        build, build_exports, check_buffer, check_package, exported_arity, relative_specifier,
+        JsExport,
+    };
 
     struct Temp(PathBuf);
 
@@ -3552,6 +4223,438 @@ mod tests {
         lone.write("App.ply", ": main ( -- Num )\n  1\n");
         let error = super::javascript_file(&lone.0.join("App.ply")).unwrap_err();
         assert_eq!(error.code, "PL0115");
+    }
+
+    #[test]
+    fn public_import_publishes_the_word_and_the_instance() {
+        let lib = "\
+.. Two numbers.
+& Eq a
+  eq ( a a -- Bool )
+
+; Box a = Box a
+
+.. Equal numbers.
+: eqNum ( Num Num -- Bool )
+  drop drop true
+
+: eqBox ( a. (Box a) (Box a) -- Bool )
+  drop drop true
+
+# Eq Num
+  eq = eqNum
+
+# Eq (Box a)
+  eq = eqBox
+
+.. A number.
+: answer ( -- Num )
+  1
+
+: private hidden ( -- Num )
+  0
+";
+        let exports = r#"
+    "./Lib": { "ply": "./dist/Lib.d.ply", "import": "./dist/Lib.js" },
+    "./Door": { "ply": "./dist/Door.d.ply", "import": "./dist/Door.js" },
+    "./Wide": { "ply": "./dist/Wide.d.ply", "import": "./dist/Wide.js" },
+    "./App": { "ply": "./dist/App.d.ply", "import": "./dist/App.js" },
+    "./UseAll": { "ply": "./dist/UseAll.d.ply", "import": "./dist/UseAll.js" }
+"#;
+        let temp = Temp::new("public");
+        temp.write("package.json", &package_json(exports));
+        temp.write("src/Lib.ply", lib);
+        temp.write("src/Door.ply", "~ public \"Lib\" (answer)\n");
+        temp.write("src/Wide.ply", "~ public \"Lib\" (..)\n");
+        temp.write(
+            "src/App.ply",
+            "~ \"Door\" (answer)\n~ \"Lib\" (Eq, eq)\n\n: same ( a. Eq a => a a -- Bool )\n  eq\n\n: use ( Num Num -- Bool )\n  same\n",
+        );
+        temp.write(
+            "src/UseAll.ply",
+            "~ \"Door\" (..)\n\n: use ( Num Num -- Bool )\n  eqNum\n",
+        );
+        build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let door = fs::read_to_string(temp.0.join("dist/Door.js")).unwrap();
+        assert!(
+            door.contains("export { answer, eqNum, eqBox } from \"./Lib.js\";"),
+            "{door}"
+        );
+        assert!(!door.contains("function "), "{door}");
+        let door_iface = fs::read_to_string(temp.0.join("dist/Door.d.ply")).unwrap();
+        assert!(door_iface.contains("~ public \"Lib\" (answer)\n"), "{door_iface}");
+        assert!(!door_iface.contains("# Eq"), "{door_iface}");
+        let app = fs::read_to_string(temp.0.join("dist/App.js")).unwrap();
+        assert!(
+            app.contains("import { answer, eqNum } from \"./Door.js\";"),
+            "{app}"
+        );
+        assert!(app.contains("eq: eqNum"), "{app}");
+        assert!(!app.contains("from \"./Lib.js\""), "{app}");
+        let wide = fs::read_to_string(temp.0.join("dist/UseAll.js")).unwrap();
+        assert!(wide.contains("eqNum") && wide.contains("from \"./Door.js\""), "{wide}");
+        node(
+            &temp.0,
+            "import { use } from \"./dist/App.js\";\nif (use(1, 2) !== true) throw new Error(\"eq\");\n",
+        );
+
+        let again = Temp::new("public-again");
+        again.write(
+            "package.json",
+            &package_json(
+                r#"
+    "./Lib": { "ply": "./dist/Lib.d.ply", "import": "./dist/Lib.js" },
+    "./Door": { "ply": "./dist/Door.d.ply", "import": "./dist/Door.js" },
+    "./App": { "ply": "./dist/App.d.ply", "import": "./dist/App.js" }
+"#,
+            ),
+        );
+        again.write("src/Lib.ply", lib);
+        again.write("src/Door.ply", "~ public \"Lib\" (answer)\n");
+        again.write(
+            "src/App.ply",
+            "~ \"Door\" ()\n~ \"Lib\" ()\n~ \"Lib\" (Eq, eq)\n\n: use ( Num Num -- Bool )\n  eq\n",
+        );
+        build(&again.0).unwrap_or_else(|error| panic!("{}", error.render()));
+
+        let hidden = Temp::new("public-hidden");
+        hidden.write(
+            "package.json",
+            &package_json(r#""./Lib": { "ply": "./dist/Lib.d.ply", "import": "./dist/Lib.js" }, "./Door": { "ply": "./dist/Door.d.ply", "import": "./dist/Door.js" }"#),
+        );
+        hidden.write("src/Lib.ply", lib);
+        hidden.write("src/Door.ply", "~ public \"Lib\" (hidden)\n");
+        let error = build(&hidden.0).unwrap_err();
+        assert_eq!(error.message, "~ \"Lib\" does not export hidden");
+
+        let dup = Temp::new("public-dup");
+        dup.write(
+            "package.json",
+            &package_json(r#""./Lib": { "ply": "./dist/Lib.d.ply", "import": "./dist/Lib.js" }, "./Door": { "ply": "./dist/Door.d.ply", "import": "./dist/Door.js" }"#),
+        );
+        dup.write("src/Lib.ply", lib);
+        dup.write(
+            "src/Door.ply",
+            "~ public \"Lib\" (answer)\n\n: answer ( -- Num )\n  2\n",
+        );
+        let error = build(&dup.0).unwrap_err();
+        assert_eq!(error.message, "duplicate definition answer");
+
+        let clash = Temp::new("public-clash");
+        clash.write(
+            "package.json",
+            &package_json(
+                r#"
+    "./Lib": { "ply": "./dist/Lib.d.ply", "import": "./dist/Lib.js" },
+    "./Door": { "ply": "./dist/Door.d.ply", "import": "./dist/Door.js" },
+    "./App": { "ply": "./dist/App.d.ply", "import": "./dist/App.js" }
+"#,
+            ),
+        );
+        clash.write("src/Lib.ply", lib);
+        clash.write("src/Door.ply", "~ public \"Lib\" (answer)\n");
+        clash.write(
+            "src/App.ply",
+            "~ \"Door\" ()\n~ \"Lib\" (Eq)\n\n: eqNum ( Num Num -- Bool )\n  drop drop false\n\n# Eq Num\n  eq = eqNum\n",
+        );
+        let error = build(&clash.0).unwrap_err();
+        assert_eq!(error.message, "incoherent instance");
+
+        let stopped = Temp::new("public-stopped");
+        stopped.write(
+            "package.json",
+            &package_json(
+                r#"
+    "./Lib": { "ply": "./dist/Lib.d.ply", "import": "./dist/Lib.js" },
+    "./Door": { "ply": "./dist/Door.d.ply", "import": "./dist/Door.js" },
+    "./Mid": { "ply": "./dist/Mid.d.ply", "import": "./dist/Mid.js" },
+    "./Next": { "ply": "./dist/Next.d.ply", "import": "./dist/Next.js" }
+"#,
+            ),
+        );
+        stopped.write("src/Lib.ply", lib);
+        stopped.write("src/Door.ply", "~ public \"Lib\" (answer)\n");
+        stopped.write(
+            "src/Mid.ply",
+            "~ \"Door\" (answer)\n~ \"Lib\" (Eq, eq)\n\n: pass ( Num Num -- Bool )\n  eq\n\n: same ( a. Eq a => a a -- Bool )\n  eq\n",
+        );
+        stopped.write(
+            "src/Next.ply",
+            "~ \"Mid\" (same)\n\n: use ( Num Num -- Bool )\n  same\n",
+        );
+        let error = build(&stopped.0).unwrap_err();
+        assert_eq!(error.message, "no instance for Eq Num");
+
+        let both = Temp::new("public-both");
+        both.write(
+            "package.json",
+            &package_json(
+                r#"
+    "./Lib": { "ply": "./dist/Lib.d.ply", "import": "./dist/Lib.js" },
+    "./Door": { "ply": "./dist/Door.d.ply", "import": "./dist/Door.js" },
+    "./App": { "ply": "./dist/App.d.ply", "import": "./dist/App.js" }
+"#,
+            ),
+        );
+        both.write("src/Lib.ply", lib);
+        both.write("src/Door.ply", "~ public \"Lib\" (Box)\n");
+        both.write(
+            "src/App.ply",
+            "~ \"Door\" (Box)\n~ \"Lib\" (Box)\n\n: id ( a. (Box a) -- (Box a) )\n  dup drop\n",
+        );
+        let error = build(&both.0).unwrap_err();
+        assert_eq!(error.message, "duplicate definition Box");
+    }
+
+    #[test]
+    fn a_published_local_import_resolves_beside_exports() {
+        let temp = Temp::new("sibling");
+        temp.write(
+            "node_modules/@algosail/door/package.json",
+            r#"{
+  "name": "@algosail/door",
+  "type": "module",
+  "ply": { "source": "src", "out": "dist", "language": 1 },
+  "exports": {
+    ".": { "ply": "./dist/Door.d.ply", "import": "./dist/Door.js" }
+  }
+}"#,
+        );
+        temp.write(
+            "node_modules/@algosail/door/dist/Door.d.ply",
+            "language 1\n~ public \"Lib\" (answer)\n",
+        );
+        temp.write(
+            "node_modules/@algosail/door/dist/Lib.d.ply",
+            "language 1\n\n: answer ( -- Num )\n",
+        );
+        temp.write(
+            "node_modules/@algosail/door/dist/Lib.js",
+            "export function answer() { return 1; }\n",
+        );
+        temp.write(
+            "node_modules/@algosail/door/dist/Door.js",
+            "export { answer } from \"./Lib.js\";\n",
+        );
+        temp.write(
+            "package.json",
+            &package_json(r#""./App": { "ply": "./dist/App.d.ply", "import": "./dist/App.js" }"#),
+        );
+        temp.write(
+            "src/App.ply",
+            "~ \"@algosail/door\" (answer)\n\n: use ( -- Num )\n  answer\n",
+        );
+        build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let js = fs::read_to_string(temp.0.join("dist/App.js")).unwrap();
+        assert!(js.contains("import { answer } from \"@algosail/door\";"), "{js}");
+        node(
+            &temp.0,
+            "import { use } from \"./dist/App.js\";\nif (use() !== 1) throw new Error(String(use()));\n",
+        );
+        temp.write(
+            "src/App.ply",
+            "~ \"@algosail/door/Lib\" (answer)\n\n: use ( -- Num )\n  answer\n",
+        );
+        let error = build(&temp.0).unwrap_err();
+        assert_eq!(error.message, "cannot resolve ~ \"@algosail/door/Lib\"");
+    }
+
+    #[test]
+    fn defaults_entry_and_a_kept_export_key() {
+        let fresh = Temp::new("defaults");
+        fresh.write(
+            "package.json",
+            "{\n  \"name\": \"fresh\",\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1 }\n}\n",
+        );
+        fresh.write("src/App.ply", ": foreign add ( Num Num -- Num )\n");
+        fresh.write(
+            "foreign/App.js",
+            "export function add(a, b) { return a + b; }\n",
+        );
+        build(&fresh.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let js = fs::read_to_string(fresh.0.join("dist/App.js")).unwrap();
+        assert!(js.contains("foreign/App.js"), "{js}");
+        assert_eq!(
+            fs::read_to_string(fresh.0.join("package.json")).unwrap(),
+            "{\n  \"name\": \"fresh\",\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1 }\n}\n"
+        );
+
+        let bare = Temp::new("no-foreign");
+        bare.write(
+            "package.json",
+            "{\n  \"ply\": { \"language\": 1 }\n}\n",
+        );
+        bare.write("src/App.ply", ": foreign add ( Num Num -- Num )\n");
+        let error = build(&bare.0).unwrap_err();
+        assert_eq!(error.code, "PL0107", "{}", error.message);
+
+        let typed = Temp::new("entry-type");
+        typed.write(
+            "package.json",
+            "{\n  \"ply\": { \"language\": 1, \"entry\": 1 }\n}\n",
+        );
+        fs::create_dir(typed.0.join("src")).unwrap();
+        let error = build(&typed.0).unwrap_err();
+        assert_eq!(error.code, "PL0123", "{}", error.message);
+
+        let missing = Temp::new("entry-missing");
+        missing.write(
+            "package.json",
+            "{\n  \"ply\": { \"language\": 1, \"entry\": \"Missing\" }\n}\n",
+        );
+        missing.write("src/App.ply", ": id ( Num -- Num )\n  dup drop\n");
+        let error = build(&missing.0).unwrap_err();
+        assert_eq!(error.code, "PL0124", "{}", error.message);
+
+        let aligned = Temp::new("entry-align");
+        let original = "{\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1, \"entry\": \"App\" },\n  \"exports\": {\n    \"./keep\": \"./keep.js\",\n    \".\": { \"ply\": \"./dist/Old.d.ply\", \"import\": \"./dist/Old.js\" },\n    \"./Old\": { \"ply\": \"./dist/Old.d.ply\", \"import\": \"./dist/Old.js\" }\n  }\n}\n";
+        aligned.write("package.json", original);
+        aligned.write("src/App.ply", ": id ( Num -- Num )\n  dup drop\n");
+        build(&aligned.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        assert_eq!(fs::read_to_string(aligned.0.join("package.json")).unwrap(), original);
+        build_exports(&aligned.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let written = fs::read_to_string(aligned.0.join("package.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let exports = value.get("exports").unwrap();
+        assert_eq!(exports.get("./keep").and_then(|item| item.as_str()), Some("./keep.js"));
+        assert_eq!(
+            exports.get(".").and_then(|item| item.get("ply")).and_then(|item| item.as_str()),
+            Some("./dist/App.d.ply"),
+            "{written}"
+        );
+        assert_eq!(
+            exports.get("./App").and_then(|item| item.get("ply")).and_then(|item| item.as_str()),
+            Some("./dist/App.d.ply"),
+            "{written}"
+        );
+        assert!(exports.get("./Old").is_none(), "{written}");
+
+        let root = Temp::new("keep-dot");
+        root.write(
+            "package.json",
+            "{\n  \"ply\": { \"language\": 1 },\n  \"exports\": {\n    \".\": { \"ply\": \"./dist/Stream.d.ply\", \"import\": \"./dist/Stream.js\" },\n    \"./Old\": { \"ply\": \"./dist/Old.d.ply\", \"import\": \"./dist/Old.js\" }\n  }\n}\n",
+        );
+        root.write("src/App.ply", ": id ( Num -- Num )\n  dup drop\n");
+        build_exports(&root.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let written = fs::read_to_string(root.0.join("package.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let exports = value.get("exports").unwrap();
+        assert_eq!(
+            exports.get(".").and_then(|item| item.get("ply")).and_then(|item| item.as_str()),
+            Some("./dist/Stream.d.ply"),
+            "{written}"
+        );
+        assert!(exports.get("./App").is_some(), "{written}");
+        assert!(exports.get("./Old").is_none(), "{written}");
+    }
+
+    #[test]
+    fn tests_import_helpers_and_source_cannot_use_a_dev_dependency() {
+        let temp = Temp::new("helpers");
+        temp.write(
+            "package.json",
+            "{\n  \"name\": \"app\",\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1 },\n  \"devDependencies\": { \"@demo/onlydev\": \"1.0.0\" }\n}\n",
+        );
+        temp.write(
+            "node_modules/@demo/onlydev/package.json",
+            "{\n  \"name\": \"@demo/onlydev\",\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1 },\n  \"exports\": {\n    \".\": { \"ply\": \"./dist/Door.d.ply\", \"import\": \"./dist/Door.js\" }\n  }\n}\n",
+        );
+        temp.write(
+            "node_modules/@demo/onlydev/dist/Door.d.ply",
+            "language 1\n\n: answer ( -- Num )\n",
+        );
+        temp.write(
+            "node_modules/@demo/onlydev/dist/Door.js",
+            "export function answer() { return 1; }\n",
+        );
+        temp.write("src/Lib.ply", ": answer ( -- Num )\n  1\n");
+        temp.write(
+            "test/Support/Session.ply",
+            "~ \"Lib\" (answer)\n\n: twice ( -- Num )\n  answer\n",
+        );
+        let pass = "\
+~ \"Support/Session\" (twice)
+~ \"@demo/onlydev\" (answer)
+
+; Verdict = Verdict ok : Bool, name : Str, text : Str
+
+: yes ( -- Verdict )
+  twice drop
+  answer drop
+  true \"\" \"\" Verdict
+";
+        temp.write("test/Pass.ply", pass);
+        temp.write(
+            "src/Bad.ply",
+            "~ \"@demo/onlydev\" (answer)\n\n: use ( -- Num )\n  answer\n",
+        );
+        let error = build(&temp.0).unwrap_err();
+        assert_eq!(error.code, "PL0121", "{}", error.message);
+        assert_eq!(error.message, "~ \"@demo/onlydev\" is a devDependency");
+        fs::remove_file(temp.0.join("src/Bad.ply")).unwrap();
+        temp.write(
+            "src/Bad.ply",
+            "~ \"Support/Session\" (twice)\n\n: use ( -- Num )\n  twice\n",
+        );
+        let error = build(&temp.0).unwrap_err();
+        assert_eq!(error.message, "cannot resolve ~ \"Support/Session\"");
+        fs::remove_file(temp.0.join("src/Bad.ply")).unwrap();
+
+        check_buffer(&temp.0.join("test/Pass.ply"), pass)
+            .unwrap_or_else(|error| panic!("{}", error.render("test/Pass.ply", pass)));
+        let blocked = "~ \"Support/Session\" (twice)\n\n: use ( -- Num )\n  twice\n";
+        let error = check_buffer(&temp.0.join("src/Lib.ply"), blocked).unwrap_err();
+        assert_eq!(error.message, "cannot resolve ~ \"Support/Session\"");
+
+        let report = crate::test_run::test_package(&temp.0, "test/**/*.ply")
+            .unwrap_or_else(|error| panic!("{}", error.render()));
+        assert!(!report.failed(), "{report:?}");
+        assert_eq!(report.files.len(), 1);
+
+        let shadow = Temp::new("shadow");
+        shadow.write(
+            "package.json",
+            "{\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1 }\n}\n",
+        );
+        shadow.write("src/Data/State.ply", ": current ( -- Num )\n  1\n");
+        shadow.write("test/Data/State.ply", ": helper ( -- Num )\n  2\n");
+        shadow.write(
+            "test/Pass.ply",
+            "\
+; Verdict = Verdict ok : Bool, name : Str, text : Str
+
+: yes ( -- Verdict )
+  true \"\" \"\" Verdict
+",
+        );
+        let error = crate::test_run::test_package(&shadow.0, "test/**/*.ply").unwrap_err();
+        assert_eq!(error.code, "PL0122", "{}", error.render());
+        assert_eq!(error.message, "test module Data/State is already a source module");
+
+        let entry = Temp::new("test-entry");
+        entry.write(
+            "package.json",
+            "{\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1 }\n}\n",
+        );
+        entry.write("src/Data/State.ply", ": current ( -- Num )\n  1\n");
+        entry.write(
+            "test/Data/State.ply",
+            "\
+~ \"Data/State\" (current)
+
+; Verdict = Verdict ok : Bool, name : Str, text : Str
+
+: reads ( -- Verdict )
+  current drop
+  true \"\" \"\" Verdict
+",
+        );
+        let report = crate::test_run::test_package(&entry.0, "test/**/*.ply")
+            .unwrap_or_else(|error| panic!("{}", error.render()));
+        assert!(!report.failed(), "{report:?}");
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.files[0].checks[0].name, "reads");
+        assert!(report.files[0].checks[0].ok);
     }
 
     fn touch_js(mark: &std::path::Path) -> String {

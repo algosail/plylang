@@ -8,7 +8,8 @@ use crate::ast::{
     method_line, scheme_string, Ctor, Data, Def, Item, Module, Scheme, Stack, StackEffect,
     StackTail, Synonym, Type,
 };
-use crate::build::{load_provider, stack_sites};
+use crate::build::{load_surface, stack_sites};
+use crate::surface::{self, Found};
 use crate::builtin;
 use crate::check::StackAt;
 use crate::lexer::tokenize;
@@ -230,25 +231,53 @@ fn imported_scheme(path: &Path, module: &Module, name: &str) -> Option<Declared>
         if !wanted {
             continue;
         }
-        let Some(provider) = load_provider(path, &import.path) else {
+        let Some((file, provider)) = load_surface(path, &import.path) else {
             continue;
         };
-        if let Some(declared) = public_scheme(&provider, name) {
+        let mut load = |from: &Path, import_path: &str| load_surface(from, import_path);
+        let Some((_, found)) = surface::lookup(&provider, &file, name, &mut load) else {
+            continue;
+        };
+        if let Some(declared) = declared_found(&found, name) {
             return Some(declared);
         }
     }
     None
 }
 
-fn public_scheme(module: &Module, name: &str) -> Option<Declared> {
-    for item in &module.items {
-        if let Item::Def(def) = item {
-            if def.name == name && !def.vis.is_private() {
-                return Some(declared_def(def));
+fn declared_found(found: &Found, name: &str) -> Option<Declared> {
+    match found {
+        Found::Def(def) if def.name == name && !def.vis.is_private() => Some(declared_def(def)),
+        Found::Data(data) => {
+            for ctor in &data.ctors {
+                if ctor.name == name {
+                    return Some(Declared {
+                        line: ctor_scheme(data, ctor),
+                        doc: data.doc.clone(),
+                    });
+                }
             }
+            if data.foreign && data.name == name {
+                return Some(Declared {
+                    line: foreign_type_line(data),
+                    doc: data.doc.clone(),
+                });
+            }
+            None
         }
+        Found::Synonym(synonym) if synonym.name == name => Some(declared_synonym(synonym)),
+        Found::Class(class) if class.name == name => Some(Declared {
+            line: format!("& {} {}", class.name, class.params.join(" ")),
+            doc: class.doc.clone(),
+        }),
+        Found::Class(class) => class.methods.iter().find(|method| method.name == name).map(|method| {
+            Declared {
+                line: method_line(class, method),
+                doc: class.doc.clone(),
+            }
+        }),
+        Found::Def(_) | Found::Synonym(_) => None,
     }
-    synonym_or_ctor(module, name)
 }
 
 fn synonym_or_ctor(module: &Module, name: &str) -> Option<Declared> {

@@ -769,7 +769,7 @@ Fix: import a public name from that module.
 
 The path is not a module of this package and not an export of another package. A missing file is the same message.
 
-Fix: check the spelling. A local module is `Data/Maybe`. A package module is the export path, such as `@algosail/example/Num`. The target must be listed in that package's `exports` with a `ply` condition. `plylang build --exports` writes those entries for the package you are building.
+Fix: check the spelling. A local module is `Data/Maybe`. A package module is the export path, such as `@algosail/example/Num`. The target must be listed in that package's `exports` with a `ply` condition. `plylang build` writes those entries for the package you are building.
 
 ## PL0093
 
@@ -829,25 +829,25 @@ Fix: correct the JSON.
 
 `package.json has no "ply" field`
 
-The compiler reads the `ply` object for the source directory, the output directory, and the language version.
+The compiler reads the `ply` object. `ply.language` is required. `source`, `out`, and `foreign` may be omitted.
 
-Fix: add `"ply": { "language": 1, "source": "src", "out": "dist" }`.
+Fix: add `"ply": { "language": 1 }`.
 
 ## PL0101
 
 `package.json ply.source must be a string`
 
-`ply.source` is the directory of `.ply` files, relative to the package root.
+When `ply.source` is present, it is the directory of `.ply` files, relative to the package root. When it is absent, that directory is `src`.
 
-Fix: set it to a string such as `"src"`.
+Fix: set it to a string such as `"src"`, or remove the field.
 
 ## PL0102
 
 `package.json ply.out must be a string`
 
-`ply.out` is the directory where `build` writes `.js` and `.d.ply`.
+When `ply.out` is present, it is the directory where `build` writes `.js` and `.d.ply`. When it is absent, that directory is `dist`.
 
-Fix: set it to a string such as `"dist"`.
+Fix: set it to a string such as `"dist"`, or remove the field.
 
 ## PL0103
 
@@ -885,9 +885,9 @@ Fix: use a third directory, usually `"foreign"`.
 
 `package.json has no "ply.foreign" field`
 
-A module declares a `foreign` word, and the package does not name a foreign directory.
+A module declares a `foreign` word, and the package has neither `ply.foreign` nor a `foreign` directory.
 
-Fix: add `"foreign": "foreign"` under `ply`.
+Fix: create `foreign`, or add `"foreign": "foreign"` under `ply`.
 
 ## PL0108
 
@@ -909,7 +909,7 @@ Fix: give the function one parameter per input, or change the signature to match
 
 `package.json must be an object`
 
-`plylang build --exports` rewrites the top-level `exports` field and found a JSON value that is not an object.
+`plylang build` rewrites the top-level `exports` field and found a JSON value that is not an object.
 
 Fix: make the top level of `package.json` an object.
 
@@ -998,3 +998,35 @@ Fix: match with `->` and read the field in the branch that has it.
 The type has one constructor, and that constructor has no field of this name. A one-field constructor such as `Effect` has no `name>>`.
 
 Fix: use the field's name, or match the one field with `->`.
+
+## PL0121
+
+`~ "PATH" is a devDependency`
+
+A module under the source directory imported a package that is listed in `devDependencies` and not in `dependencies`, `optionalDependencies`, or `peerDependencies`.
+
+Fix: move the package to `dependencies`, or import it from a file under `test/`.
+
+## PL0122
+
+`test module PATH is already a source module`
+
+A file under `test/` is a utility, and `src` already has that module path. A test entry, a public word `( -- Verdict )` or `suite`, is not a module and does not clash.
+
+Fix: rename the utility, or make the file a test entry.
+
+## PL0123
+
+`package.json ply.entry must be a string`
+
+`ply.entry` is present and is not a string. It names the module opened by a pathless package import and the `exports` key `.`.
+
+Fix: set it to a module path such as `"Stream"`, or remove the field.
+
+## PL0124
+
+`ply.entry module NAME is not in the source`
+
+`ply.entry` names a module path that is not a file under the source directory.
+
+Fix: name a module that `plylang build` compiles, or remove the field.

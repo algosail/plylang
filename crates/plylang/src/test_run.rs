@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::build::{build, compile_test_file, package_dirs, BuildError, CompiledTest};
+use crate::build::{
+    build, compile_test_file, file_is_test_entry, package_dirs, reject_shadowed_test_modules,
+    BuildError, CompiledTest,
+};
 
 const HARNESS: &str = r##"
 import { pathToFileURL } from "node:url";
@@ -254,8 +257,18 @@ pub fn test_package(start: &Path, pattern: &str) -> Result<TestReport, BuildErro
         return Err(BuildError::plain(format!("no tests matched {pattern}")));
     }
     build(&root)?;
-    let mut reports = Vec::new();
+    reject_shadowed_test_modules(&root)?;
+    let mut entries = Vec::new();
     for file in files {
+        if file_is_test_entry(&file)? {
+            entries.push(file);
+        }
+    }
+    if entries.is_empty() {
+        return Err(BuildError::plain(format!("no tests matched {pattern}")));
+    }
+    let mut reports = Vec::new();
+    for file in entries {
         reports.push(run_file(&root, &out, &file));
     }
     Ok(TestReport {
@@ -626,17 +639,13 @@ Time   12ms
         let report = super::test_package(&temp.0, "test/**/*.ply")
             .unwrap_or_else(|error| panic!("{}", error.render()));
         assert!(report.failed());
-        assert_eq!(report.files.len(), 3, "{report:?}");
+        assert_eq!(report.files.len(), 2, "{report:?}");
         let bad = &report.files[0];
         assert_eq!(bad.path, "test/Bad.ply");
         assert!(bad.checks.is_empty());
         let bad_text = bad.failure.as_deref().unwrap_or("");
         assert!(bad_text.contains("error: PL"), "{bad_text}");
-        let miss = &report.files[1];
-        assert_eq!(miss.path, "test/Miss.ply");
-        let miss_text = miss.failure.as_deref().unwrap_or("");
-        assert!(miss_text.contains("no tests"), "{miss_text}");
-        let pass = &report.files[2];
+        let pass = &report.files[1];
         assert_eq!(pass.path, "test/Pass.ply");
         assert!(pass.failure.is_none(), "{pass:?}");
         assert_eq!(pass.checks.len(), 2);
@@ -653,9 +662,8 @@ Time   12ms
         assert!(text.contains("✗ no"), "{text}");
         assert!(text.contains("no: 1 !== 2"), "{text}");
         assert!(text.contains("✗ failed to compile"), "{text}");
-        assert!(text.contains("✗ failed to run"), "{text}");
         assert!(text.contains("Tests  1 failed | 1 passed (2)"), "{text}");
-        assert!(text.contains("Files  3 failed (3)"), "{text}");
+        assert!(text.contains("Files  2 failed (2)"), "{text}");
         assert!(!temp.0.join("dist/test/Pass.js").exists());
         assert!(!temp.0.join("dist/test/Miss.js").exists());
         assert!(temp.0.join("dist/Lib.js").is_file());

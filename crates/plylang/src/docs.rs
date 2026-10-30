@@ -1,9 +1,9 @@
 //! Package documentation. The page copies declaration comments.
 //! The only words this pass adds are `Types`, `Classes`, `Instances`, and `Words`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::ast::{
     method_line, scheme_string, type_string, Class, Data, Def, Instance, Item, Module, Synonym,
@@ -55,6 +55,7 @@ fn render(package: &crate::build::Package) -> Result<String, BuildError> {
             .map_err(|error| located(&file, &source, error))?;
         pages.push(Page {
             path: module_path,
+            file,
             description,
             module,
         });
@@ -70,6 +71,7 @@ fn render(package: &crate::build::Package) -> Result<String, BuildError> {
 
 struct Page {
     path: String,
+    file: PathBuf,
     description: String,
     module: Module,
 }
@@ -117,17 +119,24 @@ fn render_page(out: &mut String, title: &str, page: &Page, seen: &mut HashMap<St
     let mut words = Vec::new();
     for item in &page.module.items {
         match item {
-            Item::Data(data) => types.push((data.name.as_str(), format_data(data), data.doc.as_str())),
-            Item::Synonym(synonym) => {
-                types.push((synonym.name.as_str(), format_synonym(synonym), synonym.doc.as_str()))
+            Item::Data(data) => {
+                types.push((data.name.clone(), format_data(data), data.doc.clone()))
             }
+            Item::Synonym(synonym) => types.push((
+                synonym.name.clone(),
+                format_synonym(synonym),
+                synonym.doc.clone(),
+            )),
             Item::Class(class) => {
-                classes.push((class.name.as_str(), format_class(class), class.doc.as_str()))
+                classes.push((class.name.clone(), format_class(class), class.doc.clone()))
             }
             Item::Instance(instance) => instances.push(instance_head(instance)),
             Item::Def(def) if def.vis.is_private() => {}
-            Item::Def(def) => words.push((def.name.as_str(), format_word(def), def.doc.as_str())),
+            Item::Def(def) => words.push((def.name.clone(), format_word(def), def.doc.clone())),
         }
+    }
+    if page.module.imports.iter().any(|import| import.publish) {
+        append_published(&page.file, &page.module, &mut types, &mut classes, &mut instances, &mut words);
     }
     render_group(out, "Types", &types, seen);
     render_group(out, "Classes", &classes, seen);
@@ -135,10 +144,64 @@ fn render_page(out: &mut String, title: &str, page: &Page, seen: &mut HashMap<St
     render_group(out, "Words", &words, seen);
 }
 
+fn append_published(
+    file: &Path,
+    module: &Module,
+    types: &mut Vec<(String, String, String)>,
+    classes: &mut Vec<(String, String, String)>,
+    instances: &mut Vec<String>,
+    words: &mut Vec<(String, String, String)>,
+) {
+    let mut load = |from: &Path, path: &str| crate::build::load_surface(from, path);
+    let names = crate::surface::public_names(module, file, &mut load);
+    let mut seen = HashSet::new();
+    for (name, _, _) in types.iter().chain(classes.iter()).chain(words.iter()) {
+        seen.insert(name.clone());
+    }
+    for name in names {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let mut load = |from: &Path, path: &str| crate::build::load_surface(from, path);
+        let Some((_, found)) = crate::surface::lookup(module, file, &name, &mut load) else {
+            continue;
+        };
+        match found {
+            crate::surface::Found::Data(data) => {
+                if types.iter().any(|(have, _, _)| have == &data.name) {
+                    continue;
+                }
+                seen.insert(data.name.clone());
+                types.push((data.name.clone(), format_data(&data), data.doc.clone()));
+            }
+            crate::surface::Found::Synonym(synonym) => {
+                types.push((synonym.name.clone(), format_synonym(&synonym), synonym.doc.clone()));
+            }
+            crate::surface::Found::Class(class) => {
+                if classes.iter().any(|(have, _, _)| have == &class.name) {
+                    continue;
+                }
+                seen.insert(class.name.clone());
+                classes.push((class.name.clone(), format_class(&class), class.doc.clone()));
+            }
+            crate::surface::Found::Def(def) => {
+                words.push((def.name.clone(), format_word(&def), def.doc.clone()));
+            }
+        }
+    }
+    let mut load = |from: &Path, path: &str| crate::build::load_surface(from, path);
+    for instance in crate::surface::instances(module, file, &mut load) {
+        let head = instance_head(&instance);
+        if !instances.iter().any(|have| have == &head) {
+            instances.push(head);
+        }
+    }
+}
+
 fn render_group(
     out: &mut String,
     title: &str,
-    items: &[(&str, String, &str)],
+    items: &[(String, String, String)],
     seen: &mut HashMap<String, usize>,
 ) {
     if items.is_empty() {
@@ -439,6 +502,27 @@ mod tests {
         let custom = temp.0.join("api.md");
         write_docs(&temp.0, Some(&custom)).unwrap_or_else(|error| panic!("{}", error.render()));
         assert_eq!(fs::read_to_string(&custom).unwrap(), EXPECTED);
+    }
+
+    #[test]
+    fn a_public_import_keeps_the_original_comment() {
+        let temp = Temp::new("door");
+        temp.write("package.json", &package_json("door"));
+        temp.write(
+            "src/Lib.ply",
+            ".. A number.\n: answer ( -- Num )\n  1\n",
+        );
+        temp.write(
+            "src/Door.ply",
+            ".. The door.\n\n~ public \"Lib\" (answer)\n",
+        );
+        write_docs(&temp.0, None).unwrap_or_else(|error| panic!("{}", error.render()));
+        let page = fs::read_to_string(temp.0.join("DOCS.md")).unwrap();
+        assert!(page.contains("## door/Door\n"), "{page}");
+        assert!(page.contains("The door."), "{page}");
+        assert!(page.contains("#### answer\n"), "{page}");
+        assert!(page.contains(": answer ( -- Num )"), "{page}");
+        assert!(page.contains("A number."), "{page}");
     }
 
     #[test]

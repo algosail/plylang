@@ -3,8 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::ast::{Clause, Item, Module, Term, TermNode};
-use crate::build::{provider_file, read_module};
+use crate::ast::{Clause, Import, Item, Module, Term, TermNode};
+use crate::build::{load_surface, provider_file, read_module};
+use crate::surface::{self, Found};
 use crate::complete::{is_import_path, name_space_at, NameSpace};
 use crate::lexer::tokenize;
 use crate::parser::parse;
@@ -17,6 +18,7 @@ pub struct Definition {
     pub span: Span,
 }
 
+#[derive(Clone, Copy)]
 enum Target {
     Type,
     Value,
@@ -131,38 +133,57 @@ fn here(path: &Path, span: Span) -> Definition {
 
 fn imported(from: &Path, module: &Module, name: &str, target: Target) -> Option<Definition> {
     for import in &module.imports {
-        let wanted = import.all || import.names.iter().any(|imported| imported == name);
-        if !wanted {
-            continue;
-        }
         let Some(file) = provider_file(from, &import.path) else {
             continue;
         };
         let Some(provider) = read_module(&file) else {
             continue;
         };
-        let span = match target {
-            Target::Type => data_span(&provider, name)
-                .or_else(|| synonym_span(&provider, name))
-                .or_else(|| class_span(&provider, name)),
-            Target::Value => exported_value(&provider, name),
+        if !import_offers(import, &provider, &file, name) {
+            continue;
+        }
+        let mut load = |start: &Path, path: &str| load_surface(start, path);
+        let Some((decl, found)) = surface::lookup(&provider, &file, name, &mut load) else {
+            continue;
         };
-        if let Some(span) = span {
-            return Some(Definition { path: file, span });
+        if let Some(span) = found_span(&found, name, target) {
+            return Some(Definition { path: decl, span });
         }
     }
     None
 }
 
-fn exported_value(module: &Module, name: &str) -> Option<Span> {
-    for item in &module.items {
-        if let Item::Def(def) = item {
-            if def.name == name && !def.vis.is_private() {
-                return Some(def.name_span);
-            }
-        }
+fn import_offers(import: &Import, provider: &Module, file: &Path, name: &str) -> bool {
+    if import.all || import.names.iter().any(|imported| imported == name) {
+        return true;
     }
-    ctor_span(module, name).or_else(|| method_span(module, name))
+    if !import.publish {
+        return false;
+    }
+    let mut load = |start: &Path, path: &str| load_surface(start, path);
+    surface::method_words(provider, file, &mut load)
+        .iter()
+        .any(|word| word == name)
+}
+
+fn found_span(found: &Found, name: &str, target: Target) -> Option<Span> {
+    match (found, target) {
+        (Found::Def(def), Target::Value) if def.name == name => Some(def.name_span),
+        (Found::Data(data), Target::Type) if data.name == name => Some(data.name_span),
+        (Found::Data(data), Target::Value) => data
+            .ctors
+            .iter()
+            .find(|ctor| ctor.name == name)
+            .map(|ctor| ctor.span),
+        (Found::Synonym(synonym), Target::Type) if synonym.name == name => Some(synonym.name_span),
+        (Found::Class(class), Target::Type) if class.name == name => Some(class.name_span),
+        (Found::Class(class), Target::Value) => class
+            .methods
+            .iter()
+            .find(|method| method.name == name)
+            .map(|method| method.name_span),
+        _ => None,
+    }
 }
 
 fn def_span(module: &Module, name: &str) -> Option<Span> {
@@ -482,6 +503,41 @@ mod tests {
         assert!(definition(&hidden, &app, 3, 2).is_none());
         let empty = "~ \"Data/Num\" ()\n\n: use ( Int -- Int )\n  add\n";
         assert!(definition(&empty, &app, 3, 2).is_none());
+    }
+
+    #[test]
+    fn a_public_import_jumps_to_the_declaring_file() {
+        let temp = Temp::new("facade");
+        temp.write(
+            "package.json",
+            "{\n  \"ply\": { \"source\": \"src\", \"out\": \"dist\", \"language\": 1 }\n}\n",
+        );
+        let lib = "\
+.. A number.
+: answer ( -- Num )
+  1
+
+.. Equal numbers.
+: eqNum ( Num Num -- Bool )
+  drop drop true
+
+& Eq a
+  eq ( a a -- Bool )
+
+# Eq Num
+  eq = eqNum
+";
+        temp.write("src/Lib.ply", lib);
+        temp.write("src/Door.ply", "~ public \"Lib\" (answer)\n");
+        let app = temp.0.join("src/App.ply");
+        let source = "~ \"Door\" (..)\n\n: use ( Num Num -- Bool )\n  eqNum\n";
+        let found = definition(&source, &app, 3, 2).unwrap();
+        assert_eq!(found.path, temp.0.join("src/Lib.ply"));
+        assert_eq!(slice(lib, found.span), "eqNum");
+        let answer = "~ \"Door\" (answer)\n\n: use ( -- Num )\n  answer\n";
+        let found = definition(&answer, &app, 3, 2).unwrap();
+        assert_eq!(found.path, temp.0.join("src/Lib.ply"));
+        assert_eq!(slice(lib, found.span), "answer");
     }
 
     #[test]

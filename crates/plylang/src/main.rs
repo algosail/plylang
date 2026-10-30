@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::io::IsTerminal;
 
 use plylang::{
-    build, build_exports, check_package, javascript_file, mode_from_path, parse, test_package,
+    build_exports, check_package, javascript_file, mode_from_path, parse, test_package,
     write_docs,
 };
 
@@ -133,11 +133,9 @@ fn build_command(mut args: impl Iterator<Item = String>) -> ExitCode {
     }
     let dir = dir.unwrap_or_else(|| ".".to_string());
     let dir = Path::new(&dir);
-    if exports {
-        finish_package(build_exports(dir))
-    } else {
-        finish_package(build(dir))
-    }
+    // `--exports` stays accepted. Both forms align `exports`.
+    let _exports = exports;
+    finish_package(build_exports(dir))
 }
 
 fn check_command(mut args: impl Iterator<Item = String>) -> ExitCode {

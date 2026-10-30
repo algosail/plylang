@@ -16,6 +16,8 @@ pub struct Import {
     pub path: String,
     pub names: Vec<String>,
     pub all: bool,
+    /// Importers of this module see the names and the instances of `path`.
+    pub publish: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -304,7 +306,11 @@ impl fmt::Display for Module {
 
 impl fmt::Display for Import {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "~ \"{}\" (", self.path)?;
+        if self.publish {
+            write!(formatter, "~ public \"{}\" (", self.path)?;
+        } else {
+            write!(formatter, "~ \"{}\" (", self.path)?;
+        }
         let mut parts = self.names.clone();
         if self.all {
             parts.push("..".to_string());

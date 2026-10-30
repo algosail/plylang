@@ -119,6 +119,7 @@ impl Parser {
     fn parse_import(&mut self) -> Result<Import, Diagnostic> {
         let start = self.cur().span;
         self.bump();
+        let publish = self.eat(&TokenKind::Public);
         let TokenKind::String(path) = self.cur().kind.clone() else {
             return Err(self.error(Error::ExpectedImportPath));
         };
@@ -151,6 +152,7 @@ impl Parser {
             path,
             names,
             all,
+            publish,
         })
     }
 
@@ -2073,6 +2075,8 @@ mod tests {
     fn import_all_prints() {
         let text = ok("~ \"Data/Either\" (..)\n\n: getName ( Str -- Str )\n  dup\n");
         assert!(text.contains("~ \"Data/Either\" (..)"), "{text}");
+        let published = ok("~ public \"Data/Scan\" (scan)\n");
+        assert!(published.contains("~ public \"Data/Scan\" (scan)"), "{published}");
         assert_eq!(
             err(
                 ": print ( Str -- ! { console } )\n  drop\n",
