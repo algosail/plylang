@@ -6,8 +6,47 @@ use crate::span::Span;
 pub struct Module {
     pub span: Span,
     pub language: Option<u32>,
+    /// What leaves this module. A source file with [`Exports::Closed`] publishes nothing.
+    pub exports: Exports,
     pub imports: Vec<Import>,
     pub items: Vec<Item>,
+}
+
+/// The names another module can import.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Exports {
+    /// Written `@ names`. A bare `@` publishes nothing.
+    List(PublicList),
+    /// No list. Nothing leaves the file. A test entry is this, and so is a
+    /// snippet checked outside a package.
+    Closed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublicList {
+    pub span: Span,
+    pub names: Vec<ExportedName>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportedName {
+    pub span: Span,
+    pub name: String,
+}
+
+impl PublicList {
+    pub fn has(&self, name: &str) -> bool {
+        self.names.iter().any(|item| item.name == name)
+    }
+}
+
+impl Exports {
+    pub fn list(&self) -> Option<&PublicList> {
+        match self {
+            Exports::List(list) => Some(list),
+            Exports::Closed => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -16,8 +55,6 @@ pub struct Import {
     pub path: String,
     pub names: Vec<String>,
     pub all: bool,
-    /// Importers of this module see the names and the instances of `path`.
-    pub publish: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -77,22 +114,14 @@ impl Ctor {
     }
 }
 
-/// `foreign` and `private` are independent. Each may be absent.
+/// `foreign` may be absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Vis {
-    pub private: bool,
     pub foreign: bool,
 }
 
 impl Vis {
-    pub const PUBLIC: Self = Self {
-        private: false,
-        foreign: false,
-    };
-
-    pub fn is_private(self) -> bool {
-        self.private
-    }
+    pub const PUBLIC: Self = Self { foreign: false };
 
     pub fn is_foreign(self) -> bool {
         self.foreign
@@ -286,6 +315,13 @@ impl fmt::Display for Module {
             writeln!(formatter, "language {version}")?;
         }
         let mut need_break = false;
+        if let Exports::List(list) = &self.exports {
+            if need_break {
+                writeln!(formatter)?;
+            }
+            writeln!(formatter, "{list}")?;
+            need_break = true;
+        }
         for import in &self.imports {
             if need_break {
                 writeln!(formatter)?;
@@ -304,13 +340,25 @@ impl fmt::Display for Module {
     }
 }
 
+impl fmt::Display for PublicList {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names = self
+            .names
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if names.is_empty() {
+            write!(formatter, "@")
+        } else {
+            write!(formatter, "@ {names}")
+        }
+    }
+}
+
 impl fmt::Display for Import {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.publish {
-            write!(formatter, "~ public \"{}\" (", self.path)?;
-        } else {
-            write!(formatter, "~ \"{}\" (", self.path)?;
-        }
+        write!(formatter, "~ \"{}\" (", self.path)?;
         let mut parts = self.names.clone();
         if self.all {
             parts.push("..".to_string());
@@ -378,9 +426,6 @@ impl fmt::Display for Def {
         write!(formatter, ": ")?;
         if self.vis.foreign {
             write!(formatter, "foreign ")?;
-        }
-        if self.vis.private {
-            write!(formatter, "private ")?;
         }
         write!(
             formatter,

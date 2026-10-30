@@ -51,6 +51,8 @@ pub enum TokenKind {
     LAngle,
     /// `>` closes an array.
     RAngle,
+    /// `@` opens the module's name list.
+    Export,
     /// Kept so error numbers stay put. The lexer does not produce this token.
     LBrace,
     /// Kept so error numbers stay put. The lexer does not produce this token.
@@ -61,8 +63,6 @@ pub enum TokenKind {
     /// Transparent type synonym.
     Type,
     Foreign,
-    Private,
-    Public,
     Class,
     Instance,
     True,
@@ -76,8 +76,6 @@ pub fn keyword(name: &str) -> Option<TokenKind> {
     Some(match name {
         "language" => TokenKind::Language,
         "foreign" => TokenKind::Foreign,
-        "private" => TokenKind::Private,
-        "public" => TokenKind::Public,
         "true" => TokenKind::True,
         "false" => TokenKind::False,
         _ => return None,

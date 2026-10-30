@@ -21,7 +21,7 @@ A signature says what a word takes and what it puts. The tail under that prefix 
 
 The body runs from left to right. A number is on the stack. `dup` copies the top. `add` takes both numbers and puts the sum.
 
-A word starts with `:`. Then `foreign` and `private` may appear, in either order and each at most once, followed by the name and the scheme in parentheses. Spaces inside the parentheses do not matter. The body may continue on the same line: `: double ( Num -- Num ) dup add`.
+A word starts with `:`. Then `foreign` may appear, followed by the name and the scheme in parentheses. Spaces inside the parentheses do not matter. The body may continue on the same line: `: double ( Num -- Num ) dup add`.
 
 A name in a scheme is one slot. `Num Num` is two slots. `Maybe a` is also two: the constructor needs an argument, and that argument is written in parentheses, `(Maybe a)`. `(Num)` is the same type as `Num`.
 
@@ -282,7 +282,7 @@ A parameter of kind `Type -> Type` writes the constructor in the head.
 
 An instance of such a class begins with `# Mapped Box`.
 
-Two classes with one head are written with a comma. An instance arrives through a direct import. It passes into the next module only when that import is `public`.
+Two classes with one head are written with a comma. An instance is not a name. Any import carries the instances of that module, and those instances pass along the next import. The word on the right of `=` stays in the file that writes `#` unless that name is also in the `@` list. The caller writes the class method.
 
 When an exported word has a constraint in its scheme, the method dictionary becomes the first argument in JavaScript.
 
@@ -290,20 +290,22 @@ When an exported word has a constraint in its scheme, the method dictionary beco
 
 One `*.ply` file is one module. The file itself has no name. The path from the source directory gives it: `src/Data/Maybe.ply` is called `Data.Maybe`. Each segment starts with a capital Latin letter.
 
-Imports stand at the beginning of the file. A path inside this package is written from the source directory. A path into another package is a package specifier. `..` in the parentheses means every public name.
-
-`public` before the path publishes that import. The next module sees the names in the parentheses, or every public name when the list is `..`, and the instances of that module. A method word of a published instance is published with it. An import without `public` still brings those instances into this file and no further.
+A module names what it publishes with one `@` list. The list may stand anywhere in the file. A name in the list leaves the file. Any other name stays in the file. The same list holds words, types, constructors, synonyms, classes, methods, and names brought in by an import. A type and its constructor share one entry when they share a name. Names are separated by commas. A bare `@` publishes nothing. A second `@` is a duplicate definition.
 
 ```ply
 ~ "Data/Maybe" (Just, Nothing, fromMaybe)
 ~ "@algosail/example/Num" (add)
+
+@ Maybe, Nothing, Just, fromMaybe
 ```
 
-`private` is visible in this file, is written into `.d.ply`, and is not exported.
+Imports stay together and come before the first `:`, `;`, `-`, `&`, or `#`. A path inside this package is written from the source directory. A path into another package is a package specifier. The parentheses name what this file uses. `..` means every published name. Writing an imported name again in the `@` list publishes it. `()` brings instances and no names.
+
+A test entry, a word `( -- Verdict )` or `suite`, is not a module and has no list. A utility under `test/` is a module and has one. A word `main` with scheme `( -- Unit )` may stay off the list. Node still runs it when it starts that file.
 
 A comment runs from `.` to the end of the line, when the dot is not inside `()`. `..` in column 0, directly above `:`, `;`, `-`, or `&`, is the text of that declaration. One space after `..` is not part of the text. A type has one text for all of its constructors. A class has one text for its name and for all of its methods. A `..` line above `#` does not attach to the declaration.
 
-A declaration stands in column 0 and starts with `:`, `;`, `-`, `&`, `#`, or `~`.
+A declaration stands in column 0 and starts with `@`, `:`, `;`, `-`, `&`, `#`, or `~`.
 
 A package is described by `package.json`.
 
@@ -321,10 +323,10 @@ A package is described by `package.json`.
 }
 ```
 
-A `foreign` word has no body. Its implementation lives in the foreign directory, and the number of JavaScript parameters matches the input length. It combines with `private`.
+A `foreign` word has no body. Its implementation lives in the foreign directory, and the number of JavaScript parameters matches the input length. Leave it out of the `@` list when it stays in this file.
 
 ```ply
-: foreign private length ( (Array a) -- Num )
+: foreign length ( (Array a) -- Num )
 ```
 
 The foreign directory is `foreign` when that directory exists, or the string `ply.foreign` when the field is set. It is required when the package has such a word. It lies inside the package and is distinct from the source directory and the output directory. The generated `.js` imports the implementation from there. Those files are not copied into `dist`. A new package writes `ply.language` and leaves `source`, `foreign`, and `out` unset: those directories are `src`, `foreign`, and `dist`. `ply.entry` names the module a pathless package import opens, and the `exports` key `.`.
@@ -340,9 +342,9 @@ plylang check --js <file>
 
 `plylang check` checks a package the same way `build` does: every file under the source directory, the imports, and `foreign`. It writes no files and does not walk `test/`. The default directory is the current one. After the same check, `plylang build` writes a `.js` file and a `.d.ply` interface into the output directory, then aligns `exports` with those modules. A key is `./` followed by the module path. When `ply.entry` is set, `.` points at that module too. `ply` points at the `.d.ply`, and `import` points at the `.js`. A key this tool does not own stays, and so does a hand-written `.` when `ply.entry` is absent. `plylang build --exports` does the same alignment. The other fields of the file stay as they were. A module of this package is imported by its path under the source directory, whether or not `exports` lists it. Another package finds the module through the `exports` entry.
 
-`plylang test` builds the package, then compiles and runs the files that match one pattern. The pattern is relative to the package root. The default is `test/**/*.ply`. `*` matches inside one path segment. `**` matches across directories. Quote the pattern so the shell does not expand `*`. A test is a public word `( -- Verdict )`. The runner calls each one in source order and uses the word as its name. A `private` word is not a test. `expect` compares two values. `pass` and `differ` build a verdict when those values have no `Showable` instance. The words live in `@plylang/test`. A file with no such word may export `suite` with scheme `( -- (Array Verdict) )` instead. A file under `test/` with neither is a utility. A test imports it by its path under `test/`, and a source file cannot. The runner does not run a utility. A source file cannot import a package that is only a `devDependency`. A test can. A file under the source directory stays where `build` wrote it. Any other test file is compiled in that package, written under the output directory for the run, and deleted afterwards. The report names each file and each check. A check also prints `file:line` of its word. A failing check prints its text under the name. One check that throws still lets the other checks run. A file that does not compile or does not run prints the diagnostic, and the other files still run. A failed check, a compile error, or a thrown suite exits 1. No file matched exits 1 with `no tests matched`. Color is used when stdout is a terminal and `NO_COLOR` is unset.
+`plylang test` builds the package, then compiles and runs the files that match one pattern. The pattern is relative to the package root. The default is `test/**/*.ply`. `*` matches inside one path segment. `**` matches across directories. Quote the pattern so the shell does not expand `*`. A test is a word `( -- Verdict )`. The runner calls each one in source order and uses the word as its name. `expect` compares two values. `pass` and `differ` build a verdict when those values have no `Showable` instance. The words live in `@plylang/test`. A file with no such word may export `suite` with scheme `( -- (Array Verdict) )` instead. A file under `test/` with neither is a utility. A test imports it by its path under `test/`, and a source file cannot. The runner does not run a utility. A source file cannot import a package that is only a `devDependency`. A test can. A file under the source directory stays where `build` wrote it. Any other test file is compiled in that package, written under the output directory for the run, and deleted afterwards. The report names each file and each check. A check also prints `file:line` of its word. A failing check prints its text under the name. One check that throws still lets the other checks run. A file that does not compile or does not run prints the diagnostic, and the other files still run. A failed check, a compile error, or a thrown suite exits 1. No file matched exits 1 with `no tests matched`. Color is used when stdout is a terminal and `NO_COLOR` is unset.
 
-A word named `main` whose scheme is `( -- Unit )` is the program of that module. It may be `private`. `build` calls it at the bottom of that module's `.js`, and only when Node started that file. `node dist/App.js` runs the program. An import of the module does not. A `package.json` script can name that file. Several modules may each have a `main`. A module without one is a library. Any other scheme on the name `main` is an error.
+A word named `main` whose scheme is `( -- Unit )` is the program of that module. It may stay off the `@` list. `build` calls it at the bottom of that module's `.js`, and only when Node started that file. `node dist/App.js` runs the program. An import of the module does not. A `package.json` script can name that file. Several modules may each have a `main`. A module without one is a library. Any other scheme on the name `main` is an error.
 
 `plylang docs` writes `DOCS.md` at the package root. `--out` names another file. A module heading is the string used to import it: the package name and the path, or only the path when there is no name. The prose comes from `..`. Inside a module the sections are `Types`, `Classes`, `Instances`, and `Words`. An empty section is left out. The name of a type, a class, or a word is a heading under its section. `Instances` is a list of `#` heads, with no comment and no method bindings.
 

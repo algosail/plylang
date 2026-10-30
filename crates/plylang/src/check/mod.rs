@@ -23,7 +23,7 @@ mod lower;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ast::{
-    Class, EffectRow, Import, Instance, Item, Lit, Module, RecordTail, Scheme, Stack,
+    Class, EffectRow, Exports, Import, Instance, Item, Lit, Module, RecordTail, Scheme, Stack,
     StackEffect, StackTail, Synonym, Term, TermNode, Type,
 };
 
@@ -573,6 +573,7 @@ impl Checker {
     }
 
     fn prepare(&mut self, module: &Module) -> Result<(), Diagnostic> {
+        self.check_export_list(module)?;
         for item in &module.items {
             match item {
                 Item::Data(data) => {
@@ -920,6 +921,7 @@ impl Checker {
                 }
             }
         }
+        self.hide_unlisted_types(known);
         let origin = known
             .first()
             .map(|known_module| known_module.origin.as_str())
@@ -946,32 +948,87 @@ impl Checker {
         known: &[KnownModule],
     ) -> Result<(), Diagnostic> {
         let Some(known_module) = known_at(known, origin) else {
-            return Err(self.error(
-                import.span,
-                Error::ImportNotExported { path: import.path.to_string(), name: name.to_string() },
-            ));
+            return Err(self.import_missing(import, name));
         };
-        if module_has_public(&known_module.module, name) {
-            return self.export_imported(&known_module.module, name, import, origin);
+        let module = &known_module.module;
+        if !name_on_surface(module, name) {
+            return Err(self.import_missing(import, name));
         }
-        for (index, child) in known_module.module.imports.iter().enumerate() {
-            if !child.publish {
-                continue;
-            }
+        if module_has_public(module, name) {
+            return self.export_imported(module, name, import, origin);
+        }
+        for (index, child) in module.imports.iter().enumerate() {
             let Some(dep) = known_module.deps.get(index) else {
                 continue;
             };
-            let offers = child.all
-                || child.names.iter().any(|have| have == name)
-                || method_words_of(dep, known).iter().any(|have| have == name);
+            let offers = child.all || child.names.iter().any(|have| have == name);
             if offers {
                 return self.export_surface_name(dep, name, import, known);
             }
         }
-        Err(self.error(
+        Err(self.import_missing(import, name))
+    }
+
+    fn import_missing(&self, import: &Import, name: &str) -> Diagnostic {
+        self.error(
             import.span,
             Error::ImportNotExported { path: import.path.to_string(), name: name.to_string() },
-        ))
+        )
+    }
+
+    /// A published scheme may name a type from the import closure. A type that
+    /// this package kept off the `@` list is not one of those.
+    fn hide_unlisted_types(&mut self, known: &[KnownModule]) {
+        let mut published = HashSet::new();
+        let mut hidden = HashSet::new();
+        for known_module in known {
+            for item in &known_module.module.items {
+                let name = match item {
+                    Item::Data(data) => data.name.clone(),
+                    Item::Synonym(synonym) => synonym.name.clone(),
+                    _ => continue,
+                };
+                if type_is_public(&known_module.module, &name) {
+                    published.insert(name);
+                } else {
+                    hidden.insert(name);
+                }
+            }
+        }
+        for name in hidden {
+            if !published.contains(&name) {
+                self.extra_arity.remove(&name);
+            }
+        }
+    }
+
+    fn check_export_list(&mut self, module: &Module) -> Result<(), Diagnostic> {
+        let Some(list) = module.exports.list() else {
+            return Ok(());
+        };
+        let mut seen = HashSet::new();
+        for item in &list.names {
+            if !seen.insert(item.name.clone()) {
+                return Err(self.error(
+                    item.span,
+                    Error::DuplicateDefinition(item.name.clone()),
+                ));
+            }
+            if crate::surface::defines(module, &item.name) || self.imported_name(&item.name) {
+                continue;
+            }
+            return Err(self.error(item.span, Error::PublicName(item.name.clone())));
+        }
+        Ok(())
+    }
+
+    fn imported_name(&self, name: &str) -> bool {
+        if self.builtin_words.contains(name) || self.builtin_types.contains(name) {
+            return false;
+        }
+        self.words.contains_key(name)
+            || self.type_arity.contains_key(name)
+            || self.visible_classes.contains(name)
     }
 
     fn export_imported(
@@ -996,16 +1053,14 @@ impl Checker {
             found = true;
         }
         if let Some(def) = find_def(provider, name) {
-            if !def.vis.is_private() {
-                let mut def = def.clone();
-                def.name_span = import.span;
-                let saved = self.relax_visibility;
-                self.relax_visibility = true;
-                let registered = self.register_def(&def);
-                self.relax_visibility = saved;
-                registered?;
-                found = true;
-            }
+            let mut def = def.clone();
+            def.name_span = import.span;
+            let saved = self.relax_visibility;
+            self.relax_visibility = true;
+            let registered = self.register_def(&def);
+            self.relax_visibility = saved;
+            registered?;
+            found = true;
         }
         if find_class_item(provider, name).is_some() {
             self.visible_classes.insert(name.to_string());
@@ -3991,7 +4046,7 @@ impl Checker {
         Ok(true)
     }
 
-    /// Instances written in `origin`, plus instances its public imports publish.
+    /// Instances written in `origin`, plus instances reached through its imports.
     fn import_instance_surface(
         &mut self,
         origin: &str,
@@ -4011,10 +4066,7 @@ impl Checker {
                 self.declare_instance(instance, &known_module.module, false, &key)?;
             }
         }
-        for (index, import) in known_module.module.imports.iter().enumerate() {
-            if !import.publish {
-                continue;
-            }
+        for (index, _) in known_module.module.imports.iter().enumerate() {
             let Some(dep) = known_module.deps.get(index) else {
                 continue;
             };
@@ -4145,16 +4197,6 @@ impl Checker {
                 .iter()
                 .find(|binding| binding.name == method.name)
                 .expect("method was checked");
-            if local {
-                if let Some(def) = find_def(module, &binding.word) {
-                    if def.vis.is_private() {
-                        return Err(self.error(
-                            binding.name_span,
-                            Error::InstanceWordPrivate(binding.word.to_string()),
-                        ));
-                    }
-                }
-            }
             let word = self.lookup_word_scheme(module, &binding.word, binding.name_span)?;
             let (context, extra) =
                 self.check_impl(class, method, &word, &head, binding.name_span)?;
@@ -4180,7 +4222,7 @@ impl Checker {
         };
         for existing in self.instances.clone() {
             if self.overlaps(&existing, &info) {
-                // A public import publishes the same instance again. A second
+                // The same instance from the same module is idempotent. A second
                 // `#` in this file is still incoherent.
                 if !local && existing.origin == info.origin {
                     return Ok(());
@@ -5398,7 +5440,22 @@ fn module_has_public(module: &Module, name: &str) -> bool {
     crate::surface::own_public_names(module).iter().any(|have| have == name)
 }
 
-/// Public names of `origin`, including names its `~ public` imports publish.
+/// `name` is on the surface an importer can ask for. A list that omits it is closed.
+fn name_on_surface(module: &Module, name: &str) -> bool {
+    match &module.exports {
+        Exports::List(list) => list.has(name),
+        Exports::Closed => false,
+    }
+}
+
+fn type_is_public(module: &Module, name: &str) -> bool {
+    match &module.exports {
+        Exports::List(list) => list.has(name),
+        Exports::Closed => false,
+    }
+}
+
+/// Names of `origin` an importer can ask for. That is the `@` list.
 fn surface_names(origin: &str, known: &[KnownModule]) -> Vec<String> {
     let mut names = Vec::new();
     let mut seen = HashSet::new();
@@ -5421,73 +5478,15 @@ fn collect_surface(
         stack.remove(origin);
         return;
     };
-    for (index, import) in known_module.module.imports.iter().enumerate() {
-        if !import.publish {
-            continue;
-        }
-        let Some(dep) = known_module.deps.get(index).map(String::as_str) else {
-            continue;
-        };
-        if import.all {
-            collect_surface(dep, known, names, seen, stack);
-        } else {
-            for name in &import.names {
-                if seen.insert(name.clone()) {
-                    names.push(name.clone());
+    match &known_module.module.exports {
+        Exports::List(list) => {
+            for item in &list.names {
+                if seen.insert(item.name.clone()) {
+                    names.push(item.name.clone());
                 }
             }
         }
-        for word in method_words_of(dep, known) {
-            if seen.insert(word.clone()) {
-                names.push(word);
-            }
-        }
-    }
-    for name in crate::surface::own_public_names(&known_module.module) {
-        if seen.insert(name.clone()) {
-            names.push(name);
-        }
-    }
-    stack.remove(origin);
-}
-
-fn method_words_of(origin: &str, known: &[KnownModule]) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut seen = HashSet::new();
-    let mut stack = HashSet::new();
-    collect_method_words(origin, known, &mut names, &mut seen, &mut stack);
-    names
-}
-
-fn collect_method_words(
-    origin: &str,
-    known: &[KnownModule],
-    names: &mut Vec<String>,
-    seen: &mut HashSet<String>,
-    stack: &mut HashSet<String>,
-) {
-    if !stack.insert(origin.to_string()) {
-        return;
-    }
-    let Some(known_module) = known_at(known, origin) else {
-        stack.remove(origin);
-        return;
-    };
-    let module = &known_module.module;
-    let public = crate::surface::own_public_names(module);
-    for word in crate::surface::own_method_words(module) {
-        if public.iter().any(|have| have == &word) && seen.insert(word.clone()) {
-            names.push(word);
-        }
-    }
-    for (index, import) in known_module.module.imports.iter().enumerate() {
-        if !import.publish {
-            continue;
-        }
-        let Some(dep) = known_module.deps.get(index).map(String::as_str) else {
-            continue;
-        };
-        collect_method_words(dep, known, names, seen, stack);
+        Exports::Closed => {}
     }
     stack.remove(origin);
 }
@@ -5849,14 +5848,8 @@ mod tests {
             "& Eq a\n  eq ( a a -- Bool )\n\n: bad ( Int -- Int )\n  dup drop\n\n# Eq Int\n  eq = bad\n",
             "type mismatch: expected Bool, found Int",
         );
-        err(
-            "& Eq a\n  eq ( a a -- Bool )\n\n: private eqInt ( Int Int -- Bool )\n  drop drop true\n\n# Eq Int\n  eq = eqInt\n",
-            "instance word eqInt is private",
-        );
-        err(
-            "& Eq a\n  eq ( a a -- Bool )\n\n: private foreign eqInt ( Int Int -- Bool )\n\n# Eq Int\n  eq = eqInt\n",
-            "instance word eqInt is private",
-        );
+        ok("& Eq a\n  eq ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  drop drop true\n\n# Eq Int\n  eq = eqInt\n");
+        ok("& Eq a\n  eq ( a a -- Bool )\n\n: foreign eqInt ( Int Int -- Bool )\n\n# Eq Int\n  eq = eqInt\n");
         err(
             "& Eq a\n  eq ( a a -- Bool )\n\n: use ( Str Str -- Bool )\n  eq\n",
             "no instance for Eq Str",
@@ -5919,12 +5912,7 @@ mod tests {
             "language 1\n: private hidden ( Int -- Int )\n",
             ParseMode::Interface,
         )
-        .unwrap();
-        check_source(
-            "language 1\n: foreign private secret ( -- Str )\n",
-            ParseMode::Interface,
-        )
-        .unwrap();
+        .unwrap_err();
     }
 
     #[test]
@@ -5977,17 +5965,17 @@ mod tests {
     #[test]
     fn a_superclass_module_is_installed_before_the_subclass() {
         let mappable = parse(
-            "& Mappable f\n  map ( a b. (f a) (a -- b) -- (f b) )\n",
+            "@ Mappable\n\n& Mappable f\n  map ( a b. (f a) (a -- b) -- (f b) )\n",
             ParseMode::Source,
         )
         .unwrap();
         let applicable = parse(
-            "~ \"Ply/Mappable\" (Mappable)\n\n& Mappable f => Applicable f\n  apply ( a b. (f a) (f (a -- b)) -- (f b) )\n",
+            "@ Applicable\n~ \"Ply/Mappable\" (Mappable)\n\n& Mappable f => Applicable f\n  apply ( a b. (f a) (f (a -- b)) -- (f b) )\n",
             ParseMode::Source,
         )
         .unwrap();
         let flat = parse(
-            "~ \"Ply/Applicable\" (Applicable)\n\n& Applicable f => Flatmappable f\n  flatmap ( a b. (f a) (a -- (f b)) -- (f b) )\n",
+            "@ Flatmappable\n~ \"Ply/Applicable\" (Applicable)\n\n& Applicable f => Flatmappable f\n  flatmap ( a b. (f a) (a -- (f b)) -- (f b) )\n",
             ParseMode::Source,
         )
         .unwrap();
@@ -6011,17 +5999,17 @@ mod tests {
     #[test]
     fn an_interface_file_installs_the_superclass_first() {
         let mappable = parse(
-            "& Mappable f\n  map ( a b. (f a) (a -- b) -- (f b) )\n",
+            "@ Mappable\n\n& Mappable f\n  map ( a b. (f a) (a -- b) -- (f b) )\n",
             ParseMode::Source,
         )
         .unwrap();
         let applicable = parse(
-            "~ \"Ply/Mappable\" (Mappable)\n\n& Mappable f => Applicable f\n  apply ( a b. (f a) (f (a -- b)) -- (f b) )\n",
+            "@ Applicable\n~ \"Ply/Mappable\" (Mappable)\n\n& Mappable f => Applicable f\n  apply ( a b. (f a) (f (a -- b)) -- (f b) )\n",
             ParseMode::Source,
         )
         .unwrap();
         let flat = parse(
-            "~ \"Ply/Applicable\" (Applicable)\n\n& Applicable f => Flatmappable f\n  flatmap ( a b. (f a) (a -- (f b)) -- (f b) )\n",
+            "@ Flatmappable\n~ \"Ply/Applicable\" (Applicable)\n\n& Applicable f => Flatmappable f\n  flatmap ( a b. (f a) (a -- (f b)) -- (f b) )\n",
             ParseMode::Source,
         )
         .unwrap();
@@ -6045,7 +6033,7 @@ mod tests {
     #[test]
     fn an_instance_word_is_not_the_imported_method() {
         let comparable = parse(
-            "& Comparable a\n  eq ( a a -- Bool )\n",
+            "@ Comparable, eq\n\n& Comparable a\n  eq ( a a -- Bool )\n",
             ParseMode::Source,
         )
         .unwrap();
@@ -6085,7 +6073,7 @@ mod tests {
     #[test]
     fn imports_are_selective() {
         let provider = parse(
-            "; Maybe a = Nothing | Just a\n\n: fromMaybe ( a. a (Maybe a) -- a )\n  Nothing ->\n  Just -> nip\n\n: private hidden ( Int -- Int )\n  dup drop\n",
+            "@ Maybe, Nothing, Just, fromMaybe\n\n; Maybe a = Nothing | Just a\n\n: fromMaybe ( a. a (Maybe a) -- a )\n  Nothing ->\n  Just -> nip\n\n: hidden ( Int -- Int )\n  dup drop\n",
             ParseMode::Source,
         )
         .unwrap();
@@ -6124,9 +6112,13 @@ mod tests {
 
     #[test]
     fn a_data_type_keeps_the_file_that_declared_it() {
-        let num = parse("; Box a = Mk one : a, two : a\n", ParseMode::Source).unwrap();
+        let num = parse(
+            "@ Box, Mk\n\n; Box a = Mk one : a, two : a\n",
+            ParseMode::Source,
+        )
+        .unwrap();
         let other = parse(
-            "; Box a = Box a\n\n: wrap ( a. a -- (Box a) )\n  Box\n",
+            "@ Box, wrap\n\n; Box a = Box a\n\n: wrap ( a. a -- (Box a) )\n  Box\n",
             ParseMode::Source,
         )
         .unwrap();
@@ -6155,7 +6147,11 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.message, "duplicate definition Box");
 
-        let twin = parse("; Box a = Mk one : a, two : a\n", ParseMode::Source).unwrap();
+        let twin = parse(
+            "@ Box, Mk\n\n; Box a = Mk one : a, two : a\n",
+            ParseMode::Source,
+        )
+        .unwrap();
         let known_twin = vec![super::KnownModule::new("Twin.ply".to_string(), twin.clone())];
         let again = parse(
             "~ \"Num\" (Box)\n~ \"Twin\" (Box)\n\n: id ( Int -- Int )\n  dup drop\n",
@@ -6342,7 +6338,7 @@ mod tests {
     #[test]
     fn imports_publish_synonym_names() {
         let provider = parse(
-            "; Person = Person name : Str, age : Num\n- Human Person\n\n: older ( Human -- Human )\n  37 >>age\n",
+            "@ Person, Human, older\n\n; Person = Person name : Str, age : Num\n- Human Person\n\n: older ( Human -- Human )\n  37 >>age\n",
             ParseMode::Source,
         )
         .unwrap();

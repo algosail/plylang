@@ -247,7 +247,7 @@ fn imported_scheme(path: &Path, module: &Module, name: &str) -> Option<Declared>
 
 fn declared_found(found: &Found, name: &str) -> Option<Declared> {
     match found {
-        Found::Def(def) if def.name == name && !def.vis.is_private() => Some(declared_def(def)),
+        Found::Def(def) if def.name == name => Some(declared_def(def)),
         Found::Data(data) => {
             for ctor in &data.ctors {
                 if ctor.name == name {

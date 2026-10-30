@@ -19,7 +19,7 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 
 use crate::anf::{js_ident, referenced_words, AnfModule};
-use crate::ast::{scheme_string, Def, Import, Item, Module, StackTail, Type};
+use crate::ast::{scheme_string, push_doc, Def, Exports, Import, Item, Module, StackTail, Type};
 use crate::check::{
     check, check_with_imports_key, collect_sites, collect_sites_with_imports_key, KnownModule,
     ResolvedImport, StackAt,
@@ -273,7 +273,7 @@ pub(crate) fn compile_test_file(root: &Path, file: &Path) -> Result<CompiledTest
     })
 }
 
-/// A test is a public word that takes nothing and returns `Verdict`.
+/// A test is a word that takes nothing and returns `Verdict`.
 fn test_words(module: &Module, source: &str) -> Vec<TestWord> {
     module
         .items
@@ -282,7 +282,7 @@ fn test_words(module: &Module, source: &str) -> Vec<TestWord> {
             let Item::Def(def) = item else {
                 return None;
             };
-            if def.vis.is_private() || def.vis.is_foreign() || !bare_verdict(def) {
+            if def.vis.is_foreign() || !bare_verdict(def) {
                 return None;
             }
             let (line, _) = line_col(source, def.name_span.start);
@@ -931,6 +931,9 @@ impl Session {
             })
             .collect();
         let module = self.units[id].module.clone();
+        if self.unit_needs_public(id) && matches!(module.exports, Exports::Closed) {
+            return Err(self.fail(id, module.span, Error::MissingPublicList));
+        }
         let key = module_key_of(
             &self.units[id].package_root,
             self.units[id].module_path.as_deref(),
@@ -1018,23 +1021,171 @@ impl Session {
         Ok(())
     }
 
+    fn unit_needs_public(&self, id: usize) -> bool {
+        if self.units[id].kind == Kind::External {
+            return false;
+        }
+        let path = &self.units[id].path;
+        if path_under(&self.package.source, path) {
+            return true;
+        }
+        importer_in_test(&self.package, path) && !is_test_entry(&self.units[id].module)
+    }
+
     fn js_header(&self, id: usize, from_js: &Path, anf: &AnfModule) -> String {
+        if matches!(self.units[id].module.exports, Exports::List(_)) {
+            return self.list_js_header(id, from_js, anf);
+        }
+        self.closed_js_header(id, from_js, anf)
+    }
+
+    /// A `@` list. A name from an import is re-exported when the body does
+    /// not mention it. A mentioned name is imported and exported as a binding.
+    /// An instance word is imported from the module that defines it.
+    fn list_js_header(&self, id: usize, from_js: &Path, anf: &AnfModule) -> String {
+        let listed: HashSet<String> = self.units[id]
+            .module
+            .exports
+            .list()
+            .expect("name list")
+            .names
+            .iter()
+            .map(|item| item.name.clone())
+            .collect();
+        let imports = self.units[id].module.imports.clone();
+        let deps = self.units[id].deps.clone();
+        let local = local_runtime_names(&self.units[id].module);
+        let referenced: HashSet<String> = referenced_words(anf).into_iter().collect();
         let mut groups: Vec<(String, Vec<String>)> = Vec::new();
         let mut reexports: Vec<(String, Vec<String>)> = Vec::new();
+        let mut local_exports: Vec<String> = Vec::new();
+        for (import, dep) in imports.iter().zip(&deps) {
+            let brought = self.imported_values(*dep, import);
+            if brought.is_empty() {
+                continue;
+            }
+            let Some(spec) = self.import_spec(import, *dep, from_js) else {
+                continue;
+            };
+            let mut local_names = Vec::new();
+            let mut reexport_names = Vec::new();
+            for name in brought {
+                if listed.contains(&name) && !referenced.contains(&name) {
+                    reexport_names.push(name);
+                } else {
+                    if listed.contains(&name) && !local_exports.contains(&name) {
+                        local_exports.push(name.clone());
+                    }
+                    local_names.push(name);
+                }
+            }
+            if !local_names.is_empty() {
+                push_group(&mut groups, spec.clone(), local_names);
+            }
+            if !reexport_names.is_empty() {
+                push_group(&mut reexports, spec, reexport_names);
+            }
+        }
+        let mut extra: Vec<String> = referenced
+            .iter()
+            .filter(|name| !local.contains(*name))
+            .cloned()
+            .collect();
+        extra.sort();
+        extra.dedup();
+        for name in extra {
+            if groups.iter().any(|(_, names)| names.iter().any(|have| have == &name)) {
+                continue;
+            }
+            let Some(spec) = self.spec_for_extra(id, &name, from_js, &imports, &deps) else {
+                continue;
+            };
+            push_group(&mut groups, spec, vec![name.clone()]);
+            if listed.contains(&name) && !local_exports.contains(&name) {
+                local_exports.push(name);
+            }
+        }
+        let mut header = String::new();
+        for (spec, names) in &groups {
+            header.push_str(&import_line(spec, names));
+            header.push('\n');
+        }
+        let sibling = self.foreign_js(id);
+        header.push_str(&foreign_header(&self.units[id].module, sibling, from_js));
+        if !local_exports.is_empty() {
+            let exported = local_exports
+                .iter()
+                .map(|name| export_binding(name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            header.push_str(&format!("export {{ {exported} }};\n"));
+        }
+        for (spec, names) in &reexports {
+            header.push_str(&reexport_line(spec, names));
+            header.push('\n');
+        }
+        header
+    }
+
+    fn spec_for_extra(
+        &self,
+        id: usize,
+        name: &str,
+        from_js: &Path,
+        imports: &[Import],
+        deps: &[usize],
+    ) -> Option<String> {
+        for (import, dep) in imports.iter().zip(deps) {
+            if self.value_surface(*dep).iter().any(|have| have == name) {
+                return self.import_spec(import, *dep, from_js);
+            }
+        }
+        let home = self.instance_home(name)?;
+        if home == id {
+            return None;
+        }
+        self.unit_js_spec(home, from_js)
+    }
+
+    /// The module that defines `name` and binds it in `#`.
+    fn instance_home(&self, name: &str) -> Option<usize> {
+        self.units.iter().position(|unit| {
+            let defines = unit.module.items.iter().any(|item| {
+                matches!(item, Item::Def(def) if def.name == name)
+            });
+            defines
+                && crate::surface::own_method_words(&unit.module)
+                    .iter()
+                    .any(|word| word == name)
+        })
+    }
+
+    fn unit_js_spec(&self, id: usize, from_js: &Path) -> Option<String> {
+        let unit = &self.units[id];
+        let module_path = unit.module_path.as_deref().unwrap_or("");
+        if unit.package_root == self.package.root {
+            if module_path.is_empty() {
+                return None;
+            }
+            let to_js = self.package.out.join(module_path).with_extension("js");
+            return Some(relative_specifier(from_js, &to_js));
+        }
+        let name = npm_name(&unit.package_root)?;
+        if module_path.is_empty() {
+            Some(name)
+        } else {
+            Some(format!("{name}/{module_path}"))
+        }
+    }
+
+    /// A file with no name list. Test entries are this. Imports are used here
+    /// and are not re-exported. Every local word is a JavaScript export, so the
+    /// runner can call it.
+    fn closed_js_header(&self, id: usize, from_js: &Path, anf: &AnfModule) -> String {
+        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
         let imports = self.units[id].module.imports.clone();
         let deps = self.units[id].deps.clone();
         for (import, dep) in imports.iter().zip(&deps) {
-            if import.publish {
-                let names = self.reexport_names(*dep, import);
-                if names.is_empty() {
-                    continue;
-                }
-                let Some(spec) = self.import_spec(import, *dep, from_js) else {
-                    continue;
-                };
-                push_group(&mut reexports, spec, names);
-                continue;
-            }
             let names = self.imported_values(*dep, import);
             if names.is_empty() {
                 continue;
@@ -1055,16 +1206,10 @@ impl Session {
             if groups.iter().any(|(_, names)| names.iter().any(|have| have == &name)) {
                 continue;
             }
-            for (import, dep) in imports.iter().zip(&deps) {
-                if !self.value_surface(*dep).iter().any(|have| have == &name) {
-                    continue;
-                }
-                let Some(spec) = self.import_spec(import, *dep, from_js) else {
-                    continue;
-                };
-                push_group(&mut groups, spec, vec![name]);
-                break;
-            }
+            let Some(spec) = self.spec_for_extra(id, &name, from_js, &imports, &deps) else {
+                continue;
+            };
+            push_group(&mut groups, spec, vec![name]);
         }
         let mut header = String::new();
         for (spec, names) in &groups {
@@ -1088,15 +1233,11 @@ impl Session {
                 header.push_str(&format!("export {{ {exported} }};\n"));
             }
         }
-        for (spec, names) in &reexports {
-            header.push_str(&reexport_line(spec, names));
-            header.push('\n');
-        }
         header
     }
 
-    /// Values this module publishes: its own, the values a `~ public` import
-    /// selects, and method words that are public values.
+    /// Values this module publishes: its own, and imported values named again
+    /// in the `@` list.
     fn value_surface(&self, id: usize) -> Vec<String> {
         let mut names = Vec::new();
         let mut seen = HashSet::new();
@@ -1115,65 +1256,39 @@ impl Session {
         if !stack.insert(id) {
             return;
         }
+        let exports = self.units[id].module.exports.clone();
         let imports = self.units[id].module.imports.clone();
         let deps = self.units[id].deps.clone();
-        for (import, dep) in imports.iter().zip(&deps) {
-            if !import.publish {
-                continue;
-            }
-            if import.all {
-                self.collect_values(*dep, names, seen, stack);
-            } else {
-                let mut child = Vec::new();
-                let mut child_seen = HashSet::new();
-                self.collect_values(*dep, &mut child, &mut child_seen, stack);
-                for name in &import.names {
-                    if child.iter().any(|have| have == name) {
-                        push_unique(names, seen, name.clone());
+        let own = crate::surface::own_public_values(&self.units[id].module);
+        match &exports {
+            Exports::List(list) => {
+                let listed: HashSet<String> =
+                    list.names.iter().map(|item| item.name.clone()).collect();
+                for name in own {
+                    push_unique(names, seen, name);
+                }
+                for (import, dep) in imports.iter().zip(&deps) {
+                    let mut child = Vec::new();
+                    let mut child_seen = HashSet::new();
+                    self.collect_values(*dep, &mut child, &mut child_seen, stack);
+                    let offered: Vec<String> = if import.all {
+                        child
+                    } else {
+                        import
+                            .names
+                            .iter()
+                            .filter(|name| child.iter().any(|have| have == *name))
+                            .cloned()
+                            .collect()
+                    };
+                    for name in offered {
+                        if listed.contains(&name) {
+                            push_unique(names, seen, name);
+                        }
                     }
                 }
             }
-            for word in self.method_values(*dep) {
-                push_unique(names, seen, word);
-            }
-        }
-        for name in crate::surface::own_public_values(&self.units[id].module) {
-            push_unique(names, seen, name);
-        }
-        stack.remove(&id);
-    }
-
-    fn method_values(&self, id: usize) -> Vec<String> {
-        let mut names = Vec::new();
-        let mut seen = HashSet::new();
-        let mut stack = HashSet::new();
-        self.collect_method_values(id, &mut names, &mut seen, &mut stack);
-        names
-    }
-
-    fn collect_method_values(
-        &self,
-        id: usize,
-        names: &mut Vec<String>,
-        seen: &mut HashSet<String>,
-        stack: &mut HashSet<usize>,
-    ) {
-        if !stack.insert(id) {
-            return;
-        }
-        let public = crate::surface::own_public_values(&self.units[id].module);
-        let words = crate::surface::own_method_words(&self.units[id].module);
-        for word in words {
-            if public.iter().any(|have| have == &word) {
-                push_unique(names, seen, word);
-            }
-        }
-        let imports = self.units[id].module.imports.clone();
-        let deps = self.units[id].deps.clone();
-        for (import, dep) in imports.iter().zip(&deps) {
-            if import.publish {
-                self.collect_method_values(*dep, names, seen, stack);
-            }
+            Exports::Closed => {}
         }
         stack.remove(&id);
     }
@@ -1189,27 +1304,6 @@ impl Session {
             .filter(|name| surface.iter().any(|have| have == *name))
             .cloned()
             .collect()
-    }
-
-    fn reexport_names(&self, dep: usize, import: &Import) -> Vec<String> {
-        let surface = self.value_surface(dep);
-        let mut names = Vec::new();
-        let mut seen = HashSet::new();
-        if import.all {
-            for name in surface {
-                push_unique(&mut names, &mut seen, name);
-            }
-        } else {
-            for name in &import.names {
-                if surface.iter().any(|have| have == name) {
-                    push_unique(&mut names, &mut seen, name.clone());
-                }
-            }
-        }
-        for word in self.method_values(dep) {
-            push_unique(&mut names, &mut seen, word);
-        }
-        names
     }
 
     /// `src/Ply/Int.ply` is implemented by `foreign/Ply/Int.js`.
@@ -1547,7 +1641,21 @@ impl OpenDoc {
             &self.units[0].package_root,
             self.units[0].module_path.as_deref(),
         );
+        if self.buffer_needs_public() && matches!(self.units[0].module.exports, Exports::Closed) {
+            return Err(Diagnostic::new(
+                self.units[0].module.span,
+                Error::MissingPublicList,
+            ));
+        }
         check_with_imports_key(&self.units[0].module, &resolved, &key).map(|_| ())
+    }
+
+    fn buffer_needs_public(&self) -> bool {
+        let path = &self.units[0].path;
+        if path_under(&self.package.source, path) {
+            return true;
+        }
+        importer_in_test(&self.package, path) && !is_test_entry(&self.units[0].module)
     }
 
     fn sites(&self) -> Vec<StackAt> {
@@ -2341,7 +2449,7 @@ fn path_under(dir: &Path, file: &Path) -> bool {
 }
 
 enum TestRole {
-    /// Public `( -- Verdict )` or public `suite`. Not a module.
+    /// `( -- Verdict )` or `suite`. Not a module.
     Entry,
     /// A module only a test can import.
     Utility,
@@ -2362,15 +2470,12 @@ fn role_of_source(source: &str) -> TestRole {
     }
 }
 
-/// A test entry is a public `( -- Verdict )` or a public word named `suite`.
+/// A test entry is a word `( -- Verdict )` or a word named `suite`.
 fn is_test_entry(module: &Module) -> bool {
     module.items.iter().any(|item| {
         let Item::Def(def) = item else {
             return false;
         };
-        if def.vis.is_private() {
-            return false;
-        }
         def.name == "suite" || (!def.vis.is_foreign() && bare_verdict(def))
     })
 }
@@ -2610,6 +2715,63 @@ fn file_label(path: &Path) -> String {
 }
 
 fn interface_text(module: &Module) -> String {
+    let Exports::List(list) = &module.exports else {
+        return closed_interface(module);
+    };
+    let mut out = String::from("language 1\n\n");
+    out.push_str(&list.to_string());
+    out.push('\n');
+    for import in &module.imports {
+        out.push('\n');
+        out.push_str(&import.to_string());
+        out.push('\n');
+    }
+    for item in &module.items {
+        if !interface_keeps(module, item) {
+            continue;
+        }
+        out.push('\n');
+        match item {
+            Item::Def(def) => push_interface_def(&mut out, def),
+            other => {
+                out.push_str(&other.to_string());
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+fn interface_keeps(module: &Module, item: &Item) -> bool {
+    let Some(list) = module.exports.list() else {
+        return true;
+    };
+    match item {
+        Item::Data(data) => {
+            list.has(&data.name) || data.ctors.iter().any(|ctor| list.has(&ctor.name))
+        }
+        Item::Synonym(synonym) => list.has(&synonym.name),
+        Item::Def(def) => crate::surface::js_exports_def(module, def),
+        Item::Class(class) => {
+            list.has(&class.name) || class.methods.iter().any(|method| list.has(&method.name))
+        }
+        Item::Instance(_) => true,
+    }
+}
+
+fn push_interface_def(out: &mut String, def: &Def) {
+    push_doc(out, &def.doc);
+    out.push_str(": ");
+    if def.vis.is_foreign() {
+        out.push_str("foreign ");
+    }
+    out.push_str(&def.name);
+    out.push_str(" ( ");
+    out.push_str(&scheme_string(&def.scheme));
+    out.push_str(" )\n");
+}
+
+fn closed_interface(module: &Module) -> String {
     let mut out = String::from("language 1\n");
     for import in &module.imports {
         out.push_str(&import.to_string());
@@ -2629,13 +2791,10 @@ fn interface_text(module: &Module) -> String {
             }
             Item::Def(def) => {
                 out.push('\n');
-                crate::ast::push_doc(&mut out, &def.doc);
+                push_doc(&mut out, &def.doc);
                 out.push_str(": ");
                 if def.vis.is_foreign() {
                     out.push_str("foreign ");
-                }
-                if def.vis.is_private() {
-                    out.push_str("private ");
                 }
                 out.push_str(&def.name);
                 out.push_str(" ( ");
@@ -2655,6 +2814,41 @@ fn interface_text(module: &Module) -> String {
         }
     }
     out
+}
+
+fn foreign_header(module: &Module, sibling: Option<PathBuf>, from_js: &Path) -> String {
+    let foreign = foreign_names(module);
+    if foreign.is_empty() {
+        return String::new();
+    }
+    let Some(sibling) = sibling else {
+        return String::new();
+    };
+    let spec = relative_specifier(from_js, &sibling);
+    let names: Vec<String> = foreign.iter().map(|(name, _)| name.clone()).collect();
+    let mut header = import_line(&spec, &names);
+    header.push('\n');
+    let exported = foreign
+        .iter()
+        .filter(|(_, hidden)| !hidden)
+        .map(|(name, _)| export_binding(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !exported.is_empty() {
+        header.push_str(&format!("export {{ {exported} }};\n"));
+    }
+    header
+}
+
+fn npm_name(root: &Path) -> Option<String> {
+    let text = fs::read_to_string(root.join("package.json")).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let name = value.get("name")?.as_str()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 fn local_runtime_names(module: &Module) -> HashSet<String> {
@@ -2681,7 +2875,7 @@ fn foreign_names(module: &Module) -> Vec<(String, bool)> {
         .iter()
         .filter_map(|item| match item {
             Item::Def(def) if def.vis.is_foreign() => {
-                Some((def.name.clone(), def.vis.is_private()))
+                Some((def.name.clone(), !crate::surface::js_exports_def(module, def)))
             }
             _ => None,
         })
@@ -2816,7 +3010,7 @@ fn entry_def(module: &Module) -> Option<&Def> {
     })
 }
 
-/// `( -- Unit )`, including a private word. No constraints, no effects, no inputs.
+/// `( -- Unit )`, including a word left off the `@` list. No constraints, no effects, no inputs.
 fn accepts_entry(def: &Def) -> bool {
     let scheme = &def.scheme;
     if !scheme.constraints.is_empty() || scheme.effect.effects.is_some() {
@@ -3247,8 +3441,11 @@ mod tests {
                 r#""./Data/Maybe": { "ply": "./dist/Data/Maybe.d.ply", "import": "./dist/Data/Maybe.js" }"#,
             ),
         );
-        temp.write("src/Data/Maybe.ply", "; Maybe a = Nothing | Just a\n");
-        let source = "~ \"Data/Maybe\" (Maybe, Just)\n\n: wrap ( a. a -- (Maybe a) )\n  Just\n";
+        temp.write(
+            "src/Data/Maybe.ply",
+            "@ Maybe, Nothing, Just\n\n; Maybe a = Nothing | Just a\n",
+        );
+        let source = "@ wrap\n~ \"Data/Maybe\" (Maybe, Just)\n\n: wrap ( a. a -- (Maybe a) )\n  Just\n";
         temp.write("src/App.ply", source);
         let path = temp.0.join("src/App.ply");
         super::check_buffer(&path, source).unwrap_or_else(|error| {
@@ -3326,8 +3523,8 @@ mod tests {
                 r#""./App": { "ply": "./dist/App.d.ply", "import": "./dist/App.js" }"#,
             ),
         );
-        temp.write("src/App.ply", ": id ( Int -- Int )\n  dup drop\n");
-        temp.write("src/Broken.ply", ": bad ( Int -- Int )\n  \"no\"\n");
+        temp.write("src/App.ply", "@ id\n\n: id ( Int -- Int )\n  dup drop\n");
+        temp.write("src/Broken.ply", "@ bad\n\n: bad ( Int -- Int )\n  \"no\"\n");
         let app = temp.0.join("src/App.ply");
         let js = super::javascript_file(&app).unwrap_or_else(|error| panic!("{}", error.render()));
         assert!(!temp.0.join("dist").exists());
@@ -3355,10 +3552,10 @@ mod tests {
         temp.write("package.json", original);
         temp.write(
             "src/App.ply",
-            "~ \"Data/Num\" (add)\n\n: twice ( Int -- Int )\n  dup add\n",
+            "@ twice\n~ \"Data/Num\" (add)\n\n: twice ( Int -- Int )\n  dup add\n",
         );
-        temp.write("src/Data/Num.ply", ": add ( Int Int -- Int )\n  drop\n");
-        temp.write("src/Hidden.ply", ": private step ( Int -- Int )\n  dup drop\n");
+        temp.write("src/Data/Num.ply", "@ add\n\n: add ( Int Int -- Int )\n  drop\n");
+        temp.write("src/Hidden.ply", "@\n\n: step ( Int -- Int )\n  dup drop\n");
         build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         assert_eq!(fs::read_to_string(temp.0.join("package.json")).unwrap(), original);
         assert!(temp.0.join("dist/Data/Num.js").is_file());
@@ -3376,7 +3573,7 @@ mod tests {
         let fresh = Temp::new("exports-fresh");
         let bare = "{\n  \"name\": \"@algosail/shelf\",\n  \"ply\": { \"source\": \"src\", \"out\": \"out\", \"language\": 1 }\n}\n";
         fresh.write("package.json", bare);
-        fresh.write("src/Age.ply", ": older ( Int -- Int )\n  dup drop\n");
+        fresh.write("src/Age.ply", "@ older\n\n: older ( Int -- Int )\n  dup drop\n");
         build_exports(&fresh.0).unwrap_or_else(|error| panic!("{}", error.render()));
         assert_eq!(
             fs::read_to_string(fresh.0.join("package.json")).unwrap(),
@@ -3399,7 +3596,7 @@ mod tests {
         let broken = Temp::new("exports-broken");
         let untouched = "{\n  \"ply\": { \"source\": \"src\", \"out\": \"dist\", \"language\": 1 }\n}\n";
         broken.write("package.json", untouched);
-        broken.write("src/Bad.ply", ": bad ( Int -- Int )\n  \"no\"\n");
+        broken.write("src/Bad.ply", "@ bad\n\n: bad ( Int -- Int )\n  \"no\"\n");
         build_exports(&broken.0).unwrap_err();
         assert_eq!(fs::read_to_string(broken.0.join("package.json")).unwrap(), untouched);
         assert!(!broken.0.join("dist").exists());
@@ -3490,7 +3687,7 @@ mod tests {
             "package.json",
             "{\n  \"name\": \"\\ud83d\\ude00\",\n  \"ply\": { \"source\": \"src\", \"out\": \"dist\", \"language\": 1 }\n}\n",
         );
-        emoji.write("src/App.ply", ": id ( Int -- Int )\n  dup drop\n");
+        emoji.write("src/App.ply", "@ id\n\n: id ( Int -- Int )\n  dup drop\n");
         build_exports(&emoji.0).unwrap_or_else(|error| panic!("{}", error.render()));
         let written = fs::read_to_string(emoji.0.join("package.json")).unwrap();
         assert!(written.contains("\\ud83d\\ude00"), "{written}");
@@ -3500,7 +3697,7 @@ mod tests {
             "package.json",
             "{\n  \"ply\": { \"source\": \"src\", \"out\": \"dist\", \"language\": 1 },\n  \"exports\": { \"./Old\": { \"ply\": \"./dist/Old.d.ply\", \"import\": \"./dist/Old.js\" } },\n  \"name\": \"shelf\",\n  \"exports\": { \"./Older\": { \"ply\": \"./dist/Older.d.ply\", \"import\": \"./dist/Older.js\" } }\n}\n",
         );
-        last.write("src/App.ply", ": id ( Int -- Int )\n  dup drop\n");
+        last.write("src/App.ply", "@ id\n\n: id ( Int -- Int )\n  dup drop\n");
         build_exports(&last.0).unwrap_or_else(|error| panic!("{}", error.render()));
         let written = fs::read_to_string(last.0.join("package.json")).unwrap();
         assert!(written.contains("./Old"), "{written}");
@@ -3529,14 +3726,17 @@ mod tests {
 "#,
             ),
         );
-        temp.write("src/Data/Num.ply", "; Box a = Mk one : a, two : a\n");
+        temp.write(
+            "src/Data/Num.ply",
+            "@ Box, Mk\n\n; Box a = Mk one : a, two : a\n",
+        );
         temp.write(
             "src/Data/Other.ply",
-            "; Box a = Box a\n\n: wrap ( a. a -- (Box a) )\n  Box\n",
+            "@ Box, wrap\n\n; Box a = Box a\n\n: wrap ( a. a -- (Box a) )\n  Box\n",
         );
         temp.write(
             "src/App.ply",
-            "~ \"Data/Num\" (Mk)\n~ \"Data/Other\" (wrap)\n\n: id ( Int -- Int )\n  dup drop\n",
+            "@ id\n~ \"Data/Num\" (Mk)\n~ \"Data/Other\" (wrap)\n\n: id ( Int -- Int )\n  dup drop\n",
         );
         let error = build(&temp.0).unwrap_err();
         assert_eq!(error.message, "duplicate definition Box");
@@ -3551,10 +3751,13 @@ mod tests {
 "#,
             ),
         );
-        again.write("src/Data/Num.ply", "; Box a = Mk one : a, two : a\n");
+        again.write(
+            "src/Data/Num.ply",
+            "@ Box, Mk\n\n; Box a = Mk one : a, two : a\n",
+        );
         again.write(
             "src/App.ply",
-            "~ \"Data/Num\" (Box)\n~ \"Data/Num\" (Mk)\n\n: pair ( a. a a -- (Box a) )\n  Mk\n",
+            "@ pair\n~ \"Data/Num\" (Box)\n~ \"Data/Num\" (Mk)\n\n: pair ( a. a a -- (Box a) )\n  Mk\n",
         );
         build(&again.0).unwrap_or_else(|error| panic!("{}", error.render()));
     }
@@ -3568,7 +3771,10 @@ mod tests {
                 r#""./Data/Num": { "ply": "./dist/Data/Num.d.ply", "import": "./dist/Data/Num.js" }"#,
             ),
         );
-        temp.write("src/Data/Num.ply", ": foreign add ( Int Int -- Int )\n");
+        temp.write(
+            "src/Data/Num.ply",
+            "@ add\n\n: foreign add ( Int Int -- Int )\n",
+        );
         let error = build(&temp.0).unwrap_err();
         assert_eq!(error.code, "PL0112", "{}", error.message);
         assert!(error.message.contains("foreign/Data/Num.js"), "{}", error.message);
@@ -3614,7 +3820,7 @@ mod tests {
         );
         temp.write(
             "node_modules/@algosail/a/dist/Data/Num.d.ply",
-            "language 1\n: foreign add ( (Int) (Int) -- Int )\n",
+            "language 1\n\n@ add\n\n: foreign add ( (Int) (Int) -- Int )\n",
         );
         temp.write(
             "node_modules/@algosail/a/dist/Data/Num.js",
@@ -3628,7 +3834,7 @@ mod tests {
         );
         temp.write(
             "src/App.ply",
-            "~ \"@algosail/a/Data/Num\" (add)\n\n: twice ( Int -- Int )\n  dup add\n",
+            "@ twice\n~ \"@algosail/a/Data/Num\" (add)\n\n: twice ( Int -- Int )\n  dup add\n",
         );
         build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         let js = fs::read_to_string(temp.0.join("dist/App.js")).unwrap();
@@ -3666,15 +3872,15 @@ mod tests {
         );
         temp.write(
             "node_modules/@algosail/cls/dist/Mappable.d.ply",
-            "language 1\n\n& Mappable f\n  map ( a b. (f a) (a -- b) -- (f b) )\n",
+            "language 1\n\n@ Mappable, map\n\n& Mappable f\n  map ( a b. (f a) (a -- b) -- (f b) )\n",
         );
         temp.write(
             "node_modules/@algosail/cls/dist/Applicable.d.ply",
-            "language 1\n~ \"Mappable\" (Mappable)\n\n& Mappable f => Applicable f\n  apply ( a b. (f a) (f (a -- b)) -- (f b) )\n",
+            "language 1\n\n@ Applicable, apply\n\n~ \"Mappable\" (Mappable)\n\n& Mappable f => Applicable f\n  apply ( a b. (f a) (f (a -- b)) -- (f b) )\n",
         );
         temp.write(
             "node_modules/@algosail/cls/dist/Wrappable.d.ply",
-            "language 1\n~ \"Applicable\" (Applicable)\n\n& Applicable f => Wrappable f\n  wrap ( a -- (f a) )\n",
+            "language 1\n\n@ Wrappable, wrap\n\n~ \"Applicable\" (Applicable)\n\n& Applicable f => Wrappable f\n  wrap ( a -- (f a) )\n",
         );
         temp.write(
             "package.json",
@@ -3684,7 +3890,7 @@ mod tests {
         );
         temp.write(
             "src/App.ply",
-            "~ \"@algosail/cls/Wrappable\" (Wrappable, wrap)\n\n: use ( f a. Wrappable f => a -- (f a) )\n  wrap\n",
+            "@ use\n~ \"@algosail/cls/Wrappable\" (Wrappable, wrap)\n\n: use ( f a. Wrappable f => a -- (f a) )\n  wrap\n",
         );
         check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
     }
@@ -3703,7 +3909,7 @@ mod tests {
         );
         temp.write(
             "src/Data/Num.ply",
-            ".. Add two integers.\n: add ( (Int) (Int) -- Int )\n  iadd\n\n: foreign iadd ( Int Int -- Int )\n\n.. secret\n: private hidden ( Int -- Int )\n  dup drop\n",
+            "@ add\n\n.. Add two integers.\n: add ( (Int) (Int) -- Int )\n  iadd\n\n: foreign iadd ( Int Int -- Int )\n\n.. secret\n: hidden ( Int -- Int )\n  dup drop\n",
         );
         temp.write(
             "foreign/Data/Num.js",
@@ -3711,7 +3917,7 @@ mod tests {
         );
         temp.write(
             "src/App.ply",
-            "~ \"Data/Num\" (add)\n\n: twice ( Int -- Int )\n  dup add\n",
+            "@ twice\n~ \"Data/Num\" (add)\n\n: twice ( Int -- Int )\n  dup add\n",
         );
         build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         let js = fs::read_to_string(temp.0.join("dist/App.js")).unwrap();
@@ -3722,8 +3928,8 @@ mod tests {
             "{num}"
         );
         let iface = fs::read_to_string(temp.0.join("dist/Data/Num.d.ply")).unwrap();
-        assert!(iface.contains(": private hidden ( Int -- Int )"), "{iface}");
-        assert!(iface.contains(".. secret\n"), "{iface}");
+        assert!(!iface.contains("hidden"), "{iface}");
+        assert!(!iface.contains(".. secret\n"), "{iface}");
         assert!(!num.contains("export function hidden"), "{num}");
         assert!(num.contains("function hidden"), "{num}");
         assert!(iface.contains(".. Add two integers.\n"), "{iface}");
@@ -3748,11 +3954,11 @@ mod tests {
             "import { twice } from \"./dist/App.js\";\nif (twice(21n) !== 42n) throw new Error(String(twice(21n)));\n",
         );
         let source = fs::read_to_string(temp.0.join("src/App.ply")).unwrap();
-        let line = source.lines().nth(3).unwrap();
+        let line = source.lines().nth(4).unwrap();
         let found = crate::hover::hover(
             &source,
             &temp.0.join("src/App.ply"),
-            3,
+            4,
             line.find("add").unwrap() as u32,
         )
         .unwrap();
@@ -3776,11 +3982,11 @@ mod tests {
         );
         cycle.write(
             "src/Data/A.ply",
-            "~ \"Data/B\" (b)\n\n: a ( Int -- Int )\n  b\n",
+            "@ a\n~ \"Data/B\" (b)\n\n: a ( Int -- Int )\n  b\n",
         );
         cycle.write(
             "src/Data/B.ply",
-            "~ \"Data/A\" (a)\n\n: b ( Int -- Int )\n  a\n",
+            "@ b\n~ \"Data/A\" (a)\n\n: b ( Int -- Int )\n  a\n",
         );
         let error = build(&cycle.0).unwrap_err();
         assert_eq!(error.message, "import cycle: Data.A, Data.B, Data.A");
@@ -3794,11 +4000,11 @@ mod tests {
         );
         missing.write(
             "src/Data/Num.ply",
-            ": add ( (Int) (Int) -- Int )\n  drop\n",
+            "@ add\n\n: add ( (Int) (Int) -- Int )\n  drop\n",
         );
         missing.write(
             "src/App.ply",
-            "~ \"Data/Num\" (add)\n\n: twice ( Int -- Int )\n  dup add\n",
+            "@ twice\n~ \"Data/Num\" (add)\n\n: twice ( Int -- Int )\n  dup add\n",
         );
         let before = fs::read_to_string(missing.0.join("package.json")).unwrap();
         build(&missing.0).unwrap_or_else(|error| panic!("{}", error.render()));
@@ -3808,7 +4014,7 @@ mod tests {
 
         let renamed = Temp::new("name");
         renamed.write("package.json", &package_json(""));
-        renamed.write("src/data/Num.ply", ": add ( Int -- Int )\n  dup drop\n");
+        renamed.write("src/data/Num.ply", "@ add\n\n: add ( Int -- Int )\n  dup drop\n");
         let error = build(&renamed.0).unwrap_err();
         assert_eq!(
             error.message,
@@ -3824,7 +4030,7 @@ mod tests {
         );
         arity.write(
             "src/Data/Num.ply",
-            ": foreign add ( (Int) (Int) -- Int )\n",
+            "@ add\n\n: foreign add ( (Int) (Int) -- Int )\n",
         );
         arity.write(
             "foreign/Data/Num.js",
@@ -3838,7 +4044,10 @@ mod tests {
             "package.json",
             r#"{ "ply": { "source": "src", "out": "dist", "language": 1 }, "exports": { "./Data/Num": { "ply": "./dist/Data/Num.d.ply" } } }"#,
         );
-        omitted.write("src/Data/Num.ply", ": foreign add ( Int Int -- Int )\n");
+        omitted.write(
+            "src/Data/Num.ply",
+            "@ add\n\n: foreign add ( Int Int -- Int )\n",
+        );
         let error = build(&omitted.0).unwrap_err();
         assert_eq!(error.message, "package.json has no \"ply.foreign\" field");
 
@@ -3867,7 +4076,7 @@ mod tests {
 
     #[test]
     fn class_dictionary_imports_the_implementing_word() {
-        let eq = ": foreign ieq ( Int Int -- Bool )\n\n& Eq a\n  eq ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  ieq\n\n# Eq Int\n  eq = eqInt\n\n: same ( a. Eq a => a a -- Bool )\n  eq\n";
+        let eq = "@ Eq, eq, same\n\n: foreign ieq ( Int Int -- Bool )\n\n& Eq a\n  eq ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  ieq\n\n# Eq Int\n  eq = eqInt\n\n: same ( a. Eq a => a a -- Bool )\n  eq\n";
         let eq_js = "export function ieq(a, b) { return a === b; }\n";
         let exports = r#"
     "./Data/Eq": { "ply": "./dist/Data/Eq.d.ply", "import": "./dist/Data/Eq.js" },
@@ -3879,7 +4088,7 @@ mod tests {
         temp.write("foreign/Data/Eq.js", eq_js);
         temp.write(
             "src/App.ply",
-            "~ \"Data/Eq\" (same)\n\n: use ( Int Int -- Bool )\n  same\n",
+            "@ use\n~ \"Data/Eq\" (same)\n\n: use ( Int Int -- Bool )\n  same\n",
         );
         build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         let iface = fs::read_to_string(temp.0.join("dist/Data/Eq.d.ply")).unwrap();
@@ -3916,22 +4125,16 @@ mod tests {
         );
         via.write(
             "src/Data/Eq.ply",
-            ": foreign ieq ( Int Int -- Bool )\n\n& Eq a\n  eq ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  ieq\n\n# Eq Int\n  eq = eqInt\n",
+            "@ Eq, eq\n\n: foreign ieq ( Int Int -- Bool )\n\n& Eq a\n  eq ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  ieq\n\n# Eq Int\n  eq = eqInt\n",
         );
         via.write("foreign/Data/Eq.js", eq_js);
         via.write(
             "src/Data/Cmp.ply",
-            "~ \"Data/Eq\" (Eq, eq)\n\n: same ( a. Eq a => a a -- Bool )\n  eq\n",
+            "@ same\n~ \"Data/Eq\" (Eq, eq)\n\n: same ( a. Eq a => a a -- Bool )\n  eq\n",
         );
         via.write(
             "src/App.ply",
-            "~ \"Data/Cmp\" (same)\n\n: use ( Int Int -- Bool )\n  same\n",
-        );
-        let error = build(&via.0).unwrap_err();
-        assert_eq!(error.message, "no instance for Eq Int");
-        via.write(
-            "src/App.ply",
-            "~ \"Data/Cmp\" (same)\n~ \"Data/Eq\" ()\n\n: use ( Int Int -- Bool )\n  same\n",
+            "@ use\n~ \"Data/Cmp\" (same)\n\n: use ( Int Int -- Bool )\n  same\n",
         );
         build(&via.0).unwrap_or_else(|error| panic!("{}", error.render()));
         let js = fs::read_to_string(via.0.join("dist/App.js")).unwrap();
@@ -3941,27 +4144,32 @@ mod tests {
             &via.0,
             "import { use } from \"./dist/App.js\";\nif (use(1n, 1n) !== true) throw new Error(\"via\");\n",
         );
+        via.write(
+            "src/App.ply",
+            "@ use\n~ \"Data/Cmp\" (same)\n~ \"Data/Eq\" ()\n\n: use ( Int Int -- Bool )\n  same\n",
+        );
+        build(&via.0).unwrap_or_else(|error| panic!("{}", error.render()));
 
         let bare = Temp::new("class-bare");
         bare.write("package.json", &package_json(exports));
         bare.write(
             "src/Data/Eq.ply",
-            ": foreign ieq ( Int Int -- Bool )\n\n& Eq a\n  eq ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  ieq\n\n# Eq Int\n  eq = eqInt\n",
+            "@\n\n: foreign ieq ( Int Int -- Bool )\n\n& Eq a\n  eq ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  ieq\n\n# Eq Int\n  eq = eqInt\n",
         );
         bare.write("foreign/Data/Eq.js", eq_js);
         bare.write(
             "src/App.ply",
-            "~ \"Data/Eq\" ()\n\n: use ( Int Int -- Bool )\n  eq\n",
+            "@ use\n~ \"Data/Eq\" ()\n\n: use ( Int Int -- Bool )\n  eq\n",
         );
         let error = build(&bare.0).unwrap_err();
         assert_eq!(error.message, "undefined word eq");
 
         let own = Temp::new("builtin-head");
         own.write("package.json", &package_json(exports));
-        own.write("src/Data/Eq.ply", "& Eq a\n  eq ( a a -- Bool )\n");
+        own.write("src/Data/Eq.ply", "@ Eq\n\n& Eq a\n  eq ( a a -- Bool )\n");
         own.write(
             "src/App.ply",
-            "~ \"Data/Eq\" (Eq)\n\n: eqBool ( Bool Bool -- Bool )\n  drop drop true\n\n# Eq Bool\n  eq = eqBool\n",
+            "@\n~ \"Data/Eq\" (Eq)\n\n: eqBool ( Bool Bool -- Bool )\n  drop drop true\n\n# Eq Bool\n  eq = eqBool\n",
         );
         build(&own.0).unwrap_or_else(|error| panic!("{}", error.render()));
 
@@ -3976,21 +4184,21 @@ mod tests {
 "#,
             ),
         );
-        orphan.write("src/Data/Eq.ply", "& Eq a\n  eq ( a a -- Bool )\n");
-        orphan.write("src/Data/Maybe.ply", "; Maybe a = Nothing | Just a\n");
+        orphan.write("src/Data/Eq.ply", "@ Eq\n\n& Eq a\n  eq ( a a -- Bool )\n");
+        orphan.write("src/Data/Maybe.ply", "@ Maybe\n\n; Maybe a = Nothing | Just a\n");
         orphan.write(
             "src/App.ply",
-            "~ \"Data/Eq\" (Eq)\n~ \"Data/Maybe\" (Maybe)\n\n: eqMaybe ( a. (Maybe a) (Maybe a) -- Bool )\n  drop drop true\n\n# Eq (Maybe a)\n  eq = eqMaybe\n",
+            "@\n~ \"Data/Eq\" (Eq)\n~ \"Data/Maybe\" (Maybe)\n\n: eqMaybe ( a. (Maybe a) (Maybe a) -- Bool )\n  drop drop true\n\n# Eq (Maybe a)\n  eq = eqMaybe\n",
         );
         let error = build(&orphan.0).unwrap_err();
         assert_eq!(error.message, "orphan instance");
 
         let local = Temp::new("local-head");
         local.write("package.json", &package_json(exports));
-        local.write("src/Data/Eq.ply", "& Eq a\n  eq ( a a -- Bool )\n");
+        local.write("src/Data/Eq.ply", "@ Eq, eq\n\n& Eq a\n  eq ( a a -- Bool )\n");
         local.write(
             "src/App.ply",
-            "~ \"Data/Eq\" (Eq, eq)\n\n; Box a = Mk a\n\n: eqBox ( a. (Box a) (Box a) -- Bool )\n  drop drop true\n\n# Eq (Box a)\n  eq = eqBox\n\n: use ( (Box Int) (Box Int) -- Bool )\n  eq\n",
+            "@\n~ \"Data/Eq\" (Eq, eq)\n\n; Box a = Mk a\n\n: eqBox ( a. (Box a) (Box a) -- Bool )\n  drop drop true\n\n# Eq (Box a)\n  eq = eqBox\n\n: use ( (Box Int) (Box Int) -- Bool )\n  eq\n",
         );
         build(&local.0).unwrap_or_else(|error| panic!("{}", error.render()));
         let js = fs::read_to_string(local.0.join("dist/App.js")).unwrap();
@@ -4007,11 +4215,11 @@ mod tests {
 "#,
             ),
         );
-        both.write("src/Data/Eq.ply", "& Eq a\n  eq ( a a -- Bool )\n");
-        both.write("src/Data/Also.ply", "& Also a\n  eq ( a a -- Bool )\n");
+        both.write("src/Data/Eq.ply", "@ Eq\n\n& Eq a\n  eq ( a a -- Bool )\n");
+        both.write("src/Data/Also.ply", "@ Also\n\n& Also a\n  eq ( a a -- Bool )\n");
         both.write(
             "src/App.ply",
-            "~ \"Data/Eq\" (Eq)\n~ \"Data/Also\" (Also)\n\n: eqInt ( Int Int -- Bool )\n  drop drop true\n\n# Eq, Also Int\n  eq = eqInt\n",
+            "@\n~ \"Data/Eq\" (Eq)\n~ \"Data/Also\" (Also)\n\n: eqInt ( Int Int -- Bool )\n  drop drop true\n\n# Eq, Also Int\n  eq = eqInt\n",
         );
         let error = build(&both.0).unwrap_err();
         assert_eq!(error.message, "method eq is a method of Eq and Also");
@@ -4028,7 +4236,7 @@ mod tests {
         );
         temp.write(
             "src/Data/Io.ply",
-            ": foreign read ( -- Str )\n\n: line ( -- Str )\n  read\n",
+            "@ read, line\n\n: foreign read ( -- Str )\n\n: line ( -- Str )\n  read\n",
         );
         temp.write(
             "foreign/Data/Io.js",
@@ -4052,7 +4260,7 @@ mod tests {
 
         temp.write(
             "src/Data/Io.ply",
-            ": foreign read ( -- Str )\n\n: line ( -- Int )\n  read\n",
+            "@ read, line\n\n: foreign read ( -- Str )\n\n: line ( -- Int )\n  read\n",
         );
         let error = build(&temp.0).unwrap_err();
         assert_eq!(
@@ -4072,7 +4280,7 @@ mod tests {
         );
         temp.write(
             "src/Data/Io.ply",
-            ": foreign read ( -- Str )\n\n: private foreign secret ( -- Str )\n\n: useSecret ( -- Str )\n  secret\n\n: private hidden ( Str -- Str )\n  drop secret\n",
+            "@ read, useSecret\n\n: foreign read ( -- Str )\n\n: foreign secret ( -- Str )\n\n: useSecret ( -- Str )\n  secret\n\n: hidden ( Str -- Str )\n  drop secret\n",
         );
         temp.write(
             "foreign/Data/Io.js",
@@ -4092,23 +4300,18 @@ mod tests {
         assert!(js.contains("export function useSecret"), "{js}");
         let iface = fs::read_to_string(temp.0.join("dist/Data/Io.d.ply")).unwrap();
         assert!(iface.contains(": foreign read ( -- Str )"), "{iface}");
-        assert!(iface.contains(": foreign private secret ( -- Str )"), "{iface}");
-        assert!(iface.contains(": private hidden ( Str -- Str )"), "{iface}");
-        let module = crate::parse(&iface, crate::ParseMode::Interface)
+        assert!(iface.contains(": useSecret ( -- Str )"), "{iface}");
+        assert!(!iface.contains("secret"), "{iface}");
+        assert!(!iface.contains("hidden"), "{iface}");
+        crate::parse(&iface, crate::ParseMode::Interface)
             .unwrap_or_else(|error| panic!("{}", error.render("Data/Io.d.ply", &iface)));
-        let secret = module.items.iter().find_map(|item| match item {
-            crate::ast::Item::Def(def) if def.name == "secret" => Some(def),
-            _ => None,
-        });
-        let secret = secret.expect("secret");
-        assert!(secret.vis.is_foreign() && secret.vis.is_private());
         node(
             &temp.0,
             "import { useSecret, read } from \"./dist/Data/Io.js\";\nif (read() !== \"hi\" || useSecret() !== \"sh\") throw new Error(\"io\");\n",
         );
         temp.write(
             "src/App.ply",
-            "~ \"Data/Io\" (secret)\n\n: use ( -- Str )\n  secret\n",
+            "@ use\n~ \"Data/Io\" (secret)\n\n: use ( -- Str )\n  secret\n",
         );
         let error = build(&temp.0).unwrap_err();
         assert_eq!(error.message, "~ \"Data/Io\" does not export secret");
@@ -4120,13 +4323,13 @@ mod tests {
         temp.write("package.json", &package_json(""));
         temp.write(
             "src/App.ply",
-            ": foreign touch ( -- Unit )\n\n: private main ( -- Unit )\n  touch\n",
+            "@\n\n: foreign touch ( -- Unit )\n\n: main ( -- Unit )\n  touch\n",
         );
         temp.write(
             "src/Tool.ply",
-            ": foreign touch ( -- Unit )\n\n: main ( -- Unit )\n  touch\n",
+            "@ main\n\n: foreign touch ( -- Unit )\n\n: main ( -- Unit )\n  touch\n",
         );
-        temp.write("src/Other.ply", ": idle ( -- Unit )\n  Unit\n");
+        temp.write("src/Other.ply", "@\n\n: idle ( -- Unit )\n  Unit\n");
         let app_mark = temp.0.join("app.txt");
         let tool_mark = temp.0.join("tool.txt");
         temp.write("foreign/App.js", &touch_js(&app_mark));
@@ -4178,7 +4381,7 @@ mod tests {
 
         temp.write(
             "src/Tool.ply",
-            ": foreign boom ( -- Unit )\n\n: main ( -- Unit )\n  boom\n",
+            "@ main\n\n: foreign boom ( -- Unit )\n\n: main ( -- Unit )\n  boom\n",
         );
         temp.write(
             "foreign/Tool.js",
@@ -4196,22 +4399,22 @@ mod tests {
     fn main_accepts_only_the_unit_scheme() {
         let temp = Temp::new("entry-scheme");
         temp.write("package.json", &package_json(""));
-        temp.write("src/App.ply", ": main ( . -- . Unit )\n  Unit\n");
+        temp.write("src/App.ply", "@\n\n: main ( . -- . Unit )\n  Unit\n");
         check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
-        temp.write("src/App.ply", ": main ( ..s -- ..s Unit )\n  Unit\n");
+        temp.write("src/App.ply", "@\n\n: main ( ..s -- ..s Unit )\n  Unit\n");
         check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
-        temp.write("src/App.ply", ": start ( -- Unit )\n  Unit\n");
+        temp.write("src/App.ply", "@\n\n: start ( -- Unit )\n  Unit\n");
         check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         let js = fs::read_to_string(temp.0.join("dist/App.js")).unwrap();
         assert!(!js.contains("import.meta.main"), "{js}");
 
-        temp.write("src/App.ply", ": main ( -- Num )\n  1\n");
+        temp.write("src/App.ply", "@\n\n: main ( -- Num )\n  1\n");
         let error = check_package(&temp.0).unwrap_err();
         assert_eq!(error.code, "PL0115");
         assert_eq!(error.message, "word main must have scheme ( -- Unit )");
         assert!(error.render().contains("App.ply"), "{}", error.render());
-        temp.write("src/App.ply", ": main ( a. a -- a Unit )\n  Unit\n");
+        temp.write("src/App.ply", "@\n\n: main ( a. a -- a Unit )\n  Unit\n");
         let error = check_package(&temp.0).unwrap_err();
         assert_eq!(error.code, "PL0115");
 
@@ -4228,6 +4431,8 @@ mod tests {
     #[test]
     fn public_import_publishes_the_word_and_the_instance() {
         let lib = "\
+@ Eq, eq, Box, answer
+
 .. Two numbers.
 & Eq a
   eq ( a a -- Bool )
@@ -4251,7 +4456,7 @@ mod tests {
 : answer ( -- Num )
   1
 
-: private hidden ( -- Num )
+: hidden ( -- Num )
   0
 ";
         let exports = r#"
@@ -4264,35 +4469,37 @@ mod tests {
         let temp = Temp::new("public");
         temp.write("package.json", &package_json(exports));
         temp.write("src/Lib.ply", lib);
-        temp.write("src/Door.ply", "~ public \"Lib\" (answer)\n");
-        temp.write("src/Wide.ply", "~ public \"Lib\" (..)\n");
+        temp.write("src/Door.ply", "@ answer\n~ \"Lib\" (answer)\n");
+        temp.write("src/Wide.ply", "@ answer\n~ \"Lib\" (answer)\n");
         temp.write(
             "src/App.ply",
-            "~ \"Door\" (answer)\n~ \"Lib\" (Eq, eq)\n\n: same ( a. Eq a => a a -- Bool )\n  eq\n\n: use ( Num Num -- Bool )\n  same\n",
+            "@ same, use\n~ \"Door\" (answer)\n~ \"Lib\" (Eq, eq)\n\n: same ( a. Eq a => a a -- Bool )\n  eq\n\n: use ( Num Num -- Bool )\n  same\n",
         );
         temp.write(
             "src/UseAll.ply",
-            "~ \"Door\" (..)\n\n: use ( Num Num -- Bool )\n  eqNum\n",
+            "@ use\n~ \"Door\" (..)\n\n: use ( -- Num )\n  answer\n",
         );
         build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         let door = fs::read_to_string(temp.0.join("dist/Door.js")).unwrap();
         assert!(
-            door.contains("export { answer, eqNum, eqBox } from \"./Lib.js\";"),
+            door.contains("export { answer } from \"./Lib.js\";"),
             "{door}"
         );
+        assert!(!door.contains("eqNum"), "{door}");
+        assert!(!door.contains("eqBox"), "{door}");
         assert!(!door.contains("function "), "{door}");
         let door_iface = fs::read_to_string(temp.0.join("dist/Door.d.ply")).unwrap();
-        assert!(door_iface.contains("~ public \"Lib\" (answer)\n"), "{door_iface}");
+        assert!(door_iface.contains("@ answer\n"), "{door_iface}");
+        assert!(door_iface.contains("~ \"Lib\" (answer)\n"), "{door_iface}");
+        assert!(!door_iface.contains("~ public"), "{door_iface}");
         assert!(!door_iface.contains("# Eq"), "{door_iface}");
         let app = fs::read_to_string(temp.0.join("dist/App.js")).unwrap();
-        assert!(
-            app.contains("import { answer, eqNum } from \"./Door.js\";"),
-            "{app}"
-        );
+        assert!(app.contains("import { answer } from \"./Door.js\";"), "{app}");
+        assert!(app.contains("import { eqNum } from \"./Lib.js\";"), "{app}");
         assert!(app.contains("eq: eqNum"), "{app}");
-        assert!(!app.contains("from \"./Lib.js\""), "{app}");
         let wide = fs::read_to_string(temp.0.join("dist/UseAll.js")).unwrap();
-        assert!(wide.contains("eqNum") && wide.contains("from \"./Door.js\""), "{wide}");
+        assert!(wide.contains("answer") && wide.contains("from \"./Door.js\""), "{wide}");
+        assert!(!wide.contains("eqNum"), "{wide}");
         node(
             &temp.0,
             "import { use } from \"./dist/App.js\";\nif (use(1, 2) !== true) throw new Error(\"eq\");\n",
@@ -4310,10 +4517,10 @@ mod tests {
             ),
         );
         again.write("src/Lib.ply", lib);
-        again.write("src/Door.ply", "~ public \"Lib\" (answer)\n");
+        again.write("src/Door.ply", "@ answer\n~ \"Lib\" (answer)\n");
         again.write(
             "src/App.ply",
-            "~ \"Door\" ()\n~ \"Lib\" ()\n~ \"Lib\" (Eq, eq)\n\n: use ( Num Num -- Bool )\n  eq\n",
+            "@ use\n~ \"Door\" ()\n~ \"Lib\" ()\n~ \"Lib\" (Eq, eq)\n\n: use ( Num Num -- Bool )\n  eq\n",
         );
         build(&again.0).unwrap_or_else(|error| panic!("{}", error.render()));
 
@@ -4323,7 +4530,7 @@ mod tests {
             &package_json(r#""./Lib": { "ply": "./dist/Lib.d.ply", "import": "./dist/Lib.js" }, "./Door": { "ply": "./dist/Door.d.ply", "import": "./dist/Door.js" }"#),
         );
         hidden.write("src/Lib.ply", lib);
-        hidden.write("src/Door.ply", "~ public \"Lib\" (hidden)\n");
+        hidden.write("src/Door.ply", "@ hidden\n~ \"Lib\" (hidden)\n");
         let error = build(&hidden.0).unwrap_err();
         assert_eq!(error.message, "~ \"Lib\" does not export hidden");
 
@@ -4335,7 +4542,7 @@ mod tests {
         dup.write("src/Lib.ply", lib);
         dup.write(
             "src/Door.ply",
-            "~ public \"Lib\" (answer)\n\n: answer ( -- Num )\n  2\n",
+            "@ answer\n~ \"Lib\" (answer)\n\n: answer ( -- Num )\n  2\n",
         );
         let error = build(&dup.0).unwrap_err();
         assert_eq!(error.message, "duplicate definition answer");
@@ -4352,10 +4559,10 @@ mod tests {
             ),
         );
         clash.write("src/Lib.ply", lib);
-        clash.write("src/Door.ply", "~ public \"Lib\" (answer)\n");
+        clash.write("src/Door.ply", "@ Eq\n~ \"Lib\" (Eq)\n");
         clash.write(
             "src/App.ply",
-            "~ \"Door\" ()\n~ \"Lib\" (Eq)\n\n: eqNum ( Num Num -- Bool )\n  drop drop false\n\n# Eq Num\n  eq = eqNum\n",
+            "@\n~ \"Door\" (Eq)\n\n: eqNum ( Num Num -- Bool )\n  drop drop false\n\n# Eq Num\n  eq = eqNum\n",
         );
         let error = build(&clash.0).unwrap_err();
         assert_eq!(error.message, "incoherent instance");
@@ -4373,17 +4580,18 @@ mod tests {
             ),
         );
         stopped.write("src/Lib.ply", lib);
-        stopped.write("src/Door.ply", "~ public \"Lib\" (answer)\n");
+        stopped.write("src/Door.ply", "@ answer\n~ \"Lib\" (answer)\n");
         stopped.write(
             "src/Mid.ply",
-            "~ \"Door\" (answer)\n~ \"Lib\" (Eq, eq)\n\n: pass ( Num Num -- Bool )\n  eq\n\n: same ( a. Eq a => a a -- Bool )\n  eq\n",
+            "@ pass, same\n~ \"Door\" (answer)\n~ \"Lib\" (Eq, eq)\n\n: pass ( Num Num -- Bool )\n  eq\n\n: same ( a. Eq a => a a -- Bool )\n  eq\n",
         );
         stopped.write(
             "src/Next.ply",
-            "~ \"Mid\" (same)\n\n: use ( Num Num -- Bool )\n  same\n",
+            "@ use\n~ \"Mid\" (same)\n\n: use ( Num Num -- Bool )\n  same\n",
         );
-        let error = build(&stopped.0).unwrap_err();
-        assert_eq!(error.message, "no instance for Eq Num");
+        build(&stopped.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let next = fs::read_to_string(stopped.0.join("dist/Next.js")).unwrap();
+        assert!(next.contains("eqNum") && next.contains("from \"./Lib.js\""), "{next}");
 
         let both = Temp::new("public-both");
         both.write(
@@ -4397,10 +4605,10 @@ mod tests {
             ),
         );
         both.write("src/Lib.ply", lib);
-        both.write("src/Door.ply", "~ public \"Lib\" (Box)\n");
+        both.write("src/Door.ply", "@ Box\n~ \"Lib\" (Box)\n");
         both.write(
             "src/App.ply",
-            "~ \"Door\" (Box)\n~ \"Lib\" (Box)\n\n: id ( a. (Box a) -- (Box a) )\n  dup drop\n",
+            "@ id\n~ \"Door\" (Box)\n~ \"Lib\" (Box)\n\n: id ( a. (Box a) -- (Box a) )\n  dup drop\n",
         );
         let error = build(&both.0).unwrap_err();
         assert_eq!(error.message, "duplicate definition Box");
@@ -4422,11 +4630,11 @@ mod tests {
         );
         temp.write(
             "node_modules/@algosail/door/dist/Door.d.ply",
-            "language 1\n~ public \"Lib\" (answer)\n",
+            "language 1\n\n@ answer\n\n~ \"Lib\" (answer)\n",
         );
         temp.write(
             "node_modules/@algosail/door/dist/Lib.d.ply",
-            "language 1\n\n: answer ( -- Num )\n",
+            "language 1\n\n@ answer\n\n: answer ( -- Num )\n",
         );
         temp.write(
             "node_modules/@algosail/door/dist/Lib.js",
@@ -4442,7 +4650,7 @@ mod tests {
         );
         temp.write(
             "src/App.ply",
-            "~ \"@algosail/door\" (answer)\n\n: use ( -- Num )\n  answer\n",
+            "@ use\n~ \"@algosail/door\" (answer)\n\n: use ( -- Num )\n  answer\n",
         );
         build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         let js = fs::read_to_string(temp.0.join("dist/App.js")).unwrap();
@@ -4453,7 +4661,7 @@ mod tests {
         );
         temp.write(
             "src/App.ply",
-            "~ \"@algosail/door/Lib\" (answer)\n\n: use ( -- Num )\n  answer\n",
+            "@ use\n~ \"@algosail/door/Lib\" (answer)\n\n: use ( -- Num )\n  answer\n",
         );
         let error = build(&temp.0).unwrap_err();
         assert_eq!(error.message, "cannot resolve ~ \"@algosail/door/Lib\"");
@@ -4466,7 +4674,7 @@ mod tests {
             "package.json",
             "{\n  \"name\": \"fresh\",\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1 }\n}\n",
         );
-        fresh.write("src/App.ply", ": foreign add ( Num Num -- Num )\n");
+        fresh.write("src/App.ply", "@ add\n\n: foreign add ( Num Num -- Num )\n");
         fresh.write(
             "foreign/App.js",
             "export function add(a, b) { return a + b; }\n",
@@ -4484,7 +4692,7 @@ mod tests {
             "package.json",
             "{\n  \"ply\": { \"language\": 1 }\n}\n",
         );
-        bare.write("src/App.ply", ": foreign add ( Num Num -- Num )\n");
+        bare.write("src/App.ply", "@ add\n\n: foreign add ( Num Num -- Num )\n");
         let error = build(&bare.0).unwrap_err();
         assert_eq!(error.code, "PL0107", "{}", error.message);
 
@@ -4502,14 +4710,14 @@ mod tests {
             "package.json",
             "{\n  \"ply\": { \"language\": 1, \"entry\": \"Missing\" }\n}\n",
         );
-        missing.write("src/App.ply", ": id ( Num -- Num )\n  dup drop\n");
+        missing.write("src/App.ply", "@ id\n\n: id ( Num -- Num )\n  dup drop\n");
         let error = build(&missing.0).unwrap_err();
         assert_eq!(error.code, "PL0124", "{}", error.message);
 
         let aligned = Temp::new("entry-align");
         let original = "{\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1, \"entry\": \"App\" },\n  \"exports\": {\n    \"./keep\": \"./keep.js\",\n    \".\": { \"ply\": \"./dist/Old.d.ply\", \"import\": \"./dist/Old.js\" },\n    \"./Old\": { \"ply\": \"./dist/Old.d.ply\", \"import\": \"./dist/Old.js\" }\n  }\n}\n";
         aligned.write("package.json", original);
-        aligned.write("src/App.ply", ": id ( Num -- Num )\n  dup drop\n");
+        aligned.write("src/App.ply", "@ id\n\n: id ( Num -- Num )\n  dup drop\n");
         build(&aligned.0).unwrap_or_else(|error| panic!("{}", error.render()));
         assert_eq!(fs::read_to_string(aligned.0.join("package.json")).unwrap(), original);
         build_exports(&aligned.0).unwrap_or_else(|error| panic!("{}", error.render()));
@@ -4534,7 +4742,7 @@ mod tests {
             "package.json",
             "{\n  \"ply\": { \"language\": 1 },\n  \"exports\": {\n    \".\": { \"ply\": \"./dist/Stream.d.ply\", \"import\": \"./dist/Stream.js\" },\n    \"./Old\": { \"ply\": \"./dist/Old.d.ply\", \"import\": \"./dist/Old.js\" }\n  }\n}\n",
         );
-        root.write("src/App.ply", ": id ( Num -- Num )\n  dup drop\n");
+        root.write("src/App.ply", "@ id\n\n: id ( Num -- Num )\n  dup drop\n");
         build_exports(&root.0).unwrap_or_else(|error| panic!("{}", error.render()));
         let written = fs::read_to_string(root.0.join("package.json")).unwrap();
         let value: serde_json::Value = serde_json::from_str(&written).unwrap();
@@ -4561,16 +4769,16 @@ mod tests {
         );
         temp.write(
             "node_modules/@demo/onlydev/dist/Door.d.ply",
-            "language 1\n\n: answer ( -- Num )\n",
+            "language 1\n\n@ answer\n\n: answer ( -- Num )\n",
         );
         temp.write(
             "node_modules/@demo/onlydev/dist/Door.js",
             "export function answer() { return 1; }\n",
         );
-        temp.write("src/Lib.ply", ": answer ( -- Num )\n  1\n");
+        temp.write("src/Lib.ply", "@ answer\n\n: answer ( -- Num )\n  1\n");
         temp.write(
             "test/Support/Session.ply",
-            "~ \"Lib\" (answer)\n\n: twice ( -- Num )\n  answer\n",
+            "@ twice\n~ \"Lib\" (answer)\n\n: twice ( -- Num )\n  answer\n",
         );
         let pass = "\
 ~ \"Support/Session\" (twice)
@@ -4586,7 +4794,7 @@ mod tests {
         temp.write("test/Pass.ply", pass);
         temp.write(
             "src/Bad.ply",
-            "~ \"@demo/onlydev\" (answer)\n\n: use ( -- Num )\n  answer\n",
+            "@ use\n~ \"@demo/onlydev\" (answer)\n\n: use ( -- Num )\n  answer\n",
         );
         let error = build(&temp.0).unwrap_err();
         assert_eq!(error.code, "PL0121", "{}", error.message);
@@ -4594,7 +4802,7 @@ mod tests {
         fs::remove_file(temp.0.join("src/Bad.ply")).unwrap();
         temp.write(
             "src/Bad.ply",
-            "~ \"Support/Session\" (twice)\n\n: use ( -- Num )\n  twice\n",
+            "@ use\n~ \"Support/Session\" (twice)\n\n: use ( -- Num )\n  twice\n",
         );
         let error = build(&temp.0).unwrap_err();
         assert_eq!(error.message, "cannot resolve ~ \"Support/Session\"");
@@ -4616,8 +4824,8 @@ mod tests {
             "package.json",
             "{\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1 }\n}\n",
         );
-        shadow.write("src/Data/State.ply", ": current ( -- Num )\n  1\n");
-        shadow.write("test/Data/State.ply", ": helper ( -- Num )\n  2\n");
+        shadow.write("src/Data/State.ply", "@ current\n\n: current ( -- Num )\n  1\n");
+        shadow.write("test/Data/State.ply", "@ helper\n\n: helper ( -- Num )\n  2\n");
         shadow.write(
             "test/Pass.ply",
             "\
@@ -4636,7 +4844,7 @@ mod tests {
             "package.json",
             "{\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1 }\n}\n",
         );
-        entry.write("src/Data/State.ply", ": current ( -- Num )\n  1\n");
+        entry.write("src/Data/State.ply", "@ current\n\n: current ( -- Num )\n  1\n");
         entry.write(
             "test/Data/State.ply",
             "\
@@ -4655,6 +4863,47 @@ mod tests {
         assert_eq!(report.files.len(), 1);
         assert_eq!(report.files[0].checks[0].name, "reads");
         assert!(report.files[0].checks[0].ok);
+    }
+
+    #[test]
+    fn an_unlisted_instance_word_is_still_called() {
+        let temp = Temp::new("map-hidden");
+        temp.write(
+            "package.json",
+            &package_json(
+                r#"
+    "./Classes/Mappable": { "ply": "./dist/Classes/Mappable.d.ply", "import": "./dist/Classes/Mappable.js" },
+    "./Data/Stream": { "ply": "./dist/Data/Stream.d.ply", "import": "./dist/Data/Stream.js" },
+    "./Stream": { "ply": "./dist/Stream.d.ply", "import": "./dist/Stream.js" },
+    "./App": { "ply": "./dist/App.d.ply", "import": "./dist/App.js" }
+"#,
+            ),
+        );
+        temp.write(
+            "src/Classes/Mappable.ply",
+            "@ Mappable, map\n\n& Mappable f\n  map ( a b. (f a) (a -- b) -- (f b) )\n",
+        );
+        temp.write(
+            "src/Data/Stream.ply",
+            "@ Stream\n~ \"Classes/Mappable\" (Mappable, map)\n\n; Stream a = Stream a\n\n: mapStream ( a b. (Stream a) (a -- b) -- (Stream b) )\n  (Stream x) q ->\n    x q call\n    Stream\n\n# Mappable Stream\n  map = mapStream\n",
+        );
+        temp.write("src/Stream.ply", "@ Stream\n~ \"Data/Stream\" (..)\n");
+        temp.write(
+            "src/App.ply",
+            "@ twice\n~ \"Stream\" (..)\n~ \"Classes/Mappable\" (map)\n\n: twice ( (Stream Num) -- (Stream Num) )\n  [ dup drop ] map\n",
+        );
+        build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let facade = fs::read_to_string(temp.0.join("dist/Stream.js")).unwrap();
+        assert!(!facade.contains("mapStream"), "{facade}");
+        let app = fs::read_to_string(temp.0.join("dist/App.js")).unwrap();
+        assert!(
+            app.contains("import { mapStream } from \"./Data/Stream.js\";"),
+            "{app}"
+        );
+        node(
+            &temp.0,
+            "import { twice } from \"./dist/App.js\";\nimport { Stream } from \"./dist/Data/Stream.js\";\nconst out = twice(Stream(1));\nif (out.value !== 1) throw new Error(JSON.stringify(out));\n",
+        );
     }
 
     fn touch_js(mark: &std::path::Path) -> String {

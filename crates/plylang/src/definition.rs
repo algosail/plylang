@@ -139,7 +139,7 @@ fn imported(from: &Path, module: &Module, name: &str, target: Target) -> Option<
         let Some(provider) = read_module(&file) else {
             continue;
         };
-        if !import_offers(import, &provider, &file, name) {
+        if !import_offers(import, name) {
             continue;
         }
         let mut load = |start: &Path, path: &str| load_surface(start, path);
@@ -153,17 +153,8 @@ fn imported(from: &Path, module: &Module, name: &str, target: Target) -> Option<
     None
 }
 
-fn import_offers(import: &Import, provider: &Module, file: &Path, name: &str) -> bool {
-    if import.all || import.names.iter().any(|imported| imported == name) {
-        return true;
-    }
-    if !import.publish {
-        return false;
-    }
-    let mut load = |start: &Path, path: &str| load_surface(start, path);
-    surface::method_words(provider, file, &mut load)
-        .iter()
-        .any(|word| word == name)
+fn import_offers(import: &Import, name: &str) -> bool {
+    import.all || import.names.iter().any(|imported| imported == name)
 }
 
 fn found_span(found: &Found, name: &str, target: Target) -> Option<Span> {
@@ -468,12 +459,14 @@ mod tests {
             "{\n  \"ply\": { \"source\": \"src\", \"out\": \"dist\", \"language\": 1 }\n}\n",
         );
         let provider = "\
+@ Hub, add
+
 ; foreign Hub a
 
 : add ( Int Int -- Int )
   drop
 
-: private hidden ( Int -- Int )
+: hidden ( Int -- Int )
   dup drop
 ";
         temp.write("src/Data/Num.ply", provider);
@@ -513,6 +506,8 @@ mod tests {
             "{\n  \"ply\": { \"source\": \"src\", \"out\": \"dist\", \"language\": 1 }\n}\n",
         );
         let lib = "\
+@ answer, eqNum
+
 .. A number.
 : answer ( -- Num )
   1
@@ -528,7 +523,7 @@ mod tests {
   eq = eqNum
 ";
         temp.write("src/Lib.ply", lib);
-        temp.write("src/Door.ply", "~ public \"Lib\" (answer)\n");
+        temp.write("src/Door.ply", "@ answer, eqNum\n~ \"Lib\" (answer, eqNum)\n");
         let app = temp.0.join("src/App.ply");
         let source = "~ \"Door\" (..)\n\n: use ( Num Num -- Bool )\n  eqNum\n";
         let found = definition(&source, &app, 3, 2).unwrap();
@@ -548,9 +543,9 @@ mod tests {
             "node_modules/@algosail/nums/package.json",
             "{\n  \"name\": \"@algosail/nums\",\n  \"ply\": { \"source\": \"src\", \"out\": \"dist\", \"language\": 1 },\n  \"exports\": { \"./Data/Num\": { \"ply\": \"./dist/Data/Num.d.ply\" } }\n}\n",
         );
-        let source_text = ": add ( Int Int -- Int )\n  drop\n";
+        let source_text = "@ add\n\n: add ( Int Int -- Int )\n  drop\n";
         temp.write("node_modules/@algosail/nums/src/Data/Num.ply", source_text);
-        let interface = "language 1\n\n.. From the interface.\n\n: add ( Int Int -- Int )\n";
+        let interface = "language 1\n\n@ add\n\n.. From the interface.\n\n: add ( Int Int -- Int )\n";
         temp.write(
             "node_modules/@algosail/nums/dist/Data/Num.d.ply",
             interface,
@@ -559,7 +554,7 @@ mod tests {
         let source = "~ \"@algosail/nums/Data/Num\" (add)\n\n: twice ( Int -- Int )\n  dup add\n";
         let found = definition(&source, &from, 3, 6).unwrap();
         assert_eq!(found.path, root.join("src/Data/Num.ply"));
-        assert_eq!(found.span.start, 2);
+        assert_eq!(found.span.start, 9);
         assert_eq!(slice(source_text, found.span), "add");
 
         fs::remove_file(root.join("src/Data/Num.ply")).unwrap();

@@ -147,6 +147,12 @@ pub enum Error {
     PackageJsonEntry,
     /// `ply.entry` names a module that is not in the source directory.
     EntryModule(String),
+    /// A package module has no `@` list.
+    MissingPublicList,
+    /// A name in the `@` list is neither declared here nor imported.
+    PublicName(String),
+    /// Not produced. The `@` list may stand anywhere. A second `@` is a duplicate definition.
+    PublicNotHere,
 }
 
 impl Error {
@@ -388,6 +394,9 @@ impl Error {
                 "PL0124",
                 format!("ply.entry module {name} is not in the source"),
             ),
+            MissingPublicList => static_text("PL0125", "module has no name list"),
+            PublicName(name) => ("PL0126", format!("listed name {name} is not defined")),
+            PublicNotHere => static_text("PL0128", "@ is the module's name list"),
         }
     }
 }
@@ -680,8 +689,23 @@ mod tests {
                 "ply.entry module Stream is not in the source",
                 "PL0124",
             ),
+            (
+                Error::MissingPublicList,
+                "module has no name list",
+                "PL0125",
+            ),
+            (
+                Error::PublicName("scan".into()),
+                "listed name scan is not defined",
+                "PL0126",
+            ),
+            (
+                Error::PublicNotHere,
+                "@ is the module's name list",
+                "PL0128",
+            ),
         ];
-        assert_eq!(samples.len(), 124);
+        assert_eq!(samples.len(), 127);
         for (error, message, code) in samples {
             assert_eq!(error.code(), code, "{message}");
             assert_eq!(error.message(), message);

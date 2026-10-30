@@ -1,6 +1,6 @@
 //! `plylang test` finds test files, compiles them in the package, and runs them.
 //!
-//! A test is a public word `( -- Verdict )`. The runner calls each one and uses
+//! A test is a word `( -- Verdict )`. The runner calls each one and uses
 //! the word as its name. A file with none of those words may export `suite`
 //! `( -- (Array Verdict) )` instead. Each verdict has `ok`, `name`, and `text`.
 //! `text` is empty when the check passed.
@@ -597,10 +597,12 @@ Time   12ms
             "package.json",
             "{\n  \"name\": \"fixture\",\n  \"type\": \"module\",\n  \"ply\": { \"source\": \"src\", \"foreign\": \"foreign\", \"out\": \"dist\", \"language\": 1 }\n}\n",
         );
-        temp.write("src/Lib.ply", ": answer ( -- Num )\n  1\n");
+        temp.write("src/Lib.ply", "@ answer\n\n: answer ( -- Num )\n  1\n");
         temp.write(
             "src/Also.ply",
             "\
+@ suite
+
 ; Verdict = Verdict ok : Bool, name : Str, text : Str
 
 : foreign push ( (Array Verdict) Verdict -- (Array Verdict) )

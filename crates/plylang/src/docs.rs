@@ -6,7 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::ast::{
-    method_line, scheme_string, type_string, Class, Data, Def, Instance, Item, Module, Synonym,
+    method_line, scheme_string, type_string, Class, Data, Def, Exports, Instance, Item, Module,
+    Synonym,
 };
 use crate::build::{io_error, located, module_path_of, open_package, os_error, walk_ply, BuildError};
 use crate::codes::Error;
@@ -119,29 +120,56 @@ fn render_page(out: &mut String, title: &str, page: &Page, seen: &mut HashMap<St
     let mut words = Vec::new();
     for item in &page.module.items {
         match item {
-            Item::Data(data) => {
+            Item::Data(data) if docs_data(&page.module, data) => {
                 types.push((data.name.clone(), format_data(data), data.doc.clone()))
             }
-            Item::Synonym(synonym) => types.push((
+            Item::Synonym(synonym) if docs_name(&page.module, &synonym.name) => types.push((
                 synonym.name.clone(),
                 format_synonym(synonym),
                 synonym.doc.clone(),
             )),
-            Item::Class(class) => {
+            Item::Class(class) if docs_class(&page.module, class) => {
                 classes.push((class.name.clone(), format_class(class), class.doc.clone()))
             }
-            Item::Instance(instance) => instances.push(instance_head(instance)),
-            Item::Def(def) if def.vis.is_private() => {}
-            Item::Def(def) => words.push((def.name.clone(), format_word(def), def.doc.clone())),
+            Item::Instance(instance) if !matches!(page.module.exports, Exports::Closed) => {
+                instances.push(instance_head(instance))
+            }
+            Item::Def(def) if docs_def(&page.module, def) => {
+                words.push((def.name.clone(), format_word(def), def.doc.clone()))
+            }
+            _ => {}
         }
     }
-    if page.module.imports.iter().any(|import| import.publish) {
+    if matches!(page.module.exports, Exports::List(_)) {
         append_published(&page.file, &page.module, &mut types, &mut classes, &mut instances, &mut words);
     }
     render_group(out, "Types", &types, seen);
     render_group(out, "Classes", &classes, seen);
     render_instances(out, &instances);
     render_group(out, "Words", &words, seen);
+}
+
+fn docs_name(module: &Module, name: &str) -> bool {
+    match &module.exports {
+        Exports::List(list) => list.has(name),
+        Exports::Closed => false,
+    }
+}
+
+fn docs_data(module: &Module, data: &Data) -> bool {
+    docs_name(module, &data.name) || data.ctors.iter().any(|ctor| docs_name(module, &ctor.name))
+}
+
+fn docs_class(module: &Module, class: &Class) -> bool {
+    docs_name(module, &class.name)
+        || class.methods.iter().any(|method| docs_name(module, &method.name))
+}
+
+fn docs_def(module: &Module, def: &Def) -> bool {
+    match &module.exports {
+        Exports::List(list) => list.has(&def.name),
+        Exports::Closed => false,
+    }
 }
 
 fn append_published(
@@ -152,8 +180,7 @@ fn append_published(
     instances: &mut Vec<String>,
     words: &mut Vec<(String, String, String)>,
 ) {
-    let mut load = |from: &Path, path: &str| crate::build::load_surface(from, path);
-    let names = crate::surface::public_names(module, file, &mut load);
+    let names = crate::surface::public_names(module);
     let mut seen = HashSet::new();
     for (name, _, _) in types.iter().chain(classes.iter()).chain(words.iter()) {
         seen.insert(name.clone());
@@ -477,23 +504,23 @@ mod tests {
         temp.write("package.json", &package_json("shelf"));
         temp.write(
             "src/Age.ply",
-            ".. An age in years.\n\n.. A wrapper.\n; Age == Age Num\n\n.. One year older.\n: older ( Age -- Age )\n  Age -> 1 add Age\n\n.. True when the number is zero.\n: foreign zero ( Num -- Bool )\n\n.. Hidden.\n: private step ( Num -- Num )\n  1 add\n",
+            ".. An age in years.\n\n@ Age, older, zero\n\n.. A wrapper.\n; Age == Age Num\n\n.. One year older.\n: older ( Age -- Age )\n  Age -> 1 add Age\n\n.. True when the number is zero.\n: foreign zero ( Num -- Bool )\n\n.. Hidden.\n: step ( Num -- Num )\n  1 add\n",
         );
         temp.write(
             "src/Equal.ply",
-            ".. Sameness of two values.\n\n& Equal a\n  eq ( a a -- Bool )\n\n# Equal Num\n  eq = eqNum\n\n# Equal, Sortable Int\n  eq = eqInt\n  compare = compareInt\n",
+            ".. Sameness of two values.\n\n@ Equal, eq\n\n& Equal a\n  eq ( a a -- Bool )\n\n# Equal Num\n  eq = eqNum\n\n# Equal, Sortable Int\n  eq = eqInt\n  compare = compareInt\n",
         );
         temp.write(
             "src/Data/List.ply",
-            ".. Finite sequences.\n\n; List a = Nil | Cons head : a, tail : (List a)\n\n: nil ( -- (List a) )\n  Nil\n\n.. How many elements.\n: foreign length ( (List a) -- Num )\n",
+            ".. Finite sequences.\n\n@ List, Nil, Cons, nil, length\n\n; List a = Nil | Cons head : a, tail : (List a)\n\n: nil ( -- (List a) )\n  Nil\n\n.. How many elements.\n: foreign length ( (List a) -- Num )\n",
         );
         temp.write(
             "src/Data/Maybe.ply",
-            ".. Nothing is absence. Just carries one field.\n..\n.. The type name is not a constructor.\n; Maybe a = Nothing | Just a\n\n.. The spare value stays.\n: fromMaybe ( a (Maybe a) -- a )\n  Nothing ->\n  Just -> nip\n\n# Equal (Maybe a)\n  eq = eqMaybe\n",
+            "@ Maybe, Nothing, Just, fromMaybe\n\n.. Nothing is absence. Just carries one field.\n..\n.. The type name is not a constructor.\n; Maybe a = Nothing | Just a\n\n.. The spare value stays.\n: fromMaybe ( a (Maybe a) -- a )\n  Nothing ->\n  Just -> nip\n\n# Equal (Maybe a)\n  eq = eqMaybe\n",
         );
         temp.write(
             "src/Data/List/NonEmpty.ply",
-            ".. At least one element.\n\n; NonEmpty a = NonEmpty head : a, tail : (List a)\n\n.. The first element.\n: head ( (NonEmpty a) -- a )\n  head>>\n",
+            ".. At least one element.\n\n@ NonEmpty, head\n\n; NonEmpty a = NonEmpty head : a, tail : (List a)\n\n.. The first element.\n: head ( (NonEmpty a) -- a )\n  head>>\n",
         );
         write_docs(&temp.0, None).unwrap_or_else(|error| panic!("{}", error.render()));
         let page = fs::read_to_string(temp.0.join("DOCS.md")).unwrap();
@@ -510,11 +537,11 @@ mod tests {
         temp.write("package.json", &package_json("door"));
         temp.write(
             "src/Lib.ply",
-            ".. A number.\n: answer ( -- Num )\n  1\n",
+            "@ answer\n\n.. A number.\n: answer ( -- Num )\n  1\n",
         );
         temp.write(
             "src/Door.ply",
-            ".. The door.\n\n~ public \"Lib\" (answer)\n",
+            ".. The door.\n\n@ answer\n\n~ \"Lib\" (answer)\n",
         );
         write_docs(&temp.0, None).unwrap_or_else(|error| panic!("{}", error.render()));
         let page = fs::read_to_string(temp.0.join("DOCS.md")).unwrap();
@@ -532,7 +559,10 @@ mod tests {
             "package.json",
             r#"{ "ply": { "source": "src", "out": "dist", "language": 1 } }"#,
         );
-        temp.write("src/Data/Maybe.ply", "; Maybe a = Nothing | Just a\n");
+        temp.write(
+            "src/Data/Maybe.ply",
+            "@ Maybe, Nothing, Just\n\n; Maybe a = Nothing | Just a\n",
+        );
         let out = temp.0.join("out").join("API.md");
         write_docs(&temp.0, Some(&out)).unwrap_or_else(|error| panic!("{}", error.render()));
         let page = fs::read_to_string(&out).unwrap();

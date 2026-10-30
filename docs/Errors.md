@@ -231,9 +231,9 @@ Fix: keep one occurrence.
 
 `expected definition name`
 
-`:` was not followed by the word's name. `foreign` and `private` may each appear once, in either order, and then the name.
+`:` was not followed by the word's name. `foreign` may appear once, and then the name.
 
-Fix: write `: name`, `: foreign name`, or `: foreign private name`. A repeated modifier is this error.
+Fix: write `: name` or `: foreign name`. A repeated `foreign` is this error.
 
 ## PL0027
 
@@ -459,7 +459,7 @@ Fix: rename one of the two definitions.
 
 The name is not a compiler word, a word in this module, or a name you imported.
 
-Fix: declare it, import it, or correct the spelling. A `private` word is visible only in its own module.
+Fix: declare it, import it, or correct the spelling. A name left off the `@` list is visible only in its own file.
 
 ## PL0055
 
@@ -717,9 +717,7 @@ Fix: add `name = word` for the missing method.
 
 `instance word NAME is private`
 
-The word bound in the instance is declared `: private`. The instance exports that method.
-
-Fix: drop `private` on the word.
+This code is not produced. A word bound in `#` stays in its file when it is absent from the `@` list, and the compiler still calls it.
 
 ## PL0087
 
@@ -759,9 +757,9 @@ Fix: bind a word that does not demand this instance, or break the superclass cyc
 
 `~ "PATH" does not export NAME`
 
-The imported module does not export that name. The name may be `private`, misspelled, or absent.
+The imported module does not export that name. The name may be misspelled or absent from that module's `@` list.
 
-Fix: import a public name from that module.
+Fix: import a name from that list.
 
 ## PL0092
 
@@ -895,7 +893,7 @@ Fix: create `foreign`, or add `"foreign": "foreign"` under `ply`.
 
 The JavaScript file for this module is missing, or it does not export `NAME`. The file is `foreign/{module}.js`, mirroring the path under `ply.source`.
 
-Fix: export a function with that name. A `private` foreign word is still exported from that file; `private` only hides it from other Ply modules.
+Fix: export a function with that name. A foreign word left off the `@` list is still imported from that file. The list only hides the name from other Ply modules.
 
 ## PL0109
 
@@ -953,7 +951,7 @@ Fix: if this text is the diagnostic you see, report it as a compiler bug. An ins
 
 `word main must have scheme ( -- Unit )`
 
-A word named `main` is the program of its module. The scheme has no constraints and no effects, takes no inputs, and returns `Unit`. `private` is allowed. Any other scheme is this error. A module with no word named `main` is a library module.
+A word named `main` is the program of its module. The scheme has no constraints and no effects, takes no inputs, and returns `Unit`. It may stay off the `@` list. Any other scheme is this error. A module with no word named `main` is a library module.
 
 Fix: write `: main ( -- Unit )` and a body that returns `Unit`, or rename the word. `( . -- . Unit )` and `( ..s -- ..s Unit )` are the same shape and are accepted.
 
@@ -1011,7 +1009,7 @@ Fix: move the package to `dependencies`, or import it from a file under `test/`.
 
 `test module PATH is already a source module`
 
-A file under `test/` is a utility, and `src` already has that module path. A test entry, a public word `( -- Verdict )` or `suite`, is not a module and does not clash.
+A file under `test/` is a utility, and `src` already has that module path. A test entry, a word `( -- Verdict )` or `suite`, is not a module and does not clash.
 
 Fix: rename the utility, or make the file a test entry.
 
@@ -1030,3 +1028,25 @@ Fix: set it to a module path such as `"Stream"`, or remove the field.
 `ply.entry` names a module path that is not a file under the source directory.
 
 Fix: name a module that `plylang build` compiles, or remove the field.
+
+## PL0125
+
+`module has no name list`
+
+A module under the source directory, or a utility under `test/`, has no `@` list. A test entry does not need one.
+
+Fix: write one `@` list. A bare `@` publishes nothing.
+
+## PL0126
+
+`listed name NAME is not defined`
+
+`NAME` is in the `@` list and is neither declared in this file nor brought in by an import.
+
+Fix: declare it, import it, or remove it from the list.
+
+## PL0128
+
+`@ is the module's name list`
+
+This code is not produced. The `@` list may stand anywhere in the file. A second `@` is a duplicate definition.

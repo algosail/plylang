@@ -39,6 +39,7 @@ impl Parser {
             return Ok(Module {
                 span: Span::new(0, 0),
                 language: None,
+                exports: Exports::Closed,
                 imports: Vec::new(),
                 items: Vec::new(),
             });
@@ -56,11 +57,11 @@ impl Parser {
         } else {
             None
         };
-        let imports = self.parse_imports()?;
-        let items = self.parse_items()?;
+        let (exports, imports, items) = self.parse_contents()?;
         let module = Module {
             span: start.merge(self.last_span),
             language,
+            exports,
             imports,
             items,
         };
@@ -91,35 +92,106 @@ impl Parser {
         Ok(version)
     }
 
-    fn parse_imports(&mut self) -> Result<Vec<Import>, Diagnostic> {
+    /// Imports, one `@` list, and declarations, in any order. The list may
+    /// stand anywhere. A second `@` is a duplicate definition. Imports stay
+    /// before the first `:`, `;`, `-`, `&`, or `#`. A bare `@` publishes
+    /// nothing. Commas separate names. A newline does not, so the list ends
+    /// at the next column-0 declaration.
+    fn parse_contents(&mut self) -> Result<(Exports, Vec<Import>, Vec<Item>), Diagnostic> {
+        let mut exports = Exports::Closed;
         let mut imports = Vec::new();
+        let mut items = Vec::new();
+        let mut saw_declaration = false;
         loop {
+            let doc = self.take_doc();
             self.skip_newlines();
-            if self.is(TokenKind::Doc(String::new())) {
-                let saved = self.pos;
-                let doc = self.take_doc();
-                if self.is(TokenKind::Import) && !doc.is_empty() {
+            if self.is_eof() {
+                break;
+            }
+            if self.is(TokenKind::Export) {
+                if !doc.is_empty() {
                     return Err(self.error(Error::DocNotOnDeclaration));
                 }
-                if self.is(TokenKind::Import) {
-                    continue;
+                if matches!(exports, Exports::List(_)) {
+                    return Err(self.error(Error::DuplicateDefinition("@".to_string())));
                 }
-                self.pos = saved;
-                break;
+                self.expect_at_column_0()?;
+                exports = Exports::List(self.parse_public_list()?);
+                continue;
             }
-            if !self.is(TokenKind::Import) {
-                break;
+            if self.is(TokenKind::Import) {
+                if !doc.is_empty() {
+                    return Err(self.error(Error::DocNotOnDeclaration));
+                }
+                if saw_declaration {
+                    return Err(self.error(Error::ImportAfterDeclaration));
+                }
+                self.expect_at_column_0()?;
+                imports.push(self.parse_import()?);
+                continue;
             }
-            self.expect_at_column_0()?;
-            imports.push(self.parse_import()?);
+            saw_declaration = true;
+            let mut item = self.parse_item()?;
+            match &mut item {
+                Item::Data(data) => data.doc = doc,
+                Item::Synonym(synonym) => synonym.doc = doc,
+                Item::Def(def) => def.doc = doc,
+                Item::Class(class) => class.doc = doc,
+                Item::Instance(_) => {}
+            }
+            items.push(item);
         }
-        Ok(imports)
+        Ok((exports, imports, items))
+    }
+
+    fn parse_public_list(&mut self) -> Result<PublicList, Diagnostic> {
+        let start = self.cur().span;
+        self.bump();
+        let mut names = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.ends_name_list() {
+                break;
+            }
+            if !matches!(self.cur().kind, TokenKind::Ident(_)) {
+                return Err(self.error(Error::ExpectedName));
+            }
+            let span = self.cur().span;
+            let name = self.expect_ident(Error::ExpectedName)?;
+            names.push(ExportedName { span, name });
+            self.skip_newlines();
+            if self.eat(&TokenKind::Comma) {
+                continue;
+            }
+            if self.ends_name_list() {
+                break;
+            }
+            return Err(self.error(Error::ExpectedName));
+        }
+        Ok(PublicList {
+            span: start.merge(self.last_span),
+            names,
+        })
+    }
+
+    /// The name list is over when the next column-0 declaration, a doc, or
+    /// the end of the file begins. A trailing comma is allowed.
+    fn ends_name_list(&self) -> bool {
+        self.is_eof()
+            || self.is(TokenKind::Doc(String::new()))
+            || self.is(TokenKind::Import)
+            || self.is(TokenKind::Data)
+            || self.is(TokenKind::Type)
+            || self.is(TokenKind::Class)
+            || self.is(TokenKind::Instance)
+            || self.is(TokenKind::Colon)
+            || self.is(TokenKind::Export)
+            || self.is(TokenKind::Language)
     }
 
     fn parse_import(&mut self) -> Result<Import, Diagnostic> {
         let start = self.cur().span;
         self.bump();
-        let publish = self.eat(&TokenKind::Public);
         let TokenKind::String(path) = self.cur().kind.clone() else {
             return Err(self.error(Error::ExpectedImportPath));
         };
@@ -152,35 +224,7 @@ impl Parser {
             path,
             names,
             all,
-            publish,
         })
-    }
-
-    fn parse_items(&mut self) -> Result<Vec<Item>, Diagnostic> {
-        let mut items = Vec::new();
-        loop {
-            let doc = self.take_doc();
-            self.skip_newlines();
-            if self.is_eof() {
-                break;
-            }
-            if self.is(TokenKind::Import) {
-                if !doc.is_empty() {
-                    return Err(self.error(Error::DocNotOnDeclaration));
-                }
-                return Err(self.error(Error::ImportAfterDeclaration));
-            }
-            let mut item = self.parse_item()?;
-            match &mut item {
-                Item::Data(data) => data.doc = doc,
-                Item::Synonym(synonym) => synonym.doc = doc,
-                Item::Def(def) => def.doc = doc,
-                Item::Class(class) => class.doc = doc,
-                Item::Instance(_) => {}
-            }
-            items.push(item);
-        }
-        Ok(items)
     }
 
     /// `..` lines with no blank line between them or before the next declaration.
@@ -438,17 +482,10 @@ impl Parser {
         self.skip_newlines();
         let start = self.cur().span;
         self.expect(&TokenKind::Colon, Error::ExpectedColon)?;
-        // `foreign` and `private` sit after `:` and before the name.
-        // Each once, either order. A repeat is not a name.
+        // `foreign` sits after `:` and before the name. A repeat is not a name.
         let mut vis = Vis::PUBLIC;
-        loop {
-            if !vis.foreign && self.eat(&TokenKind::Foreign) {
-                vis.foreign = true;
-            } else if !vis.private && self.eat(&TokenKind::Private) {
-                vis.private = true;
-            } else {
-                break;
-            }
+        if self.eat(&TokenKind::Foreign) {
+            vis.foreign = true;
         }
         let name_span = self.cur().span;
         let name = self.expect_ident(Error::ExpectedDefinitionName)?;
@@ -573,6 +610,7 @@ impl Parser {
                 | TokenKind::Class
                 | TokenKind::Instance
                 | TokenKind::Colon
+                | TokenKind::Export
         ) {
             return true;
         }
@@ -2075,8 +2113,57 @@ mod tests {
     fn import_all_prints() {
         let text = ok("~ \"Data/Either\" (..)\n\n: getName ( Str -- Str )\n  dup\n");
         assert!(text.contains("~ \"Data/Either\" (..)"), "{text}");
-        let published = ok("~ public \"Data/Scan\" (scan)\n");
-        assert!(published.contains("~ public \"Data/Scan\" (scan)"), "{published}");
+        assert_eq!(
+            err("~ public \"Data/Scan\" (scan)\n", ParseMode::Source),
+            "expected import path"
+        );
+        assert_eq!(
+            err("language 1\n~ public \"Data/Scan\" (scan)\n", ParseMode::Interface),
+            "expected import path"
+        );
+        let listed = ok("@ Maybe, Nothing, Just\n\n; Maybe a = Nothing | Just a\n");
+        assert!(listed.contains("@ Maybe, Nothing, Just\n"), "{listed}");
+        let after_import = ok(
+            "~ \"Data/Clock\" (Time)\n\n@ Time, soon\n\n: soon ( -- Unit )\n  Unit\n",
+        );
+        assert!(after_import.starts_with("@ Time, soon\n"), "{after_import}");
+        assert!(after_import.contains("~ \"Data/Clock\" (Time)"), "{after_import}");
+        let after_word = ok(
+            ": soon ( -- Unit )\n  Unit\n\n@ soon\n",
+        );
+        assert!(after_word.starts_with("@ soon\n"), "{after_word}");
+        assert!(after_word.contains(": soon ( -- Unit )"), "{after_word}");
+        let between = ok(
+            "~ \"Data/Clock\" (Time)\n\n@ Time\n\n~ \"Data/Sink\" (Sink)\n",
+        );
+        assert!(between.starts_with("@ Time\n"), "{between}");
+        assert!(between.contains("~ \"Data/Clock\" (Time)"), "{between}");
+        assert!(between.contains("~ \"Data/Sink\" (Sink)"), "{between}");
+        let wrapped = ok("@\n  Stream, Behavior,\n  listen\n\n~ \"Data/Stream\" (Stream)\n");
+        assert!(wrapped.contains("@ Stream, Behavior, listen\n"), "{wrapped}");
+        let empty = ok("@\n\n: main ( -- Unit )\n  Unit\n");
+        assert!(empty.contains("@\n"), "{empty}");
+        assert!(!empty.contains("@ main"), "{empty}");
+        assert_eq!(
+            err("@ A\n@ B\n", ParseMode::Source),
+            "duplicate definition @"
+        );
+        assert_eq!(
+            err(
+                ": soon ( -- Unit )\n  Unit\n@ soon\n@ again\n",
+                ParseMode::Source
+            ),
+            "duplicate definition @"
+        );
+        assert_eq!(
+            err(".. The list.\n@ soon\n", ParseMode::Source),
+            "doc comment must sit above a declaration"
+        );
+        assert_eq!(err("public (A)\n", ParseMode::Source), "expected declaration");
+        assert_eq!(
+            err("language 1\npublic (A)\n", ParseMode::Interface),
+            "expected declaration"
+        );
         assert_eq!(
             err(
                 ": print ( Str -- ! { console } )\n  drop\n",
@@ -2112,50 +2199,22 @@ mod tests {
             err("foreign : nzero ( Num -- Bool )\n", ParseMode::Source),
             "expected declaration"
         );
-        let both = ok(": foreign private nzero ( Num -- Bool )\n");
-        assert!(both.contains(": foreign private nzero ( Num -- Bool )"), "{both}");
-        let swapped = ok(": private foreign nzero ( Num -- Bool )\n");
-        assert!(
-            swapped.contains(": foreign private nzero ( Num -- Bool )"),
-            "{swapped}"
+        assert_eq!(
+            err(": foreign private nzero ( Num -- Bool )\n", ParseMode::Source),
+            "expected '('"
         );
-        let iface_source = "language 1\n: private foreign nzero ( Num -- Bool )\n";
-        let iface = parse(iface_source, ParseMode::Interface)
-            .unwrap_or_else(|error| panic!("{}", render(iface_source, &error)))
-            .to_string();
-        assert!(
-            iface.contains(": foreign private nzero ( Num -- Bool )"),
-            "{iface}"
-        );
-        let hidden_source = "language 1\n: private hidden ( Int -- Int )\n";
-        let hidden_iface = parse(hidden_source, ParseMode::Interface)
-            .unwrap_or_else(|error| panic!("{}", render(hidden_source, &error)))
-            .to_string();
-        assert!(
-            hidden_iface.contains(": private hidden ( Int -- Int )"),
-            "{hidden_iface}"
+        assert_eq!(
+            err("language 1\n: private hidden ( Int -- Int )\n", ParseMode::Interface),
+            "expected '('"
         );
         assert_eq!(
             err(": foreign foreign nzero ( Num -- Bool )\n", ParseMode::Source),
             "expected definition name"
         );
         assert_eq!(
-            err(": private private nzero ( Num -- Bool )\n", ParseMode::Source),
-            "expected definition name"
-        );
-        assert_eq!(
-            err(
-                ": foreign private nzero ( Num -- Bool )\n  dup\n",
-                ParseMode::Source
-            ),
-            "foreign declaration has a body"
-        );
-        assert_eq!(
             err("def : foreign nzero ( Num -- Bool )\n", ParseMode::Source),
             "expected declaration"
         );
-        let hidden = ok(": private hidden ( Int -- Int )\n  dup\n");
-        assert!(hidden.contains(": private hidden ( Int -- Int )"), "{hidden}");
         let source = ": fact ( Int -- Int )\n  0n -> 1n\n  n -> n dup 1n isub fact imul\n: double ( Int -- Int ) dup iadd\n";
         let module = parse(source, ParseMode::Source).unwrap_or_else(|error| panic!("{}", error.message));
         assert_eq!(module.items.len(), 2, "{module}");

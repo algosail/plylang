@@ -142,7 +142,7 @@ impl Checker {
         for item in &module.items {
             if let Item::Def(def) = item {
                 if !def.body.is_empty() || !def.clauses.is_empty() {
-                    defs.push(self.lower_def(def)?);
+                    defs.push(self.lower_def(module, def)?);
                 }
             }
         }
@@ -174,19 +174,27 @@ impl Checker {
         Ok(anf)
     }
 
-    fn lower_def(&mut self, def: &crate::ast::Def) -> Result<AnfDef, Diagnostic> {
+    fn lower_def(
+        &mut self,
+        module: &crate::ast::Module,
+        def: &crate::ast::Def,
+    ) -> Result<AnfDef, Diagnostic> {
         self.use_dicts.clear();
         self.deferred.clear();
-        let first = self.lower_def_pass(def)?;
+        let first = self.lower_def_pass(module, def)?;
         if self.use_dicts.is_empty() {
             return Ok(first);
         }
-        let second = self.lower_def_pass(def)?;
+        let second = self.lower_def_pass(module, def)?;
         self.use_dicts.clear();
         Ok(second)
     }
 
-    fn lower_def_pass(&mut self, def: &crate::ast::Def) -> Result<AnfDef, Diagnostic> {
+    fn lower_def_pass(
+        &mut self,
+        module: &crate::ast::Module,
+        def: &crate::ast::Def,
+    ) -> Result<AnfDef, Diagnostic> {
         let scheme = self.lookup(&def.name).expect("def was registered");
         let (input, output, effect, constraints) = self.instantiate_scheme(&scheme, true);
         let saved = self.ambient.replace(effect);
@@ -256,7 +264,7 @@ impl Checker {
         }
         Ok(AnfDef {
             name: def.name.clone(),
-            export: !def.vis.is_private(),
+            export: crate::surface::js_exports_def(module, def),
             params,
             body: Expr {
                 lets: frame.lets,

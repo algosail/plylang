@@ -65,17 +65,8 @@ pub fn complete(source: &str, path: &Path, line: u32, character: u32) -> Vec<Com
     let mut items = match context {
         Context::None => Vec::new(),
         Context::Keyword => keywords(path.to_string_lossy().ends_with(".d.ply"), replace),
-        Context::Modifier { foreign, private } => modifiers(foreign, private, replace),
-        Context::ImportPath { quoted, publish } => {
-            let mut items = import_paths(path, replace, quoted);
-            if !quoted && !publish {
-                items.insert(
-                    0,
-                    entry("public", "public ", CompletionKind::Keyword, "", "", "0", replace),
-                );
-            }
-            items
-        }
+        Context::Modifier { foreign } => modifiers(foreign, replace),
+        Context::ImportPath { quoted } => import_paths(path, replace, quoted),
         Context::ImportName { path: import, seen, has_all } => {
             import_names(path, &import, &seen, has_all, replace)
         }
@@ -103,8 +94,8 @@ pub fn complete(source: &str, path: &Path, line: u32, character: u32) -> Vec<Com
 enum Context {
     None,
     Keyword,
-    Modifier { foreign: bool, private: bool },
-    ImportPath { quoted: bool, publish: bool },
+    Modifier { foreign: bool },
+    ImportPath { quoted: bool },
     ImportName { path: String, seen: Vec<String>, has_all: bool },
     Type { vars: Vec<String> },
     Word,
@@ -114,10 +105,7 @@ fn context_of(walked: &Walk, partial: Option<&Token>, at_column_0: bool) -> Cont
     if matches!(partial.map(|token| &token.kind), Some(TokenKind::String(_)))
         && matches!(walked.state, Place::Import)
     {
-        return Context::ImportPath {
-            quoted: true,
-            publish: walked.saw_public,
-        };
+        return Context::ImportPath { quoted: true };
     }
     match walked.state {
         Place::ImportList => Context::ImportName {
@@ -125,14 +113,8 @@ fn context_of(walked: &Walk, partial: Option<&Token>, at_column_0: bool) -> Cont
             seen: walked.seen.clone(),
             has_all: walked.has_all,
         },
-        Place::Import => Context::ImportPath {
-            quoted: false,
-            publish: walked.saw_public,
-        },
-        Place::Vis | Place::DefName => Context::Modifier {
-            foreign: walked.saw_foreign,
-            private: walked.saw_private,
-        },
+        Place::Import => Context::ImportPath { quoted: false },
+        Place::Vis | Place::DefName => Context::Modifier { foreign: walked.saw_foreign },
         Place::Signature => Context::Type { vars: walked.vars.clone() },
         Place::DataFields => Context::Type { vars: walked.params.clone() },
         Place::Body if !at_column_0 => Context::Word,
@@ -143,9 +125,9 @@ fn context_of(walked: &Walk, partial: Option<&Token>, at_column_0: bool) -> Cont
 
 fn keywords(interface: bool, replace: Span) -> Vec<Completion> {
     let names: &[&str] = if interface {
-        &["~", ";", "-", "&", "#", ":", "language"]
+        &["@", "~", ";", "-", "&", "#", ":", "language"]
     } else {
-        &["~", ";", "-", "&", "#", ":"]
+        &["@", "~", ";", "-", "&", "#", ":"]
     };
     names
         .iter()
@@ -153,13 +135,10 @@ fn keywords(interface: bool, replace: Span) -> Vec<Completion> {
         .collect()
 }
 
-fn modifiers(saw_foreign: bool, saw_private: bool, replace: Span) -> Vec<Completion> {
+fn modifiers(saw_foreign: bool, replace: Span) -> Vec<Completion> {
     let mut names = Vec::new();
     if !saw_foreign {
         names.push("foreign");
-    }
-    if !saw_private {
-        names.push("private");
     }
     names
         .into_iter()
@@ -190,8 +169,7 @@ fn import_names(
     let mut items = Vec::new();
     if let Some(file) = provider_file(from, import) {
         if let Some(module) = read_module(&file) {
-            let mut load = |start: &Path, path: &str| load_surface(start, path);
-            let names = surface::public_names(&module, &file, &mut load);
+            let names = surface::public_names(&module);
             for name in names {
                 if seen.iter().any(|have| have == &name) {
                     continue;
@@ -351,7 +329,7 @@ fn imported_words(from: &Path, module: &Module) -> Vec<Named> {
                 continue;
             };
             match found {
-                Found::Def(def) if def.name == name && !def.vis.is_private() => names.push(Named {
+                Found::Def(def) if def.name == name => names.push(Named {
                     label: def.name.clone(),
                     kind: CompletionKind::Word,
                     detail: scheme_string(&def.scheme),
@@ -440,8 +418,7 @@ fn selected_names(from: &Path, import: &crate::ast::Import) -> Vec<String> {
     let Some(module) = read_module(&file) else {
         return Vec::new();
     };
-    let mut load = |start: &Path, path: &str| load_surface(start, path);
-    surface::public_names(&module, &file, &mut load)
+    surface::public_names(&module)
 }
 
 fn found_exports(found: &Found, name: &str) -> Vec<(CompletionKind, String, String)> {
@@ -486,7 +463,7 @@ fn found_exports(found: &Found, name: &str) -> Vec<(CompletionKind, String, Stri
                 ));
             }
         }
-        Found::Def(def) if def.name == name && !def.vis.is_private() => {
+        Found::Def(def) if def.name == name => {
             entries.push((
                 CompletionKind::Word,
                 scheme_string(&def.scheme),
@@ -644,8 +621,6 @@ struct Walk {
     binders: bool,
     depth: i32,
     saw_foreign: bool,
-    saw_private: bool,
-    saw_public: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -711,8 +686,6 @@ fn walk(tokens: &[&Token]) -> Walk {
         binders: true,
         depth: 0,
         saw_foreign: false,
-        saw_private: false,
-        saw_public: false,
     };
     let mut index = 0;
     while index < tokens.len() {
@@ -722,8 +695,6 @@ fn walk(tokens: &[&Token]) -> Walk {
             walked.state = Place::Top;
             walked.depth = 0;
             walked.saw_foreign = false;
-            walked.saw_private = false;
-            walked.saw_public = false;
         }
         step(&mut walked, token, next);
         index += 1;
@@ -758,7 +729,6 @@ fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
             TokenKind::Import => walked.state = Place::Import,
             TokenKind::Colon => {
                 walked.saw_foreign = false;
-                walked.saw_private = false;
                 walked.state = Place::DefName;
             }
             TokenKind::Data => walked.state = Place::DataName,
@@ -767,16 +737,13 @@ fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
         Place::Vis => match &token.kind {
             TokenKind::Ident(_) => walked.state = Place::DefParen,
             TokenKind::Foreign => walked.saw_foreign = true,
-            TokenKind::Private => walked.saw_private = true,
             TokenKind::Newline => {
                 walked.saw_foreign = false;
-                walked.saw_private = false;
                 walked.state = Place::Top;
             }
             _ => {}
         },
         Place::Import => match &token.kind {
-            TokenKind::Public => walked.saw_public = true,
             TokenKind::String(path) => {
                 walked.path = path.clone();
                 walked.state = Place::ImportString;
@@ -805,13 +772,8 @@ fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
                 walked.saw_foreign = true;
                 walked.state = Place::Vis;
             }
-            TokenKind::Private => {
-                walked.saw_private = true;
-                walked.state = Place::Vis;
-            }
             TokenKind::Newline => {
                 walked.saw_foreign = false;
-                walked.saw_private = false;
                 walked.state = Place::Top;
             }
             _ => {}
@@ -898,6 +860,7 @@ fn is_item(token: &Token) -> bool {
                 | TokenKind::Class
                 | TokenKind::Instance
                 | TokenKind::Colon
+                | TokenKind::Export
         )
 }
 
@@ -1684,35 +1647,26 @@ mod tests {
         assert!(!keywords.iter().any(|label| label == "class"), "{keywords:?}");
         assert!(!keywords.iter().any(|label| label == "instance"), "{keywords:?}");
         assert!(!keywords.iter().any(|label| label == "import"), "{keywords:?}");
+        assert!(keywords.iter().any(|label| label == "@"), "{keywords:?}");
         assert!(!keywords.iter().any(|label| label == "public"), "{keywords:?}");
         let after_import = labels("~ ", "~ ");
-        assert!(after_import.iter().any(|label| label == "public"), "{after_import:?}");
-        let after_public = labels("~ public ", "~ public ");
-        assert!(!after_public.iter().any(|label| label == "public"), "{after_public:?}");
+        assert!(!after_import.iter().any(|label| label == "public"), "{after_import:?}");
         assert!(!keywords.iter().any(|label| label == "dup"), "{keywords:?}");
         let after_colon = labels(": ", ": ");
         assert!(after_colon.iter().any(|label| label == "foreign"), "{after_colon:?}");
-        assert!(after_colon.iter().any(|label| label == "private"), "{after_colon:?}");
-        let after_foreign = labels(": foreign ", ": foreign ");
-        assert_eq!(after_foreign, vec!["private".to_string()]);
-        let after_private = labels(": private ", ": private ");
-        assert_eq!(after_private, vec!["foreign".to_string()]);
-        assert!(labels(": foreign private ", ": foreign private ").is_empty());
-        assert!(labels(": private foreign ", ": private foreign ").is_empty());
+        assert!(!after_colon.iter().any(|label| label == "private"), "{after_colon:?}");
+        assert!(labels(": foreign ", ": foreign ").is_empty());
         let again = ": foreign read ( -- Str )\n\n: ";
         let after_next = labels(again, "\n\n: ");
         assert!(after_next.iter().any(|label| label == "foreign"), "{after_next:?}");
-        assert!(after_next.iter().any(|label| label == "private"), "{after_next:?}");
+        assert!(!after_next.iter().any(|label| label == "private"), "{after_next:?}");
         let (line, character) = at(": ", ": ");
         let iface = complete(": ", Path::new("M.d.ply"), line, character);
         assert!(iface.iter().any(|item| item.label == "foreign"), "{iface:?}");
-        assert!(iface.iter().any(|item| item.label == "private"), "{iface:?}");
+        assert!(!iface.iter().any(|item| item.label == "private"), "{iface:?}");
         let (line, character) = at(": foreign ", ": foreign ");
         let iface_foreign = complete(": foreign ", Path::new("M.d.ply"), line, character);
-        assert_eq!(
-            iface_foreign.iter().map(|item| item.label.as_str()).collect::<Vec<_>>(),
-            vec!["private"]
-        );
+        assert!(iface_foreign.is_empty(), "{iface_foreign:?}");
         assert!(labels(": f ( Int -- Int )\n  dup . dr", ". dr").is_empty());
     }
 
@@ -1738,6 +1692,8 @@ mod tests {
         fs::write(
             root.join("src/Data/Maybe.ply"),
             "\
+@ Maybe, Nothing, Just, fromMaybe, mapMaybe
+
 ; Maybe a = Nothing | Just a
 
 : fromMaybe ( a (Maybe a) -- a )
@@ -1783,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn hides_a_private_word_and_keeps_its_doc_on_the_public_one() {
+    fn hides_an_unlisted_word_and_keeps_its_doc() {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let root = std::env::temp_dir().join(format!("plylang-complete-{nanos}"));
         let _cleanup = Cleanup(root.clone());
@@ -1799,7 +1755,7 @@ mod tests {
         .unwrap();
         fs::write(
             root.join("src/Data/Num.ply"),
-            ".. Add two integers.\n: add ( Int Int -- Int )\n  drop\n\n: private hidden ( Int -- Int )\n  dup drop\n",
+            "@ add\n\n.. Add two integers.\n: add ( Int Int -- Int )\n  drop\n\n: hidden ( Int -- Int )\n  dup drop\n",
         )
         .unwrap();
         let app = root.join("src/App.ply");

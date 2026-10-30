@@ -173,6 +173,7 @@ impl<'a> Lexer<'a> {
                 return Ok(self.make(TokenKind::FieldSet(name), start, self.index));
             }
             '>' => TokenKind::RAngle,
+            '@' => TokenKind::Export,
             // Declaration runes. `-` at column 0 is a synonym; other dashes stay in `dash`.
             '~' => TokenKind::Import,
             ';' => TokenKind::Data,
