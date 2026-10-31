@@ -26,11 +26,22 @@ pub struct Hover {
 
 /// `line` and `character` are the 0-based UTF-16 position LSP sends.
 pub fn hover(source: &str, path: &Path, line: u32, character: u32) -> Option<Hover> {
+    let sites = stack_sites(path, source);
+    hover_with_sites(source, path, line, character, &sites)
+}
+
+/// Hover using stack notes already computed for this text.
+pub fn hover_with_sites(
+    source: &str,
+    path: &Path,
+    line: u32,
+    character: u32,
+    sites: &[StackAt],
+) -> Option<Hover> {
     let offset = offset_at(source, line, character);
     let tokens = tokenize(source).ok()?;
     let path_text = path.to_string_lossy();
     let module = parse(source, mode_from_path(&path_text)).ok()?;
-    let sites = stack_sites(path, source);
     if let Some(token) = token_at(&tokens, offset) {
         let contents = match &token.kind {
             TokenKind::Ident(name) => word_hover(path, &module, name, token.span, &sites),

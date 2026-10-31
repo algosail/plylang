@@ -5,7 +5,9 @@ use lsp_types::{
     CompletionOptions, HoverProviderCapability, OneOf, ServerCapabilities,
     TextDocumentSyncCapability, TextDocumentSyncKind,
 };
-use plylang::{check_buffer, complete, definition, hover, utf16_position, CompletionKind};
+use plylang::{
+    buffer_notes, complete, definition, hover_with_sites, utf16_position, CompletionKind, StackAt,
+};
 use serde::Deserialize;
 
 fn main() {
@@ -87,10 +89,21 @@ fn serve(connection: Connection) -> Result<(), String> {
                     .map_err(|error| error.to_string())?;
             }
             Message::Notification(notification) => {
-                if let Some((uri, text)) = document_text(&notification) {
-                    docs.insert(uri, text);
+                if let Some(uri) = closed_uri(&notification) {
+                    docs.remove(&uri);
+                    continue;
                 }
-                if let Some(published) = publish_for(&notification) {
+                if let Some((uri, text)) = document_text(&notification) {
+                    let path = uri_path(&uri);
+                    let notes = buffer_notes(std::path::Path::new(&path), &text);
+                    let published = publish(&uri, &text, notes.error.as_ref());
+                    docs.insert(
+                        uri,
+                        Opened {
+                            text,
+                            sites: notes.sites,
+                        },
+                    );
                     connection
                         .sender
                         .send(published.into())
@@ -118,25 +131,26 @@ fn document_text(notification: &Notification) -> Option<(String, String)> {
     }
 }
 
-fn hover_response(docs: &HashMap<String, String>, request: &Request) -> Response {
+fn hover_response(docs: &HashMap<String, Opened>, request: &Request) -> Response {
     let params: HoverRequest = match serde_json::from_value(request.params.clone()) {
         Ok(params) => params,
         Err(_) => return Response::new_ok(request.id.clone(), serde_json::Value::Null),
     };
-    let Some(text) = docs.get(&params.text_document.uri) else {
+    let Some(opened) = docs.get(&params.text_document.uri) else {
         return Response::new_ok(request.id.clone(), serde_json::Value::Null);
     };
     let path = uri_path(&params.text_document.uri);
-    let Some(found) = hover(
-        text,
+    let Some(found) = hover_with_sites(
+        &opened.text,
         std::path::Path::new(&path),
         params.position.line,
         params.position.character,
+        &opened.sites,
     ) else {
         return Response::new_ok(request.id.clone(), serde_json::Value::Null);
     };
-    let (start_line, start_character) = utf16_position(text, found.span.start);
-    let (end_line, end_character) = utf16_position(text, found.span.end);
+    let (start_line, start_character) = utf16_position(&opened.text, found.span.start);
+    let (end_line, end_character) = utf16_position(&opened.text, found.span.end);
     Response::new_ok(
         request.id.clone(),
         serde_json::json!({
@@ -149,14 +163,15 @@ fn hover_response(docs: &HashMap<String, String>, request: &Request) -> Response
     )
 }
 
-fn definition_response(docs: &HashMap<String, String>, request: &Request) -> Response {
+fn definition_response(docs: &HashMap<String, Opened>, request: &Request) -> Response {
     let params: HoverRequest = match serde_json::from_value(request.params.clone()) {
         Ok(params) => params,
         Err(_) => return Response::new_ok(request.id.clone(), serde_json::Value::Null),
     };
-    let Some(text) = docs.get(&params.text_document.uri) else {
+    let Some(opened) = docs.get(&params.text_document.uri) else {
         return Response::new_ok(request.id.clone(), serde_json::Value::Null);
     };
+    let text = &opened.text;
     let path = uri_path(&params.text_document.uri);
     let Some(found) = definition(
         text,
@@ -191,7 +206,7 @@ fn definition_response(docs: &HashMap<String, String>, request: &Request) -> Res
     )
 }
 
-fn completion_response(docs: &HashMap<String, String>, request: &Request) -> Response {
+fn completion_response(docs: &HashMap<String, Opened>, request: &Request) -> Response {
     let params: HoverRequest = match serde_json::from_value(request.params.clone()) {
         Ok(params) => params,
         Err(_) => {
@@ -201,12 +216,13 @@ fn completion_response(docs: &HashMap<String, String>, request: &Request) -> Res
             );
         }
     };
-    let Some(text) = docs.get(&params.text_document.uri) else {
+    let Some(opened) = docs.get(&params.text_document.uri) else {
         return Response::new_ok(
             request.id.clone(),
             serde_json::json!({ "isIncomplete": false, "items": [] }),
         );
     };
+    let text = &opened.text;
     let path = uri_path(&params.text_document.uri);
     let items = complete(
         text,
@@ -265,25 +281,15 @@ fn kind_code(kind: CompletionKind) -> u32 {
     }
 }
 
-fn publish_for(notification: &Notification) -> Option<Notification> {
-    let (uri, text) = match notification.method.as_str() {
-        "textDocument/didOpen" => {
-            let params: DidOpen = serde_json::from_value(notification.params.clone()).ok()?;
-            (params.text_document.uri, params.text_document.text)
-        }
-        "textDocument/didChange" => {
-            let params: DidChange = serde_json::from_value(notification.params.clone()).ok()?;
-            let text = params.content_changes.last()?.text.clone();
-            (params.text_document.uri, text)
-        }
-        _ => return None,
-    };
-    Some(publish(&uri, &text))
+fn closed_uri(notification: &Notification) -> Option<String> {
+    if notification.method != "textDocument/didClose" {
+        return None;
+    }
+    let params: DidClose = serde_json::from_value(notification.params.clone()).ok()?;
+    Some(params.text_document.uri)
 }
 
-fn publish(uri: &str, text: &str) -> Notification {
-    let path = uri_path(uri);
-    let error = check_buffer(std::path::Path::new(&path), text).err();
+fn publish(uri: &str, text: &str, error: Option<&plylang::Diagnostic>) -> Notification {
     let diagnostics = match error {
         None => Vec::new(),
         Some(error) => {
@@ -329,6 +335,17 @@ fn uri_path(uri: &str) -> String {
         index += 1;
     }
     String::from_utf8(bytes).unwrap_or_else(|_| raw.to_string())
+}
+
+struct Opened {
+    text: String,
+    sites: Vec<StackAt>,
+}
+
+#[derive(Deserialize)]
+struct DidClose {
+    #[serde(rename = "textDocument")]
+    text_document: HoverDocument,
 }
 
 #[derive(Deserialize)]

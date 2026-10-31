@@ -25,7 +25,7 @@ use crate::span::Span;
 use super::{Checker, Dict, EffectId, StackId, StackNode, TyId, TyNode};
 
 pub(crate) fn to_anf(module: &Module) -> Result<AnfModule, Diagnostic> {
-    Checker::new().lower_module(module)
+    super::with_checker(|checker| checker.lower_module(module))
 }
 
 pub fn javascript(module: &Module) -> Result<String, Diagnostic> {

@@ -21,8 +21,8 @@ use serde_json::Value;
 use crate::anf::{js_ident, referenced_words, AnfModule};
 use crate::ast::{scheme_string, push_doc, Def, Exports, Import, Item, Module, StackTail, Type};
 use crate::check::{
-    check, check_with_imports_key, collect_sites, collect_sites_with_imports_key, KnownModule,
-    ResolvedImport, StackAt,
+    check_and_note, check_with_imports_key, collect_sites, collect_sites_with_imports_key,
+    module_notes, KnownModule, ResolvedImport, StackAt,
 };
 use crate::codes::{error_url, Error};
 use crate::diagnostic::Diagnostic;
@@ -317,54 +317,70 @@ fn snippet_javascript(path: &Path) -> Result<String, BuildError> {
     apply_entry(path, &source, &module, js)
 }
 
+/// One editor check: the diagnostic, and the stack notes for the same text.
+/// Hover reads `sites` instead of checking the buffer again.
+pub struct BufferNotes {
+    pub error: Option<Diagnostic>,
+    pub sites: Vec<StackAt>,
+}
+
 /// Check one editor buffer. Inside a package, imports resolve as in `plylang build`.
 /// Outside a package this is the single-file checker. `plylang check` checks the
 /// whole package and does not call this.
 pub fn check_buffer(path: &Path, source: &str) -> Result<(), Diagnostic> {
-    let mode = if path.to_string_lossy().ends_with(".d.ply") {
-        ParseMode::Interface
-    } else {
-        ParseMode::Source
-    };
-    let module = parse(source, mode)?;
-    if mode == ParseMode::Source {
-        reject_bad_entry(&module)?;
+    match buffer_notes(path, source).error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
-    let Some(root) = find_ply_root(path) else {
-        return check(&module);
-    };
-    let package = read_package(&root).map_err(|error| {
-        Diagnostic::with_code(Span::new(0, 0), error.code, error.message)
-    })?;
-    let mut doc = OpenDoc {
-        package,
-        units: Vec::new(),
-        by_file: HashMap::new(),
-        by_module: HashMap::new(),
-        exports_cache: HashMap::new(),
-    };
-    doc.push_buffer(path, module);
-    doc.visit(0, &mut Vec::new(), None)?;
-    doc.check_open()
 }
 
 /// Stack notes for the editor. Same import rules as [`check_buffer`].
 /// A failed check still returns the terms reached before the error.
 /// A package that cannot be resolved falls back to a single-file check.
 pub fn stack_sites(path: &Path, source: &str) -> Vec<StackAt> {
+    buffer_notes(path, source).sites
+}
+
+/// The diagnostic and the stack notes of one buffer, from one check.
+pub fn buffer_notes(path: &Path, source: &str) -> BufferNotes {
     let mode = if path.to_string_lossy().ends_with(".d.ply") {
         ParseMode::Interface
     } else {
         ParseMode::Source
     };
-    let Ok(module) = parse(source, mode) else {
-        return Vec::new();
+    let module = match parse(source, mode) {
+        Ok(module) => module,
+        Err(error) => {
+            return BufferNotes {
+                error: Some(error),
+                sites: Vec::new(),
+            };
+        }
+    };
+    let entry_error = if mode == ParseMode::Source {
+        reject_bad_entry(&module).err()
+    } else {
+        None
     };
     let Some(root) = find_ply_root(path) else {
-        return collect_sites(&module);
+        let (error, sites) = module_notes(&module);
+        return BufferNotes {
+            error: entry_error.or(error),
+            sites,
+        };
     };
-    let Ok(package) = read_package(&root) else {
-        return collect_sites(&module);
+    let package = match read_package(&root) {
+        Ok(package) => package,
+        Err(error) => {
+            return BufferNotes {
+                error: entry_error.or(Some(Diagnostic::with_code(
+                    Span::new(0, 0),
+                    error.code,
+                    error.message,
+                ))),
+                sites: collect_sites(&module),
+            };
+        }
     };
     let mut doc = OpenDoc {
         package,
@@ -374,10 +390,17 @@ pub fn stack_sites(path: &Path, source: &str) -> Vec<StackAt> {
         exports_cache: HashMap::new(),
     };
     doc.push_buffer(path, module.clone());
-    if doc.visit(0, &mut Vec::new(), None).is_err() {
-        return collect_sites(&module);
+    if let Err(error) = doc.visit(0, &mut Vec::new(), None) {
+        return BufferNotes {
+            error: entry_error.or(Some(error)),
+            sites: collect_sites(&module),
+        };
     }
-    doc.sites()
+    let mut notes = doc.noted();
+    if let Some(error) = entry_error {
+        notes.error = Some(error);
+    }
+    notes
 }
 
 /// Import paths the package of `from_file` can name: files under the source
@@ -1619,7 +1642,7 @@ impl OpenDoc {
         Ok(exports)
     }
 
-    fn check_open(&self) -> Result<(), Diagnostic> {
+    fn noted(&self) -> BufferNotes {
         let import_count = self.units[0].module.imports.len();
         let mut providers = Vec::with_capacity(import_count);
         let mut knowns = Vec::with_capacity(import_count);
@@ -1642,12 +1665,25 @@ impl OpenDoc {
             self.units[0].module_path.as_deref(),
         );
         if self.buffer_needs_public() && matches!(self.units[0].module.exports, Exports::Closed) {
-            return Err(Diagnostic::new(
-                self.units[0].module.span,
-                Error::MissingPublicList,
-            ));
+            return BufferNotes {
+                error: Some(Diagnostic::new(
+                    self.units[0].module.span,
+                    Error::MissingPublicList,
+                )),
+                sites: self.sites(),
+            };
         }
-        check_with_imports_key(&self.units[0].module, &resolved, &key).map(|_| ())
+        let noted = check_and_note(&self.units[0].module, &resolved, &key);
+        if !noted.sites.is_empty() {
+            return BufferNotes {
+                error: noted.error,
+                sites: noted.sites,
+            };
+        }
+        BufferNotes {
+            error: noted.error,
+            sites: collect_sites(&self.units[0].module),
+        }
     }
 
     fn buffer_needs_public(&self) -> bool {

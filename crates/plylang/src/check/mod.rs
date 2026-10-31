@@ -20,6 +20,7 @@
 mod clauses;
 mod lower;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ast::{
@@ -36,7 +37,7 @@ use crate::span::Span;
 pub use lower::javascript;
 
 pub fn check(module: &Module) -> Result<(), Diagnostic> {
-    Checker::new().check_module(module)
+    with_checker(|checker| checker.check_module(module))
 }
 
 /// One module in an import closure, with the file that declared it.
@@ -108,32 +109,102 @@ pub(crate) fn check_with_imports_key(
     imports: &[ResolvedImport<'_>],
     module_key: &str,
 ) -> Result<CheckedModule, Diagnostic> {
-    let mut checker = Checker::new();
-    checker.module_key = module_key.to_string();
-    for imported in imports {
-        checker.import_resolved(imported.provider, imported.import, imported.known)?;
-    }
-    checker.prepare(module)?;
-    checker.check_bodies(module)?;
-    let mut foreign_arity = Vec::new();
-    for item in &module.items {
-        if let Item::Def(def) = item {
-            if def.vis.is_foreign() {
-                if let Some(arity) = checker.concrete_input_len(&def.name) {
-                    foreign_arity.push((def.name.clone(), arity));
+    with_checker(|checker| {
+        checker.module_key = module_key.to_string();
+        for imported in imports {
+            checker.import_resolved(imported.provider, imported.import, imported.known)?;
+        }
+        checker.prepare(module)?;
+        checker.check_bodies(module)?;
+        let mut foreign_arity = Vec::new();
+        for item in &module.items {
+            if let Item::Def(def) = item {
+                if def.vis.is_foreign() {
+                    if let Some(arity) = checker.concrete_input_len(&def.name) {
+                        foreign_arity.push((def.name.clone(), arity));
+                    }
                 }
             }
         }
+        let anf = checker.lower_prepared(module)?;
+        Ok(CheckedModule { anf, foreign_arity })
+    })
+}
+
+/// The diagnostic and the stack notes from one pass. Lowering still runs when
+/// the bodies check, so an editor sees the same error as [`check_with_imports_key`].
+pub(crate) struct ImportNotes {
+    pub error: Option<Diagnostic>,
+    pub sites: Vec<StackAt>,
+}
+
+pub(crate) fn check_and_note(
+    module: &Module,
+    imports: &[ResolvedImport<'_>],
+    module_key: &str,
+) -> ImportNotes {
+    with_checker(|checker| {
+        checker.module_key = module_key.to_string();
+        for imported in imports {
+            if let Err(error) =
+                checker.import_resolved(imported.provider, imported.import, imported.known)
+            {
+                return ImportNotes {
+                    error: Some(error),
+                    sites: Vec::new(),
+                };
+            }
+        }
+        if let Err(error) = checker.prepare(module) {
+            return ImportNotes {
+                error: Some(error),
+                sites: Vec::new(),
+            };
+        }
+        let error = checker.check_bodies(module).err();
+        let sites = checker.render_sites();
+        if error.is_some() {
+            return ImportNotes { error, sites };
+        }
+        ImportNotes {
+            error: checker.lower_prepared(module).err(),
+            sites,
+        }
+    })
+}
+
+/// One checker per thread. `reset` keeps the type-buffer allocation.
+/// A fresh checker on every edit allocates that buffer again, frees it, and
+/// macOS leaves the empty region resident, so a language server grows by
+/// several megabytes on every keystroke and every hover.
+fn with_checker<T>(body: impl FnOnce(&mut Checker) -> T) -> T {
+    thread_local! {
+        static PARKED: Cell<Option<Checker>> = Cell::new(None);
     }
-    let anf = checker.lower_prepared(module)?;
-    Ok(CheckedModule { anf, foreign_arity })
+    PARKED.with(|parked| {
+        let mut checker = parked.take().unwrap_or_else(Checker::new);
+        checker.reset();
+        let value = body(&mut checker);
+        parked.set(Some(checker));
+        value
+    })
 }
 
 /// Sites from a single-file check. A body that fails still yields the terms reached before it.
 pub(crate) fn collect_sites(module: &Module) -> Vec<StackAt> {
-    let mut checker = Checker::new();
-    let _ = checker.check_module(module);
-    checker.render_sites()
+    with_checker(|checker| {
+        let _ = checker.check_module(module);
+        checker.render_sites()
+    })
+}
+
+/// Notes for one module that has no imports to install. The same pass as
+/// [`check`] plus the sites a hover reads.
+pub(crate) fn module_notes(module: &Module) -> (Option<Diagnostic>, Vec<StackAt>) {
+    with_checker(|checker| {
+        let error = checker.check_module(module).err();
+        (error, checker.render_sites())
+    })
 }
 
 pub(crate) fn collect_sites_with_imports_key(
@@ -141,21 +212,22 @@ pub(crate) fn collect_sites_with_imports_key(
     imports: &[ResolvedImport<'_>],
     module_key: &str,
 ) -> Vec<StackAt> {
-    let mut checker = Checker::new();
-    checker.module_key = module_key.to_string();
-    for imported in imports {
-        if checker
-            .import_resolved(imported.provider, imported.import, imported.known)
-            .is_err()
-        {
+    with_checker(|checker| {
+        checker.module_key = module_key.to_string();
+        for imported in imports {
+            if checker
+                .import_resolved(imported.provider, imported.import, imported.known)
+                .is_err()
+            {
+                return Vec::new();
+            }
+        }
+        if checker.prepare(module).is_err() {
             return Vec::new();
         }
-    }
-    if checker.prepare(module).is_err() {
-        return Vec::new();
-    }
-    let _ = checker.check_bodies(module);
-    checker.render_sites()
+        let _ = checker.check_bodies(module);
+        checker.render_sites()
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -565,6 +637,56 @@ impl Checker {
         };
         checker.preload();
         checker
+    }
+
+    fn reset(&mut self) {
+        self.tys.clear();
+        self.stacks.clear();
+        self.rows.clear();
+        self.effects.clear();
+        self.ambient = None;
+        self.empty = None;
+        self.words.clear();
+        self.type_arity.clear();
+        self.datas.clear();
+        self.synonyms.clear();
+        self.expanding.clear();
+        self.builtin_words.clear();
+        self.builtin_types.clear();
+        self.installed.clear();
+        self.extra_arity.clear();
+        self.locals.clear();
+        self.fn_arity.clear();
+        self.next_local = 0;
+        self.sites.clear();
+        self.pending_here = None;
+        self.kinds.clear();
+        self.type_kind = None;
+        self.ty_kind.clear();
+        self.classes.clear();
+        self.visible_classes.clear();
+        self.defined_classes.clear();
+        self.defined_data.clear();
+        self.instances.clear();
+        self.assumptions.clear();
+        self.deferred.clear();
+        self.pending_arity.clear();
+        self.pending_quotes.clear();
+        self.bind_tys.clear();
+        self.bind_arity.clear();
+        self.use_dicts.clear();
+        self.assumption_locals.clear();
+        self.solving.clear();
+        self.trail.clear();
+        self.recording = false;
+        self.frozen_ty.clear();
+        self.frozen_stack.clear();
+        self.frozen_row.clear();
+        self.frozen_effect.clear();
+        self.guarded.clear();
+        self.relax_visibility = false;
+        self.module_key.clear();
+        self.preload();
     }
 
     fn check_module(&mut self, module: &Module) -> Result<(), Diagnostic> {
@@ -5710,6 +5832,15 @@ mod tests {
             ": bad ( Num -- Num )\n  [ dup ] [ drop ] bi",
             "occurs check failed",
         );
+    }
+
+    #[test]
+    fn a_second_check_repeats_the_first() {
+        let bad = ": bad ( Str -- Int )\n  dup drop";
+        err(bad, "type mismatch: expected Int, found Str");
+        err(bad, "type mismatch: expected Int, found Str");
+        ok(": double ( Int -- Int )\n  dup drop");
+        ok(": double ( Int -- Int )\n  dup drop");
     }
 
     #[test]
