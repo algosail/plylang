@@ -711,8 +711,9 @@ impl Parser {
                 Ok(Pattern::Wild)
             }
             TokenKind::Ident(name) if is_lower(&name) => {
+                let span = self.cur().span;
                 self.bump();
-                Ok(Pattern::Bind(name))
+                Ok(Pattern::Bind(span, name))
             }
             TokenKind::Ident(name) if is_upper(&name) => {
                 self.bump();
@@ -2258,7 +2259,7 @@ mod tests {
         assert!(def.body.is_empty());
         assert!(matches!(
             def.clauses[0].patterns.as_slice(),
-            [crate::ast::Pattern::Bind(name)] if name == "n"
+            [crate::ast::Pattern::Bind(_, name)] if name == "n"
         ));
         assert!(matches!(def.clauses[0].body[0].node, crate::ast::TermNode::Word(ref name) if name == "n"));
         assert_eq!(

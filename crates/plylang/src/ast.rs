@@ -158,7 +158,8 @@ pub struct Clause {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
     Wild,
-    Bind(String),
+    /// A name for this slot. The span is the name, so a hover can show its type.
+    Bind(Span, String),
     Lit(Lit),
     Unpack(String),
     Ctor(String, Vec<Pattern>),
@@ -679,7 +680,7 @@ fn clause_string(clause: &Clause) -> String {
 fn pattern_string(pattern: &Pattern) -> String {
     match pattern {
         Pattern::Wild => "_".to_string(),
-        Pattern::Bind(name) | Pattern::Unpack(name) => name.clone(),
+        Pattern::Bind(_, name) | Pattern::Unpack(name) => name.clone(),
         Pattern::Lit(lit) => lit_string(lit),
         Pattern::Ctor(name, fields) => {
             let mut out = format!("({name}");

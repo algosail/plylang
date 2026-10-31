@@ -3489,6 +3489,8 @@ impl Checker {
         match bottom {
             Bottom::Hidden if !items.is_empty() => {}
             Bottom::Hidden if hide_lone_hidden => {}
+            // A note lists values. An open tail has no name, so it is not one of them.
+            Bottom::Open if fold => {}
             Bottom::Hidden | Bottom::Open => parts.push(".._".to_string()),
             Bottom::Empty => parts.push(".".to_string()),
             Bottom::Named(name) => parts.push(format!("..{name}")),

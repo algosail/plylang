@@ -1273,7 +1273,7 @@ impl Checker {
     ) -> Result<(), Diagnostic> {
         match pattern {
             Pattern::Wild => Ok(()),
-            Pattern::Bind(name) => {
+            Pattern::Bind(_, name) => {
                 if binds.contains_key(name) {
                     return Err(self.error(span, Error::DuplicateDefinition(name.to_string())));
                 }

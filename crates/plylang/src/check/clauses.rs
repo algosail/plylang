@@ -154,6 +154,19 @@ impl Checker {
         Ok((current, top_first))
     }
 
+    /// The name is not a word, and the slot is already off the stack. The note is
+    /// the type alone: a hidden tail under it prints as nothing.
+    fn note_pattern_bind(&mut self, span: Span, ty: TyId) {
+        let tail = self.stack_rigid("");
+        let stack = self.stack_cons(tail, ty);
+        self.sites.push(super::RawSite {
+            span,
+            before: stack,
+            after: None,
+            here: None,
+        });
+    }
+
     fn pattern_effect(
         &mut self,
         pattern: &Pattern,
@@ -164,11 +177,12 @@ impl Checker {
     ) -> Result<(), Diagnostic> {
         match pattern {
             Pattern::Wild => Ok(()),
-            Pattern::Bind(name) => {
+            Pattern::Bind(name_span, name) => {
                 if binds.iter().any(|(bound, _)| bound == name) {
                     return Err(self.error(span, Error::DuplicateDefinition(name.to_string())));
                 }
                 binds.push((name.clone(), ty));
+                self.note_pattern_bind(*name_span, ty);
                 Ok(())
             }
             Pattern::Lit(lit) => {
@@ -419,7 +433,7 @@ fn overlaps(pattern: &Pattern, need: &Need) -> bool {
         return true;
     }
     match pattern {
-        Pattern::Wild | Pattern::Bind(_) => true,
+        Pattern::Wild | Pattern::Bind(..) => true,
         Pattern::Lit(Lit::Bool(true)) => match need {
             Need::Bool { yes, .. } => *yes,
             Need::Exact(Lit::Bool(true)) => true,
@@ -512,7 +526,7 @@ fn subtract_slot(need: &Need, pattern: &Pattern) -> Vec<Need> {
         return Vec::new();
     }
     match pattern {
-        Pattern::Wild | Pattern::Bind(_) => Vec::new(),
+        Pattern::Wild | Pattern::Bind(..) => Vec::new(),
         _ if matches!(need, Need::Any) => vec![Need::Any],
         Pattern::Lit(Lit::Bool(true)) => match need {
             Need::Bool { no: true, .. } => vec![Need::Bool { yes: false, no: true }],
@@ -643,7 +657,7 @@ fn covered_slot(pattern: &Pattern, need: &Need) -> Option<Need> {
         return Some(Need::Deep);
     }
     match pattern {
-        Pattern::Wild | Pattern::Bind(_) => Some(need.clone()),
+        Pattern::Wild | Pattern::Bind(..) => Some(need.clone()),
         _ if matches!(need, Need::Any) => None,
         Pattern::Lit(Lit::Bool(true)) => match need {
             Need::Bool { yes: true, .. } => Some(Need::Bool { yes: true, no: false }),

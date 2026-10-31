@@ -1,6 +1,7 @@
 //! Hover is markdown. A named `ply` block is the declared scheme. Prose from the `..`
 //! lines above that declaration sits under it. One unwrapped line with `--` and no
-//! name is this use. A gap shows only the stack.
+//! name is this use. A field word has no scheme, so that line is its whole hover.
+//! A gap shows only the stack.
 
 use std::path::Path;
 
@@ -31,13 +32,19 @@ pub fn hover(source: &str, path: &Path, line: u32, character: u32) -> Option<Hov
     let module = parse(source, mode_from_path(&path_text)).ok()?;
     let sites = stack_sites(path, source);
     if let Some(token) = token_at(&tokens, offset) {
-        if let TokenKind::Ident(name) = &token.kind {
-            if let Some(contents) = word_hover(path, &module, name, token.span, &sites) {
-                return Some(Hover {
-                    span: token.span,
-                    contents,
-                });
-            }
+        let contents = match &token.kind {
+            TokenKind::Ident(name) => word_hover(path, &module, name, token.span, &sites),
+            TokenKind::Field(_) | TokenKind::FieldSet(_) | TokenKind::FieldInsert(_) => sites
+                .iter()
+                .find(|site| site.span == token.span)
+                .map(context_only),
+            _ => None,
+        };
+        if let Some(contents) = contents {
+            return Some(Hover {
+                span: token.span,
+                contents,
+            });
         }
     }
     let contents = gap_hover(source, &module, offset, &sites)?;
@@ -392,8 +399,13 @@ fn ctor_scheme(data: &Data, ctor: &Ctor) -> String {
 
 fn token_at(tokens: &[Token], offset: u32) -> Option<&Token> {
     tokens.iter().find(|token| {
-        matches!(token.kind, TokenKind::Ident(_))
-            && token.span.start <= offset
+        matches!(
+            token.kind,
+            TokenKind::Ident(_)
+                | TokenKind::Field(_)
+                | TokenKind::FieldSet(_)
+                | TokenKind::FieldInsert(_)
+        ) && token.span.start <= offset
             && offset < token.span.end
     })
 }
@@ -560,6 +572,41 @@ mod tests {
     }
 
     #[test]
+    fn hovers_a_pattern_name_as_its_type() {
+        let source = "\
+; Maybe a = Nothing | Just a
+
+: fact ( Int -- Int )
+  n -> n dup drop
+
+: from ( (Maybe Int) -- Int )
+  (Just x) -> x
+  Nothing -> 0n
+
+: choose ( Int Str -- Str )
+  n text -> text
+";
+        let pattern = source.find("n ->").unwrap();
+        let (line, character) = at_offset(source, pattern);
+        let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert_eq!(hovered.contents, "```ply\nInt\n```");
+
+        let inside = source.find("(Just x)").unwrap() + "(Just ".len();
+        let (line, character) = at_offset(source, inside);
+        let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert_eq!(hovered.contents, "```ply\nInt\n```");
+
+        let deep = source.find("n text").unwrap();
+        let (line, character) = at_offset(source, deep);
+        let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert_eq!(hovered.contents, "```ply\nInt\n```");
+        let top = deep + "n ".len();
+        let (line, character) = at_offset(source, top);
+        let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert_eq!(hovered.contents, "```ply\nStr\n```");
+    }
+
+    #[test]
     fn hovers_the_stack_in_the_gap() {
         let source = ": double ( Int -- Int )\n  dup drop\n";
         let between = at(source, "dup drop");
@@ -592,6 +639,36 @@ mod tests {
             hovered.contents,
             "```ply\n: drop ( ..s a -- ..s )\n```\n\nDrops the top value. On `x y` the result is `x`.\n\n```ply\nInt --\n```"
         );
+    }
+
+    #[test]
+    fn hides_an_open_tail_in_the_stack_note() {
+        let source = "\
+; Box a = Box done : ( ..s -- ..s a ), run : Num
+
+: see ( a. (Box a) -- ( -- a ) )
+  done>>
+
+: kept ( ..s a -- ..s a )
+  dup drop
+
+: pass ( a b. (a -- b) -- (a -- b) )
+  dup drop
+";
+        let done = source.find("done>>").unwrap() + "done>>".len();
+        let (line, character) = at_offset(source, done);
+        let gap = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert_eq!(gap.contents, "```ply\n(-- a)\n```");
+
+        let kept = source.find("dup drop").unwrap() + "dup".len();
+        let (line, character) = at_offset(source, kept);
+        let gap = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert_eq!(gap.contents, "```ply\n..s a a\n```");
+
+        let fun = source.rfind("dup drop").unwrap() + "dup".len();
+        let (line, character) = at_offset(source, fun);
+        let gap = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert_eq!(gap.contents, "```ply\n(a -- b) (a -- b)\n```");
     }
 
     #[test]
@@ -708,6 +785,15 @@ mod tests {
             "{}",
             hovered.contents
         );
+
+        let name = source.find("name>>").unwrap();
+        let (line, character) = at_offset(source, name);
+        let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert_eq!(hovered.contents, "```ply\nOuter -- Str\n```");
+        let age = source.find(">>age").unwrap();
+        let (line, character) = at_offset(source, age);
+        let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert_eq!(hovered.contents, "```ply\nHuman Num -- Human\n```");
 
         let row = source.rfind("\n  read").unwrap() + 3;
         let (line, character) = at_offset(source, row);
