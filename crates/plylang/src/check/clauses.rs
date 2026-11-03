@@ -3,6 +3,7 @@
 //! A name is a local. It is not on the stack until the body mentions it.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::ast::{Clause, Def, Lit, Pattern};
 use crate::diagnostic::Diagnostic;
@@ -36,17 +37,20 @@ pub(super) struct CtorShape {
 /// `Record` lists the fields the type has. A pattern may read fewer of them.
 /// `Deep` is a data type the walk did not enter. `Any` is a type the walk did see
 /// and does not know, such as a variable; a constructor does not cover `Any`.
+/// A child is an [`Rc`], so cloning a node copies one layer. The same type at the
+/// same depth is built once. Past [`NEED_DEPTH`], or after [`NEED_NODES`] shapes,
+/// the walk stops at `Deep` instead of copying a recursive type down every field.
 #[derive(Clone, Debug)]
 enum Need {
     Any,
-    /// Fields past [`NEED_DEPTH`]. Any pattern covers the slot.
+    /// The walk stopped. Any pattern covers the slot.
     Deep,
     Bool { yes: bool, no: bool },
     Open { name: String, excluded: Vec<Lit> },
     Exact(Lit),
     Data { ctors: Vec<CtorNeed> },
     Array {
-        elem: Box<Need>,
+        elem: Rc<Need>,
         open: bool,
         apart: Vec<Apart>,
     },
@@ -57,7 +61,7 @@ enum Need {
 #[derive(Clone, Debug)]
 struct FieldNeed {
     name: String,
-    need: Need,
+    need: Rc<Need>,
 }
 
 /// One fixed length that is no longer the plain open element.
@@ -71,11 +75,28 @@ struct Apart {
 struct CtorNeed {
     name: String,
     /// `None` means this constructor is already covered.
-    fields: Option<Vec<Need>>,
+    fields: Option<Vec<Rc<Need>>>,
 }
 
 const NEED_DEPTH: usize = 16;
+/// Distinct shapes in one coverage walk. A recursive type reuses a shape.
+const NEED_NODES: usize = 65_536;
 const EXAMPLE_CAP: usize = 8;
+
+/// Identity of a type term. Field instantiations copy a term into a fresh id,
+/// so coverage shares nodes by this shape rather than by that id.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+enum TypeKey {
+    Other,
+    Ctor(String, Vec<TypeKey>),
+    Record(Vec<(String, TypeKey)>),
+}
+
+struct NeedMemo {
+    nodes: HashMap<(TypeKey, usize), Rc<Need>>,
+    keys: HashMap<TyId, TypeKey>,
+    built: usize,
+}
 
 impl Checker {
     pub(super) fn check_clauses(
@@ -322,9 +343,14 @@ impl Checker {
         report: Span,
     ) -> Result<(), Diagnostic> {
         let clauses = self.canonical_clauses(clauses);
+        let mut memo = NeedMemo {
+            nodes: HashMap::new(),
+            keys: HashMap::new(),
+            built: 0,
+        };
         let mut rows = vec![slots
             .iter()
-            .map(|ty| self.need_of(*ty, 0))
+            .map(|ty| self.need_of(*ty, 0, &mut memo))
             .collect::<Vec<_>>()];
         for clause in clauses {
             if !rows.iter().any(|row| row_hit(row, &clause.patterns)) {
@@ -389,13 +415,57 @@ impl Checker {
         }
     }
 
-    fn need_of(&mut self, ty: TyId, depth: usize) -> Need {
-        if depth > NEED_DEPTH {
-            return Need::Deep;
-        }
+    /// One shape per type structure and depth. A later field of the same type shares it.
+    fn need_of(&mut self, ty: TyId, depth: usize, memo: &mut NeedMemo) -> Need {
         let ty = self.expose(ty);
+        let key = self.type_key(ty, &mut memo.keys);
+        if let Some(found) = memo.nodes.get(&(key.clone(), depth)) {
+            return (**found).clone();
+        }
+        if depth > NEED_DEPTH || memo.built >= NEED_NODES {
+            let deep = Need::Deep;
+            memo.nodes.insert((key, depth), Rc::new(Need::Deep));
+            return deep;
+        }
+        memo.built += 1;
+        let built = self.need_shape(ty, depth, memo);
+        memo.nodes.insert((key, depth), Rc::new(built.clone()));
+        built
+    }
+
+    fn type_key(&self, ty: TyId, keys: &mut HashMap<TyId, TypeKey>) -> TypeKey {
+        let ty = self.expose(ty);
+        if let Some(found) = keys.get(&ty) {
+            return found.clone();
+        }
+        keys.insert(ty, TypeKey::Other);
+        let built = match self.tys[ty.0 as usize].clone() {
+            TyNode::Ctor(name, args) => {
+                let args = args
+                    .into_iter()
+                    .map(|arg| self.type_key(arg, keys))
+                    .collect();
+                TypeKey::Ctor(name, args)
+            }
+            TyNode::Record(row) => match self.peel_row(row) {
+                Ok((fields, _)) => {
+                    let fields = fields
+                        .into_iter()
+                        .map(|(name, field)| (name, self.type_key(field, keys)))
+                        .collect();
+                    TypeKey::Record(fields)
+                }
+                Err(_) => TypeKey::Other,
+            },
+            _ => TypeKey::Other,
+        };
+        keys.insert(ty, built.clone());
+        built
+    }
+
+    fn need_shape(&mut self, ty: TyId, depth: usize, memo: &mut NeedMemo) -> Need {
         if let TyNode::Record(row) = self.tys[ty.0 as usize].clone() {
-            return self.record_need(row, depth);
+            return self.record_need(row, depth, memo);
         }
         let TyNode::Ctor(name, args) = self.tys[ty.0 as usize].clone() else {
             return Need::Any;
@@ -426,7 +496,7 @@ impl Checker {
         }
         if name == "Array" && args.len() == 1 {
             return Need::Array {
-                elem: Box::new(self.need_of(args[0], depth + 1)),
+                elem: Rc::new(self.need_of(args[0], depth + 1, memo)),
                 open: true,
                 apart: Vec::new(),
             };
@@ -442,7 +512,7 @@ impl Checker {
             let fields = self.instantiate_fields(&data.params, &args, &ctor.fields);
             let mut needs = Vec::new();
             for field in fields {
-                needs.push(self.need_of(field, depth + 1));
+                needs.push(Rc::new(self.need_of(field, depth + 1, memo)));
             }
             ctors.push(CtorNeed {
                 name: ctor.name.clone(),
@@ -452,7 +522,7 @@ impl Checker {
         Need::Data { ctors }
     }
 
-    fn record_need(&mut self, row: super::RowId, depth: usize) -> Need {
+    fn record_need(&mut self, row: super::RowId, depth: usize, memo: &mut NeedMemo) -> Need {
         let Ok((fields, _)) = self.peel_row(row) else {
             return Need::Any;
         };
@@ -460,7 +530,7 @@ impl Checker {
         for (name, field_ty) in fields {
             out.push(FieldNeed {
                 name,
-                need: self.need_of(field_ty, depth + 1),
+                need: Rc::new(self.need_of(field_ty, depth + 1, memo)),
             });
         }
         Need::Record { fields: out }
@@ -526,7 +596,7 @@ fn overlaps(pattern: &Pattern, need: &Need) -> bool {
     }
 }
 
-fn live_ctor<'a>(need: &'a Need, name: &str) -> Option<&'a [Need]> {
+fn live_ctor<'a>(need: &'a Need, name: &str) -> Option<&'a [Rc<Need>]> {
     let Need::Data { ctors } = need else {
         return None;
     };
@@ -629,7 +699,8 @@ fn subtract_slot(need: &Need, pattern: &Pattern) -> Vec<Need> {
                 if patterns.len() != fields.len() {
                     return vec![need.clone()];
                 }
-                let remainders = subtract_row(&fields, patterns);
+                let owned: Vec<Need> = fields.iter().map(|field| (**field).clone()).collect();
+                let remainders = subtract_row(&owned, patterns);
                 let mut out = Vec::new();
                 if !others.is_empty() {
                     out.push(Need::Data { ctors: others });
@@ -638,7 +709,7 @@ fn subtract_slot(need: &Need, pattern: &Pattern) -> Vec<Need> {
                     out.push(Need::Data {
                         ctors: vec![CtorNeed {
                             name: name.clone(),
-                            fields: Some(remainder),
+                            fields: Some(remainder.into_iter().map(Rc::new).collect()),
                         }],
                     });
                 }
@@ -744,7 +815,7 @@ fn covered_slot(pattern: &Pattern, need: &Need) -> Option<Need> {
             }
             let mut covered = Vec::new();
             for (pattern, field) in patterns.iter().zip(fields) {
-                covered.push(covered_slot(pattern, field)?);
+                covered.push(Rc::new(covered_slot(pattern, field)?));
             }
             Some(Need::Data {
                 ctors: vec![CtorNeed {
@@ -813,7 +884,7 @@ fn subtract_record(need: &Need, fields: &[(String, Pattern)]) -> Vec<Need> {
         .map(|remainder| {
             let mut next = have.clone();
             for (offset, index) in indexes.iter().enumerate() {
-                next[*index].need = remainder[offset].clone();
+                next[*index].need = Rc::new(remainder[offset].clone());
             }
             Need::Record { fields: next }
         })
@@ -827,7 +898,7 @@ fn covered_record(need: &Need, fields: &[(String, Pattern)]) -> Option<Need> {
     let mut next = have.clone();
     for (name, pattern) in fields {
         let index = next.iter().position(|field| field.name == *name)?;
-        next[index].need = covered_slot(pattern, &next[index].need)?;
+        next[index].need = Rc::new(covered_slot(pattern, &next[index].need)?);
     }
     Some(Need::Record { fields: next })
 }
@@ -839,7 +910,7 @@ fn project_fields(have: &[FieldNeed], fields: &[(String, Pattern)]) -> Option<(V
     for (name, _) in fields {
         let index = have.iter().position(|field| field.name == *name)?;
         indexes.push(index);
-        row.push(have[index].need.clone());
+        row.push((*have[index].need).clone());
     }
     Some((indexes, row))
 }
@@ -960,11 +1031,11 @@ fn render_record(fields: &[FieldNeed]) -> Vec<String> {
     acc.into_iter().map(|text| format!("{{ {text} }}")).collect()
 }
 
-fn render_ctor(name: &str, fields: &[Need]) -> Vec<String> {
+fn render_ctor(name: &str, fields: &[Rc<Need>]) -> Vec<String> {
     if fields.is_empty() {
         return vec![name.to_string()];
     }
-    let field_examples: Vec<Vec<String>> = fields.iter().map(render_need).collect();
+    let field_examples: Vec<Vec<String>> = fields.iter().map(|field| render_need(field)).collect();
     if field_examples
         .iter()
         .all(|examples| examples.len() == 1 && examples[0] == "_")

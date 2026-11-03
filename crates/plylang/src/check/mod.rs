@@ -7450,6 +7450,17 @@ mod tests {
     }
 
     #[test]
+    fn a_branching_recursive_type_is_shared() {
+        ok(
+            "; Tree = Branch (Array Tree) | Left Tree | Right Tree | Leaf Str\n\n: label ( Tree -- Str )\n  (Branch _) -> \"\"\n  (Left (Leaf text)) -> text\n  (Left _) -> \"\"\n  (Right _) -> \"\"\n  (Leaf _) -> \"\"\n",
+        );
+        err(
+            "; Tree = Branch (Array Tree) | Left Tree | Right Tree | Leaf Str\n\n: label ( Tree -- Str )\n  (Leaf text) -> text\n",
+            "non-exhaustive match: Branch Array, Left Branch Array, Left Left Branch Array, Left Left Left Branch Array, Left Left Left Left Branch Array, Left Left Left Left Left Branch Array, Left Left Left Left Left Left Branch Array, Left Left Left Left Left Left Left Branch Array",
+        );
+    }
+
+    #[test]
     fn a_deep_constructor_is_covered() {
         let mut ty = "Int".to_string();
         let mut pat = "n".to_string();
