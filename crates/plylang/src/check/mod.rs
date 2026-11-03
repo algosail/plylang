@@ -606,6 +606,8 @@ struct Checker {
     /// Constructor words in scope. Lowering reads the field count from here,
     /// not from whichever data declaration happens to share the name.
     ctor_words: HashMap<String, CtorWord>,
+    /// Local spelling of an import to the name the provider published.
+    renamed: HashMap<String, String>,
     /// `Comparable` instances derived for this module. The def is lowered.
     /// A public type's instance is also appended to the module.
     derived: Vec<Item>,
@@ -661,6 +663,7 @@ impl Checker {
             relax_visibility: false,
             module_key: String::new(),
             ctor_words: HashMap::new(),
+            renamed: HashMap::new(),
             derived: Vec::new(),
         };
         checker.preload();
@@ -715,6 +718,7 @@ impl Checker {
         self.relax_visibility = false;
         self.module_key.clear();
         self.ctor_words.clear();
+        self.renamed.clear();
         self.derived.clear();
         self.preload();
     }
@@ -1219,6 +1223,11 @@ impl Checker {
         );
     }
 
+    /// The name the provider published, when this spelling was renamed or aliased.
+    fn canonical<'a>(&'a self, name: &'a str) -> &'a str {
+        self.renamed.get(name).map(String::as_str).unwrap_or(name)
+    }
+
     /// The constructor word in scope builds `type_name`.
     fn constructor_open(&self, type_name: &str, ctor: &str) -> Result<(), Error> {
         match self.ctor_words.get(ctor) {
@@ -1234,20 +1243,34 @@ impl Checker {
     fn export_ctors_named(
         &mut self,
         provider: &Module,
-        name: &str,
-        names: &HashSet<String>,
+        remote: &str,
+        local: &str,
         span: Span,
         origin: &str,
     ) -> Result<(), Diagnostic> {
-        let data = data_of_ctor(provider, name).expect("constructor was found");
+        let data = data_of_ctor(provider, remote).expect("constructor was found");
         if let Some(stored) = self.datas.get(&data.name) {
             if stored.origin != origin {
                 return Err(self.error(span, Error::DuplicateDefinition(data.name.to_string())));
             }
-            self.export_ctors(&data.name, Some(names), span)
         } else {
-            self.add_data(data, Some(names), origin, span)
+            let none = HashSet::new();
+            self.add_data(data, Some(&none), origin, span)?;
         }
+        let stored = self
+            .datas
+            .get(&data.name)
+            .cloned()
+            .expect("data was staged");
+        let Some(ctor) = stored.ctors.iter().find(|ctor| ctor.name == remote) else {
+            return Ok(());
+        };
+        let Some(scheme) = ctor.word.clone() else {
+            return Ok(());
+        };
+        self.export_word(local, scheme, span)?;
+        self.note_ctor(&data.name, local, ctor.fields.len());
+        Ok(())
     }
 
     fn export_word(&mut self, name: &str, scheme: SemScheme, span: Span) -> Result<(), Diagnostic> {
@@ -1326,47 +1349,53 @@ impl Checker {
             .first()
             .map(|known_module| known_module.origin.as_str())
             .unwrap_or("");
-        let names = if import.all {
-            surface_names(origin, known)
-        } else {
-            import.names.clone()
-        };
-        for name in &names {
-            self.export_surface_name(origin, name, import, known)?;
+        let surface = surface_names(origin, known);
+        if import.alias.is_none() && !import.all {
+            for imported in &import.names {
+                if !surface.iter().any(|have| have == &imported.remote) {
+                    return Err(self.import_missing(import, &imported.remote));
+                }
+            }
+        }
+        for (remote, local) in import.bindings(&surface) {
+            self.export_surface_name(origin, &remote, &local, &remote, import, known)?;
         }
         self.import_instance_surface(origin, known, &mut HashSet::new())?;
         Ok(())
     }
 
-    /// Bring one published name into scope. A name this module re-exports is
-    /// resolved in the module that declares it.
+    /// Bring one published name into scope. `name` is what `origin` publishes.
+    /// `local` is the spelling in the module being checked. A provider that
+    /// renamed the name on its own import is followed by that import's remote.
     fn export_surface_name(
         &mut self,
         origin: &str,
         name: &str,
+        local: &str,
+        asked: &str,
         import: &Import,
         known: &[KnownModule],
     ) -> Result<(), Diagnostic> {
         let Some(known_module) = known_at(known, origin) else {
-            return Err(self.import_missing(import, name));
+            return Err(self.import_missing(import, asked));
         };
         let module = &known_module.module;
         if !name_on_surface(module, name) {
-            return Err(self.import_missing(import, name));
+            return Err(self.import_missing(import, asked));
         }
         if module_has_public(module, name) {
-            return self.export_imported(module, name, import, origin);
+            return self.export_imported(module, name, local, import, origin);
         }
         for (index, child) in module.imports.iter().enumerate() {
             let Some(dep) = known_module.deps.get(index) else {
                 continue;
             };
-            let offers = child.all || child.names.iter().any(|have| have == name);
-            if offers {
-                return self.export_surface_name(dep, name, import, known);
-            }
+            let Some(remote) = child.remote_of(name) else {
+                continue;
+            };
+            return self.export_surface_name(dep, remote, local, asked, import, known);
         }
-        Err(self.import_missing(import, name))
+        Err(self.import_missing(import, asked))
     }
 
     fn import_missing(&self, import: &Import, name: &str) -> Diagnostic {
@@ -1434,26 +1463,30 @@ impl Checker {
     fn export_imported(
         &mut self,
         provider: &Module,
-        name: &str,
+        remote: &str,
+        local: &str,
         import: &Import,
         origin: &str,
     ) -> Result<(), Diagnostic> {
+        if local != remote {
+            self.renamed.insert(local.to_string(), remote.to_string());
+        }
         let mut found = false;
-        if let Some(data) = find_data(provider, name) {
-            self.publish_type(data, import.span)?;
+        if let Some(data) = find_data(provider, remote) {
+            self.publish_type(data, local, import.span)?;
             found = true;
         }
-        if let Some(synonym) = find_synonym(provider, name) {
-            self.publish_synonym(synonym, import.span)?;
+        if let Some(synonym) = find_synonym(provider, remote) {
+            self.publish_synonym(synonym, local, import.span)?;
             found = true;
         }
-        if data_of_ctor(provider, name).is_some() {
-            let set = HashSet::from([name.to_string()]);
-            self.export_ctors_named(provider, name, &set, import.span, origin)?;
+        if data_of_ctor(provider, remote).is_some() {
+            self.export_ctors_named(provider, remote, local, import.span, origin)?;
             found = true;
         }
-        if let Some(def) = find_def(provider, name) {
+        if let Some(def) = find_def(provider, remote) {
             let mut def = def.clone();
+            def.name = local.to_string();
             def.name_span = import.span;
             let saved = self.relax_visibility;
             self.relax_visibility = true;
@@ -1462,44 +1495,57 @@ impl Checker {
             registered?;
             found = true;
         }
-        if find_class_item(provider, name).is_some() {
-            self.visible_classes.insert(name.to_string());
+        if find_class_item(provider, remote).is_some() {
+            self.visible_classes.insert(local.to_string());
             found = true;
         }
-        if self.export_imported_method(provider, name, import.span)? {
+        if self.export_imported_method(provider, remote, local, import.span)? {
             found = true;
         }
         if !found {
             return Err(self.error(
                 import.span,
-                Error::ImportNotExported { path: import.path.to_string(), name: name.to_string() },
+                Error::ImportNotExported {
+                    path: import.path.to_string(),
+                    name: remote.to_string(),
+                },
             ));
         }
         Ok(())
     }
 
-    fn publish_type(&mut self, data: &crate::ast::Data, span: Span) -> Result<(), Diagnostic> {
-        if self.builtin_types.contains(&data.name) {
-            return Err(self.error(span, Error::CannotRedefineBuiltin(data.name.to_string())));
+    fn publish_type(
+        &mut self,
+        data: &crate::ast::Data,
+        local: &str,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        if self.builtin_types.contains(local) {
+            return Err(self.error(span, Error::CannotRedefineBuiltin(local.to_string())));
         }
-        if self.type_arity.contains_key(&data.name) {
-            return Err(self.error(span, Error::DuplicateDefinition(data.name.to_string())));
+        if self.type_arity.contains_key(local) {
+            return Err(self.error(span, Error::DuplicateDefinition(local.to_string())));
         }
-        self.type_arity.insert(data.name.clone(), data.params.len());
+        self.type_arity.insert(local.to_string(), data.params.len());
         Ok(())
     }
 
-    fn publish_synonym(&mut self, synonym: &Synonym, span: Span) -> Result<(), Diagnostic> {
-        if self.builtin_types.contains(&synonym.name) {
-            return Err(self.error(span, Error::CannotRedefineBuiltin(synonym.name.to_string())));
+    fn publish_synonym(
+        &mut self,
+        synonym: &Synonym,
+        local: &str,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        if self.builtin_types.contains(local) {
+            return Err(self.error(span, Error::CannotRedefineBuiltin(local.to_string())));
         }
-        if self.type_arity.contains_key(&synonym.name) {
-            return Err(self.error(span, Error::DuplicateDefinition(synonym.name.to_string())));
+        if self.type_arity.contains_key(local) {
+            return Err(self.error(span, Error::DuplicateDefinition(local.to_string())));
         }
         self.type_arity
-            .insert(synonym.name.clone(), synonym.params.len());
+            .insert(local.to_string(), synonym.params.len());
         self.synonyms
-            .entry(synonym.name.clone())
+            .entry(local.to_string())
             .or_insert_with(|| SynBody::from(synonym, true));
         Ok(())
     }
@@ -2712,7 +2758,8 @@ impl Checker {
                 if arity == 0 && self.syn_in_scope(name) {
                     return self.expand_synonym(name, &[], span);
                 }
-                Ok((self.ty_ctor(name, Vec::new()), self.ctor_kind(arity)))
+                let canon = self.canonical(name).to_string();
+                Ok((self.ty_ctor(&canon, Vec::new()), self.ctor_kind(arity)))
             }
             Type::App(head, args) => {
                 if let Type::Ctor(name) = head.as_ref() {
@@ -2797,7 +2844,9 @@ impl Checker {
             .type_arity
             .get(name)
             .or_else(|| self.extra_arity.get(name))
-            .copied()?;
+            .copied()
+            .or_else(|| self.datas.get(name).map(|data| data.params.len()))
+            .or_else(|| self.synonyms.get(name).map(|body| body.params.len()))?;
         if args.len() < arity {
             Some(Error::TypeConstructorArity {
                 name: name.to_string(),
@@ -4388,24 +4437,19 @@ impl Checker {
         scope: &mut Scope,
         span: Span,
     ) -> Result<SemConstraint, Diagnostic> {
-        if !self.relax_visibility && !self.visible_classes.contains(&constraint.class_name) {
-            return Err(self.error(
-                span,
-                Error::UndefinedClass(constraint.class_name.to_string()),
-            ));
+        let written = constraint.class_name.clone();
+        if !self.relax_visibility && !self.visible_classes.contains(&written) {
+            return Err(self.error(span, Error::UndefinedClass(written)));
         }
-        let class = self
-            .classes
-            .get(&constraint.class_name)
-            .cloned()
-            .ok_or_else(|| {
-                self.error(span, Error::UndefinedClass(constraint.class_name.to_string()))
-            })?;
+        let canon = self.canonical(&written).to_string();
+        let class = self.classes.get(&canon).cloned().ok_or_else(|| {
+            self.error(span, Error::UndefinedClass(written.clone()))
+        })?;
         if constraint.args.len() != class.params.len() {
             let count = class.params.len();
             return Err(self.error(
                 span,
-                Error::ClassArity { name: constraint.class_name.to_string(), count },
+                Error::ClassArity { name: written, count },
             ));
         }
         let mut args = Vec::new();
@@ -4420,7 +4464,7 @@ impl Checker {
             args.push(ty);
         }
         Ok(SemConstraint {
-            class_name: constraint.class_name.clone(),
+            class_name: canon,
             args,
         })
     }
@@ -4428,11 +4472,12 @@ impl Checker {
     fn export_imported_method(
         &mut self,
         provider: &Module,
-        name: &str,
+        remote: &str,
+        local: &str,
         span: Span,
     ) -> Result<bool, Diagnostic> {
         let Some(class) = provider.items.iter().find_map(|item| match item {
-            Item::Class(class) if class.methods.iter().any(|method| method.name == name) => {
+            Item::Class(class) if class.methods.iter().any(|method| method.name == remote) => {
                 Some(class.clone())
             }
             _ => None,
@@ -4446,11 +4491,11 @@ impl Checker {
             .and_then(|info| {
                 info.methods
                     .iter()
-                    .find(|method| method.name == name)
+                    .find(|method| method.name == remote)
                     .map(|method| method.scheme.clone())
             })
             .expect("class method was installed");
-        self.export_word(name, scheme, span)?;
+        self.export_word(local, scheme, span)?;
         Ok(true)
     }
 
@@ -5618,6 +5663,7 @@ impl Checker {
     }
 
     fn is_class_method(&self, name: &str) -> bool {
+        let name = self.canonical(name);
         self.classes
             .values()
             .any(|class| class.methods.iter().any(|method| method.name == name))
@@ -6636,16 +6682,16 @@ mod tests {
         )
         .unwrap();
         let applicable = parse(
-            "@ Applicable\n~ \"Ply/Mappable\" (Mappable)\n\n& Mappable f => Applicable f\n  apply ( a b. (f a) (f (a -- b)) -- (f b) )\n",
+            "@ Applicable\n~ \"Ply/Mappable\" Mappable\n\n& Mappable f => Applicable f\n  apply ( a b. (f a) (f (a -- b)) -- (f b) )\n",
             ParseMode::Source,
         )
         .unwrap();
         let flat = parse(
-            "@ Flatmappable\n~ \"Ply/Applicable\" (Applicable)\n\n& Applicable f => Flatmappable f\n  flatmap ( a b. (f a) (a -- (f b)) -- (f b) )\n",
+            "@ Flatmappable\n~ \"Ply/Applicable\" Applicable\n\n& Applicable f => Flatmappable f\n  flatmap ( a b. (f a) (a -- (f b)) -- (f b) )\n",
             ParseMode::Source,
         )
         .unwrap();
-        let consumer = parse("~ \"Ply/Flatmappable\" (Flatmappable)\n", ParseMode::Source).unwrap();
+        let consumer = parse("~ \"Ply/Flatmappable\" Flatmappable\n", ParseMode::Source).unwrap();
         let known = vec![
             super::KnownModule::new("Ply/Flatmappable.ply".to_string(), flat.clone()),
             super::KnownModule::new("Ply/Mappable.ply".to_string(), mappable),
@@ -6670,16 +6716,16 @@ mod tests {
         )
         .unwrap();
         let applicable = parse(
-            "@ Applicable\n~ \"Ply/Mappable\" (Mappable)\n\n& Mappable f => Applicable f\n  apply ( a b. (f a) (f (a -- b)) -- (f b) )\n",
+            "@ Applicable\n~ \"Ply/Mappable\" Mappable\n\n& Mappable f => Applicable f\n  apply ( a b. (f a) (f (a -- b)) -- (f b) )\n",
             ParseMode::Source,
         )
         .unwrap();
         let flat = parse(
-            "@ Flatmappable\n~ \"Ply/Applicable\" (Applicable)\n\n& Applicable f => Flatmappable f\n  flatmap ( a b. (f a) (a -- (f b)) -- (f b) )\n",
+            "@ Flatmappable\n~ \"Ply/Applicable\" Applicable\n\n& Applicable f => Flatmappable f\n  flatmap ( a b. (f a) (a -- (f b)) -- (f b) )\n",
             ParseMode::Source,
         )
         .unwrap();
-        let consumer = parse("~ \"Ply/Flatmappable\" (Flatmappable)\n", ParseMode::Source).unwrap();
+        let consumer = parse("~ \"Ply/Flatmappable\" Flatmappable\n", ParseMode::Source).unwrap();
         let known = vec![
             super::KnownModule::new("/deps/dist/Ply/Flatmappable.d.ply".to_string(), flat.clone()),
             super::KnownModule::new("/deps/dist/Ply/Mappable.d.ply".to_string(), mappable),
@@ -6704,12 +6750,12 @@ mod tests {
         )
         .unwrap();
         let number = parse(
-            "~ \"Ply/Comparable\" (Comparable)\n\n: eq ( Num Num -- Bool )\n  drop drop true\n\n# Comparable Num\n  eq = eq\n",
+            "~ \"Ply/Comparable\" Comparable\n\n: eq ( Num Num -- Bool )\n  drop drop true\n\n# Comparable Num\n  eq = eq\n",
             ParseMode::Source,
         )
         .unwrap();
         let consumer = parse(
-            "~ \"Ply/Comparable\" (Comparable, eq)\n~ \"Ply/Number\" ()\n\n: use ( Num Num -- Bool )\n  eq\n",
+            "~ \"Ply/Comparable\" Comparable, eq\n~ \"Ply/Number\"\n\n: use ( Num Num -- Bool )\n  eq\n",
             ParseMode::Source,
         )
         .unwrap();
@@ -6756,24 +6802,128 @@ mod tests {
             )
         };
         check_import(
-            "~ \"Data/Maybe\" (fromMaybe, Nothing)\n\n: use ( Int -- Int )\n  Nothing fromMaybe\n",
+            "~ \"Data/Maybe\" fromMaybe, Nothing\n\n: use ( Int -- Int )\n  Nothing fromMaybe\n",
         )
         .unwrap();
         let missing_word = check_import(
-            "~ \"Data/Maybe\" (Maybe)\n\n: use ( a. -- (Maybe a) )\n  Nothing\n",
+            "~ \"Data/Maybe\" Maybe\n\n: use ( a. -- (Maybe a) )\n  Nothing\n",
         )
         .unwrap_err();
         assert_eq!(missing_word.message, "undefined word Nothing");
         let missing_type = check_import(
-            "~ \"Data/Maybe\" (Nothing)\n\n: use ( a. -- (Maybe a) )\n  Nothing\n",
+            "~ \"Data/Maybe\" Nothing\n\n: use ( a. -- (Maybe a) )\n  Nothing\n",
         )
         .unwrap_err();
         assert_eq!(missing_type.message, "undefined type Maybe");
         let hidden = check_import(
-            "~ \"Data/Maybe\" (hidden)\n\n: use ( Int -- Int )\n  hidden\n",
+            "~ \"Data/Maybe\" hidden\n\n: use ( Int -- Int )\n  hidden\n",
         )
         .unwrap_err();
         assert_eq!(hidden.message, "~ \"Data/Maybe\" does not export hidden");
+    }
+
+    #[test]
+    fn a_renamed_import_keeps_the_canonical_name() {
+        let provider = parse(
+            "@ Maybe, Nothing, Just, fromMaybe\n\n; Maybe a = Nothing | Just a\n\n: fromMaybe ( a. a (Maybe a) -- a )\n  Nothing ->\n  Just -> nip\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let known = vec![super::KnownModule::new("Data/Maybe".to_string(), provider.clone())];
+        let check_import = |source: &str| {
+            let module = parse(source, ParseMode::Source).unwrap();
+            super::check_with_imports(
+                &module,
+                &[super::ResolvedImport {
+                    provider: &provider,
+                    import: &module.imports[0],
+                    known: &known,
+                }],
+            )
+        };
+        let alias = check_import(
+            "~ \"Data/Maybe\" : Bus\n\n: open ( (Bus:Maybe Int) -- Int )\n  (Bus:Just x) -> x\n  Bus:Nothing -> 0n\n\n: use ( Int -- Int )\n  Bus:Nothing Bus:fromMaybe\n",
+        )
+        .unwrap();
+        let js = alias.anf.javascript();
+        assert!(js.contains(".tag === \"Just\""), "{js}");
+        assert!(js.contains("Bus$Nothing"), "{js}");
+        assert!(js.contains("Bus$fromMaybe"), "{js}");
+        assert!(!js.contains(".tag === \"Bus"), "{js}");
+        let partial = check_import(
+            "~ \"Data/Maybe\" : Bus\n\n: open ( (Bus:Maybe Int) -- Int )\n  (Bus:Just x) -> x\n",
+        )
+        .unwrap_err();
+        assert_eq!(partial.message, "non-exhaustive match: Nothing");
+        let hidden_type = check_import(
+            "~ \"Data/Maybe\" : Bus\n\n: use ( a. -- (Maybe a) )\n  Nothing\n",
+        )
+        .unwrap_err();
+        assert_eq!(hidden_type.message, "undefined type Maybe");
+        let hidden_word = check_import(
+            "~ \"Data/Maybe\" : Bus\n\n: use ( a. a (Bus:Maybe a) -- a )\n  Nothing Bus:fromMaybe\n",
+        )
+        .unwrap_err();
+        assert_eq!(hidden_word.message, "undefined word Nothing");
+        let renamed = check_import(
+            "~ \"Data/Maybe\" Maybe : Option, Just : Yes, Nothing : No, fromMaybe\n\n: open ( (Option Int) -- Int )\n  No -> 0n\n  (Yes x) -> x\n\n: make ( Int -- (Option Int) )\n  Yes\n",
+        )
+        .unwrap();
+        let renamed_js = renamed.anf.javascript();
+        assert!(renamed_js.contains(".tag === \"Nothing\""), "{renamed_js}");
+        assert!(renamed_js.contains("Yes("), "{renamed_js}");
+        assert!(!renamed_js.contains(".tag === \"Yes\""), "{renamed_js}");
+        assert!(!renamed_js.contains(".tag === \"No\""), "{renamed_js}");
+        check_import(
+            "~ \"Data/Maybe\" Maybe, Nothing : a, Nothing : b\n\n: use ( -- (Maybe Int) (Maybe Int) )\n  a b\n",
+        )
+        .unwrap();
+        let module = parse(
+            "~ \"Data/Maybe\" : Bus\n~ \"Data/Maybe\" : Bus\n\n: open ( (Bus:Maybe Int) -- Int )\n  Bus:Nothing -> 0n\n  (Bus:Just x) -> x\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let duplicate = super::check_with_imports(
+            &module,
+            &[
+                super::ResolvedImport {
+                    provider: &provider,
+                    import: &module.imports[0],
+                    known: &known,
+                },
+                super::ResolvedImport {
+                    provider: &provider,
+                    import: &module.imports[1],
+                    known: &known,
+                },
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(duplicate.message, "duplicate definition Bus:Maybe");
+
+        let equal = parse(
+            "@ Equal, eq\n\n& Equal a\n  eq ( a a -- Bool )\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let known_equal = vec![super::KnownModule::new("Equal".to_string(), equal.clone())];
+        let caller = parse(
+            "~ \"Equal\" Equal : Eq, eq : same\n\n: use ( Eq a => a a -- Bool )\n  same\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let called = super::check_with_imports(
+            &caller,
+            &[super::ResolvedImport {
+                provider: &equal,
+                import: &caller.imports[0],
+                known: &known_equal,
+            }],
+        )
+        .unwrap();
+        let method_js = called.anf.javascript();
+        assert!(method_js.contains(".eq"), "{method_js}");
+        assert!(!method_js.contains(".same"), "{method_js}");
     }
 
     #[test]
@@ -6791,7 +6941,7 @@ mod tests {
         let known_num = vec![super::KnownModule::new("Num.ply".to_string(), num.clone())];
         let known_other = vec![super::KnownModule::new("Other.ply".to_string(), other.clone())];
         let module = parse(
-            "~ \"Num\" (Mk)\n~ \"Other\" (wrap)\n\n: id ( Int -- Int )\n  dup drop\n",
+            "~ \"Num\" Mk\n~ \"Other\" wrap\n\n: id ( Int -- Int )\n  dup drop\n",
             ParseMode::Source,
         )
         .unwrap();
@@ -6820,7 +6970,7 @@ mod tests {
         .unwrap();
         let known_twin = vec![super::KnownModule::new("Twin.ply".to_string(), twin.clone())];
         let again = parse(
-            "~ \"Num\" (Box)\n~ \"Twin\" (Box)\n\n: id ( Int -- Int )\n  dup drop\n",
+            "~ \"Num\" Box\n~ \"Twin\" Box\n\n: id ( Int -- Int )\n  dup drop\n",
             ParseMode::Source,
         )
         .unwrap();
@@ -6843,7 +6993,7 @@ mod tests {
         assert_eq!(error.message, "duplicate definition Box");
 
         let module = parse(
-            "~ \"Num\" (Box)\n~ \"Num\" (Mk)\n\n: pair ( a. a a -- (Box a) )\n  Mk\n",
+            "~ \"Num\" Box\n~ \"Num\" Mk\n\n: pair ( a. a a -- (Box a) )\n  Mk\n",
             ParseMode::Source,
         )
         .unwrap();
@@ -6880,7 +7030,7 @@ mod tests {
         let known_element = vec![super::KnownModule::new("Element".to_string(), element.clone())];
         let known_child = vec![super::KnownModule::new("Child".to_string(), child.clone())];
         let module = parse(
-            "~ \"Element\" (Prop, Mark)\n~ \"Child\" (Child)\n\n: page ( Str Str -- Prop )\n  Mark\n",
+            "~ \"Element\" Prop, Mark\n~ \"Child\" Child\n\n: page ( Str Str -- Prop )\n  Mark\n",
             ParseMode::Source,
         )
         .unwrap();
@@ -6923,7 +7073,7 @@ mod tests {
         .unwrap();
         let known = vec![super::KnownModule::new("Data/Box".to_string(), provider.clone())];
         let hidden = parse(
-            "~ \"Data/Box\" (Box)\n\n: read ( a. (Box a) -- a )\n  one>>\n",
+            "~ \"Data/Box\" Box\n\n: read ( a. (Box a) -- a )\n  one>>\n",
             ParseMode::Source,
         )
         .unwrap();
@@ -6938,7 +7088,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.message, "fields of Box are private");
         let open = parse(
-            "~ \"Data/Box\" (Box, Mk)\n\n: read ( a. (Box a) -- a )\n  one>>\n",
+            "~ \"Data/Box\" Box, Mk\n\n: read ( a. (Box a) -- a )\n  one>>\n",
             ParseMode::Source,
         )
         .unwrap();
@@ -7173,25 +7323,25 @@ mod tests {
             )
         };
         check_import(
-            "~ \"Data/Person\" (older, Human)\n\n: use ( Human -- Human )\n  older\n",
+            "~ \"Data/Person\" older, Human\n\n: use ( Human -- Human )\n  older\n",
         )
         .unwrap();
         check_import(
-            "~ \"Data/Person\" (..)\n\n: use ( Human -- Human )\n  older\n",
+            "~ \"Data/Person\" ..\n\n: use ( Human -- Human )\n  older\n",
         )
         .unwrap();
         let missing = check_import(
-            "~ \"Data/Person\" (older)\n\n: use ( Human -- Human )\n  older\n",
+            "~ \"Data/Person\" older\n\n: use ( Human -- Human )\n  older\n",
         )
         .unwrap_err();
         assert_eq!(missing.message, "undefined type Human");
         let hidden = check_import(
-            "~ \"Data/Person\" (older, Human)\n\n: use ( Person -- Person )\n  drop\n",
+            "~ \"Data/Person\" older, Human\n\n: use ( Person -- Person )\n  drop\n",
         )
         .unwrap_err();
         assert_eq!(hidden.message, "undefined type Person");
         let sneak = check_import(
-            "~ \"Data/Person\" (older)\n\n- Sneak Person\n\n: use ( Sneak -- Sneak )\n  drop\n",
+            "~ \"Data/Person\" older\n\n- Sneak Person\n\n: use ( Sneak -- Sneak )\n  drop\n",
         )
         .unwrap_err();
         assert_eq!(sneak.message, "undefined type Person");

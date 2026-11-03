@@ -44,7 +44,10 @@ pub fn hover_with_sites(
     let module = parse(source, mode_from_path(&path_text)).ok()?;
     if let Some(token) = token_at(&tokens, offset) {
         let contents = match &token.kind {
-            TokenKind::Ident(name) => word_hover(path, &module, name, token.span, &sites),
+            TokenKind::Ident(name) => {
+                let (full, span) = qualified_span(&tokens, token, name);
+                word_hover(path, &module, &full, span, &sites)
+            }
             TokenKind::Field(_) | TokenKind::FieldSet(_) | TokenKind::FieldInsert(_) => sites
                 .iter()
                 .find(|site| site.span == token.span)
@@ -245,18 +248,17 @@ fn declared_def(def: &Def) -> Declared {
 
 fn imported_scheme(path: &Path, module: &Module, name: &str) -> Option<Declared> {
     for import in &module.imports {
-        let wanted = import.all || import.names.iter().any(|imported| imported == name);
-        if !wanted {
+        let Some(remote) = import.remote_of(name) else {
             continue;
-        }
+        };
         let Some((file, provider)) = load_surface(path, &import.path) else {
             continue;
         };
         let mut load = |from: &Path, import_path: &str| load_surface(from, import_path);
-        let Some((_, found)) = surface::lookup(&provider, &file, name, &mut load) else {
+        let Some((_, found)) = surface::lookup(&provider, &file, remote, &mut load) else {
             continue;
         };
-        if let Some(declared) = declared_found(&found, name) {
+        if let Some(declared) = declared_found(&found, remote) {
             return Some(declared);
         }
     }
@@ -406,6 +408,38 @@ fn ctor_scheme(data: &Data, ctor: &Ctor) -> String {
         },
     };
     format!("{} : {}", ctor.name, scheme_string(&scheme))
+}
+
+/// `Bus:send` is one name. The cursor may sit on either identifier.
+fn qualified_span(tokens: &[Token], token: &Token, name: &str) -> (String, Span) {
+    let Some(index) = tokens.iter().position(|item| item.span == token.span) else {
+        return (name.to_string(), token.span);
+    };
+    if index >= 2 {
+        if let (TokenKind::Ident(left), TokenKind::Colon) =
+            (&tokens[index - 2].kind, &tokens[index - 1].kind)
+        {
+            let colon = &tokens[index - 1];
+            if is_upper(left) && !(colon.line_start && colon.col == 0) {
+                let span = tokens[index - 2].span.merge(token.span);
+                return (format!("{left}:{name}"), span);
+            }
+        }
+    }
+    if let Some(TokenKind::Colon) = tokens.get(index + 1).map(|item| &item.kind) {
+        if let Some(TokenKind::Ident(right)) = tokens.get(index + 2).map(|item| &item.kind) {
+            let colon = &tokens[index + 1];
+            if is_upper(name) && !(colon.line_start && colon.col == 0) {
+                let span = token.span.merge(tokens[index + 2].span);
+                return (format!("{name}:{right}"), span);
+            }
+        }
+    }
+    (name.to_string(), token.span)
+}
+
+fn is_upper(name: &str) -> bool {
+    name.chars().next().is_some_and(|ch| ch.is_ascii_uppercase())
 }
 
 fn token_at(tokens: &[Token], offset: u32) -> Option<&Token> {

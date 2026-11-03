@@ -541,7 +541,7 @@ mod tests {
         );
         temp.write(
             "src/Door.ply",
-            ".. The door.\n\n@ answer\n\n~ \"Lib\" (answer)\n",
+            ".. The door.\n\n@ answer\n\n~ \"Lib\" answer\n",
         );
         write_docs(&temp.0, None).unwrap_or_else(|error| panic!("{}", error.render()));
         let page = fs::read_to_string(temp.0.join("DOCS.md")).unwrap();

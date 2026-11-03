@@ -126,7 +126,7 @@ fn push(names: &mut Vec<String>, seen: &mut HashSet<String>, name: String) {
 
 type Load<'a> = dyn FnMut(&Path, &str) -> Option<(PathBuf, Module)> + 'a;
 
-/// Names another file receives from `(..)`.
+/// Names another file receives from `..`.
 pub(crate) fn public_names(module: &Module) -> Vec<String> {
     match &module.exports {
         Exports::List(list) => {
@@ -213,10 +213,10 @@ fn lookup_in(
         let Some((file, provider)) = load(from, &import.path) else {
             continue;
         };
-        if !import_offers(import, name) {
+        let Some(remote) = import.remote_of(name) else {
             continue;
-        }
-        if let Some(found) = lookup_in(&provider, &file, name, load, stack) {
+        };
+        if let Some(found) = lookup_in(&provider, &file, remote, load, stack) {
             stack.remove(&key);
             return Some(found);
         }
@@ -234,10 +234,6 @@ fn may_reexport(module: &Module, name: &str) -> bool {
 
 fn follows_reexport(module: &Module, _import: &Import) -> bool {
     matches!(module.exports, Exports::List(_))
-}
-
-fn import_offers(import: &Import, name: &str) -> bool {
-    import.all || import.names.iter().any(|have| have == name)
 }
 
 fn own_found(module: &Module, name: &str) -> Option<Found> {

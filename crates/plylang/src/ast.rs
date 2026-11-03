@@ -49,12 +49,64 @@ impl Exports {
     }
 }
 
+/// One name brought in from another module. `local` is the spelling in this file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportedName {
+    pub span: Span,
+    pub remote: String,
+    pub local: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Import {
     pub span: Span,
     pub path: String,
-    pub names: Vec<String>,
+    /// Chosen names. Empty when the import is `..`, an alias, or only instances.
+    pub names: Vec<ImportedName>,
+    /// `..` opens every published name under its own spelling.
     pub all: bool,
+    /// `: Alias` opens every published name as `Alias:name`.
+    pub alias: Option<String>,
+}
+
+impl Import {
+    /// The published name behind a spelling in this file.
+    /// `..` answers every spelling. An alias answers only `Alias:name`.
+    pub fn remote_of<'a>(&'a self, local: &'a str) -> Option<&'a str> {
+        if let Some(alias) = &self.alias {
+            let mut prefix = String::from(alias);
+            prefix.push(':');
+            return local.strip_prefix(&prefix).filter(|rest| !rest.is_empty());
+        }
+        if self.all {
+            return Some(local);
+        }
+        self.names
+            .iter()
+            .find(|imported| imported.local == local)
+            .map(|imported| imported.remote.as_str())
+    }
+
+    /// `(remote, local)` pairs this import binds from `surface`.
+    pub fn bindings(&self, surface: &[String]) -> Vec<(String, String)> {
+        if let Some(alias) = &self.alias {
+            return surface
+                .iter()
+                .map(|remote| (remote.clone(), format!("{alias}:{remote}")))
+                .collect();
+        }
+        if self.all {
+            return surface
+                .iter()
+                .map(|name| (name.clone(), name.clone()))
+                .collect();
+        }
+        self.names
+            .iter()
+            .filter(|imported| surface.iter().any(|have| have == &imported.remote))
+            .map(|imported| (imported.remote.clone(), imported.local.clone()))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -359,12 +411,29 @@ impl fmt::Display for PublicList {
 
 impl fmt::Display for Import {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "~ \"{}\" (", self.path)?;
-        let mut parts = self.names.clone();
-        if self.all {
-            parts.push("..".to_string());
+        write!(formatter, "~ \"{}\"", self.path)?;
+        if let Some(alias) = &self.alias {
+            return write!(formatter, " : {alias}");
         }
-        write!(formatter, "{})", parts.join(", "))
+        if self.all {
+            return write!(formatter, " ..");
+        }
+        if self.names.is_empty() {
+            return Ok(());
+        }
+        let parts = self
+            .names
+            .iter()
+            .map(|imported| {
+                if imported.local == imported.remote {
+                    imported.remote.clone()
+                } else {
+                    format!("{} : {}", imported.remote, imported.local)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(formatter, " {parts}")
     }
 }
 

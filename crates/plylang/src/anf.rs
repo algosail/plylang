@@ -631,10 +631,11 @@ fn js_string(value: &str) -> String {
 }
 
 pub(crate) fn js_ident(name: &str) -> String {
-    if JS_RESERVED.contains(&name) {
-        format!("ply_{name}")
+    let mangled = name.replace(':', "$");
+    if JS_RESERVED.contains(&mangled.as_str()) {
+        format!("ply_{mangled}")
     } else {
-        name.to_string()
+        mangled
     }
 }
 

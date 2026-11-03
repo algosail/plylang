@@ -619,7 +619,7 @@ Time   12ms
         temp.write(
             "test/Pass.ply",
             "\
-~ \"Lib\" (answer)
+~ \"Lib\" answer
 
 ; Verdict = Verdict ok : Bool, name : Str, text : Str
 

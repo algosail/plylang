@@ -145,7 +145,7 @@ Fix: start the line with one of those marks. `: name` is a word. `def : name` is
 
 `~` must be followed by a string path.
 
-Fix: write `~ "Data/Maybe" (fromMaybe)`.
+Fix: write `~ "Data/Maybe" fromMaybe`.
 
 ## PL0016
 
@@ -153,7 +153,7 @@ Fix: write `~ "Data/Maybe" (fromMaybe)`.
 
 The parenthesized list after an import path is missing a name, or a name is not an identifier.
 
-Fix: list the names you import: `~ "Data/Maybe" (Maybe, fromMaybe)`.
+Fix: list the names you import: `~ "Data/Maybe" Maybe, fromMaybe`.
 
 ## PL0017
 
@@ -1090,3 +1090,11 @@ Fix: list `NAME`, or stop mentioning it in what this module publishes. A type im
 `name>>` or `>>name` read a field of `NAME`, and the constructor of `NAME` is not in scope. Listing the type name does not list a constructor whose name differs.
 
 Fix: import the constructor, or use a word this module published for that value. In the file that declares `NAME`, the constructor is in scope.
+
+## PL0133
+
+`import is already complete`
+
+`..` and `: Alias` each finish the import. A name after either, or a second form on the same import, has nowhere to go.
+
+Fix: put the names on their own `~` line, or list them instead of `..` and `: Alias`.

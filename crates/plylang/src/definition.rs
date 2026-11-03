@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::ast::{Clause, Import, Item, Module, Term, TermNode};
+use crate::ast::{Clause, Item, Module, Term, TermNode};
 use crate::build::{load_surface, provider_file, read_module};
 use crate::surface::{self, Found};
 use crate::complete::{is_import_path, name_space_at, NameSpace};
@@ -38,8 +38,9 @@ pub fn definition(source: &str, path: &Path, line: u32, character: u32) -> Optio
     match &tokens[index].kind {
         TokenKind::String(import_path) => import_definition(path, import_path, &tokens, index),
         TokenKind::Ident(name) => {
+            let name = qualified_name(&tokens, index, name);
             let space = name_space_at(&tokens, index);
-            resolve(path, &module, &tokens, offset, name, space)
+            resolve(path, &module, &tokens, offset, &name, space)
         }
         _ => None,
     }
@@ -139,22 +140,40 @@ fn imported(from: &Path, module: &Module, name: &str, target: Target) -> Option<
         let Some(provider) = read_module(&file) else {
             continue;
         };
-        if !import_offers(import, name) {
-            continue;
-        }
-        let mut load = |start: &Path, path: &str| load_surface(start, path);
-        let Some((decl, found)) = surface::lookup(&provider, &file, name, &mut load) else {
+        let Some(remote) = import.remote_of(name) else {
             continue;
         };
-        if let Some(span) = found_span(&found, name, target) {
+        let mut load = |start: &Path, path: &str| load_surface(start, path);
+        let Some((decl, found)) = surface::lookup(&provider, &file, remote, &mut load) else {
+            continue;
+        };
+        if let Some(span) = found_span(&found, remote, target) {
             return Some(Definition { path: decl, span });
         }
     }
     None
 }
 
-fn import_offers(import: &Import, name: &str) -> bool {
-    import.all || import.names.iter().any(|imported| imported == name)
+fn qualified_name(tokens: &[Token], index: usize, name: &str) -> String {
+    if index >= 2 {
+        if let (TokenKind::Ident(left), TokenKind::Colon) =
+            (&tokens[index - 2].kind, &tokens[index - 1].kind)
+        {
+            let colon = &tokens[index - 1];
+            if is_upper(left) && !(colon.line_start && colon.col == 0) {
+                return format!("{left}:{name}");
+            }
+        }
+    }
+    if let Some(TokenKind::Colon) = tokens.get(index + 1).map(|token| &token.kind) {
+        if let Some(TokenKind::Ident(right)) = tokens.get(index + 2).map(|token| &token.kind) {
+            let colon = &tokens[index + 1];
+            if is_upper(name) && !(colon.line_start && colon.col == 0) {
+                return format!("{name}:{right}");
+            }
+        }
+    }
+    name.to_string()
 }
 
 fn found_span(found: &Found, name: &str, target: Target) -> Option<Span> {
@@ -471,7 +490,7 @@ mod tests {
 ";
         temp.write("src/Data/Num.ply", provider);
         let app = temp.0.join("src/App.ply");
-        let source = "~ \"Data/Num\" (add)\n\n: twice ( Int -- Int )\n  dup add\n";
+        let source = "~ \"Data/Num\" add\n\n: twice ( Int -- Int )\n  dup add\n";
         let line = source.lines().nth(3).unwrap();
         let found = definition(&source, &app, 3, line.find("add").unwrap() as u32).unwrap();
         assert_eq!(found.path, temp.0.join("src/Data/Num.ply"));
@@ -483,18 +502,18 @@ mod tests {
         assert_eq!(anchor.path, found.path);
         assert_eq!(slice(provider, anchor.span), "Hub");
 
-        let hub = "~ \"Data/Num\" (Hub)\n\n: pass ( (Hub a) -- (Hub a) )\n  hub -> hub\n";
+        let hub = "~ \"Data/Num\" Hub\n\n: pass ( (Hub a) -- (Hub a) )\n  hub -> hub\n";
         let hub_at = at_offset(hub, hub.find("(Hub").unwrap() + 1);
         let hub_def = definition(&hub, &app, hub_at.0, hub_at.1).unwrap();
         assert_eq!(hub_def.path, found.path);
         assert_eq!(hub_def.span, anchor.span);
 
-        let all = "~ \"Data/Num\" (..)\n\n: use ( Int -- Int )\n  add\n";
+        let all = "~ \"Data/Num\" ..\n\n: use ( Int -- Int )\n  add\n";
         let all_add = definition(&all, &app, 3, 2).unwrap();
         assert_eq!(slice(provider, all_add.span), "add");
-        let hidden = "~ \"Data/Num\" (..)\n\n: use ( Int -- Int )\n  hidden\n";
+        let hidden = "~ \"Data/Num\" ..\n\n: use ( Int -- Int )\n  hidden\n";
         assert!(definition(&hidden, &app, 3, 2).is_none());
-        let empty = "~ \"Data/Num\" ()\n\n: use ( Int -- Int )\n  add\n";
+        let empty = "~ \"Data/Num\"\n\n: use ( Int -- Int )\n  add\n";
         assert!(definition(&empty, &app, 3, 2).is_none());
     }
 
@@ -523,13 +542,13 @@ mod tests {
   eq = eqNum
 ";
         temp.write("src/Lib.ply", lib);
-        temp.write("src/Door.ply", "@ answer, eqNum\n~ \"Lib\" (answer, eqNum)\n");
+        temp.write("src/Door.ply", "@ answer, eqNum\n~ \"Lib\" answer, eqNum\n");
         let app = temp.0.join("src/App.ply");
-        let source = "~ \"Door\" (..)\n\n: use ( Num Num -- Bool )\n  eqNum\n";
+        let source = "~ \"Door\" ..\n\n: use ( Num Num -- Bool )\n  eqNum\n";
         let found = definition(&source, &app, 3, 2).unwrap();
         assert_eq!(found.path, temp.0.join("src/Lib.ply"));
         assert_eq!(slice(lib, found.span), "eqNum");
-        let answer = "~ \"Door\" (answer)\n\n: use ( -- Num )\n  answer\n";
+        let answer = "~ \"Door\" answer\n\n: use ( -- Num )\n  answer\n";
         let found = definition(&answer, &app, 3, 2).unwrap();
         assert_eq!(found.path, temp.0.join("src/Lib.ply"));
         assert_eq!(slice(lib, found.span), "answer");
@@ -551,7 +570,7 @@ mod tests {
             interface,
         );
         let from = temp.0.join("App.ply");
-        let source = "~ \"@algosail/nums/Data/Num\" (add)\n\n: twice ( Int -- Int )\n  dup add\n";
+        let source = "~ \"@algosail/nums/Data/Num\" add\n\n: twice ( Int -- Int )\n  dup add\n";
         let found = definition(&source, &from, 3, 6).unwrap();
         assert_eq!(found.path, root.join("src/Data/Num.ply"));
         assert_eq!(found.span.start, 9);

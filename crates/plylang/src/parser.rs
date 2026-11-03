@@ -197,34 +197,139 @@ impl Parser {
         };
         let path = path.clone();
         self.bump();
-        self.expect(&TokenKind::LParen, Error::ExpectedLParen)?;
+        self.skip_newlines();
+        if self.ends_import() {
+            return Ok(Import {
+                span: start.merge(self.last_span),
+                path,
+                names: Vec::new(),
+                all: false,
+                alias: None,
+            });
+        }
+        if self.eat(&TokenKind::All) {
+            self.skip_newlines();
+            if !self.ends_import() {
+                return Err(self.error(Error::ImportClosed));
+            }
+            return Ok(Import {
+                span: start.merge(self.last_span),
+                path,
+                names: Vec::new(),
+                all: true,
+                alias: None,
+            });
+        }
+        if self.is(TokenKind::Colon) && !self.at_column_0() {
+            self.bump();
+            let alias_span = self.cur().span;
+            let alias = self.expect_ident(Error::ExpectedName)?;
+            if !is_upper(&alias) {
+                return Err(self.error_at(alias_span, Error::ModuleSegment(alias)));
+            }
+            self.skip_newlines();
+            if !self.ends_import() {
+                return Err(self.error(Error::ImportClosed));
+            }
+            return Ok(Import {
+                span: start.merge(self.last_span),
+                path,
+                names: Vec::new(),
+                all: false,
+                alias: Some(alias),
+            });
+        }
         let mut names = Vec::new();
-        let mut all = false;
+        let mut seen = HashSet::new();
         loop {
             self.skip_newlines();
-            if self.eat(&TokenKind::RParen) {
+            if self.ends_import() {
                 break;
             }
-            if self.eat(&TokenKind::All) {
-                all = true;
-            } else if matches!(self.cur().kind, TokenKind::Ident(_)) {
-                names.push(self.expect_ident(Error::ExpectedImportedName)?);
-            } else {
+            if !matches!(self.cur().kind, TokenKind::Ident(_)) {
                 return Err(self.error(Error::ExpectedImportedName));
             }
+            let name_span = self.cur().span;
+            let remote = self.expect_ident(Error::ExpectedImportedName)?;
+            let mut local = remote.clone();
+            let mut end = self.last_span;
+            if self.is(TokenKind::Colon) && !self.at_column_0() {
+                self.bump();
+                let local_span = self.cur().span;
+                local = self.expect_ident(Error::ExpectedName)?;
+                end = self.last_span;
+                if !seen.insert(local.clone()) {
+                    return Err(self.error_at(local_span, Error::DuplicateDefinition(local)));
+                }
+            } else if !seen.insert(local.clone()) {
+                return Err(self.error_at(name_span, Error::DuplicateDefinition(local)));
+            }
+            names.push(ImportedName {
+                span: name_span.merge(end),
+                remote,
+                local,
+            });
             self.skip_newlines();
             if self.eat(&TokenKind::Comma) {
                 continue;
             }
-            self.expect(&TokenKind::RParen, Error::ExpectedRParen)?;
-            break;
+            if self.ends_import() {
+                break;
+            }
+            return Err(self.error(Error::ExpectedImportedName));
         }
         Ok(Import {
             span: start.merge(self.last_span),
             path,
             names,
-            all,
+            all: false,
+            alias: None,
         })
+    }
+
+    /// A column-0 declaration, a doc, or the end of the file. A colon ends the
+    /// import only at column 0, where it starts a word. `name : local` and an
+    /// indented `: Alias` stay in the import.
+    fn ends_import(&self) -> bool {
+        self.is_eof()
+            || self.is(TokenKind::Doc(String::new()))
+            || self.is(TokenKind::Import)
+            || self.is(TokenKind::Data)
+            || self.is(TokenKind::Type)
+            || self.is(TokenKind::Class)
+            || self.is(TokenKind::Instance)
+            || self.is(TokenKind::Export)
+            || self.is(TokenKind::Language)
+            || (self.is(TokenKind::Colon) && self.at_column_0())
+    }
+
+    fn at_column_0(&self) -> bool {
+        let token = self.cur();
+        token.line_start && token.col == 0
+    }
+
+    /// `Bus:send` is the name `send` from the module imported as `Bus`.
+    /// A colon at column 0 still starts a word.
+    fn expect_qualified(&mut self, error: Error) -> Result<String, Diagnostic> {
+        let name = self.expect_upper(error)?;
+        Ok(self.qualify(name))
+    }
+
+    fn qualify(&mut self, name: String) -> String {
+        if !is_upper(&name) || !self.is(TokenKind::Colon) || self.at_column_0() {
+            return name;
+        }
+        let Some(next) = self.tokens.get(self.pos + 1) else {
+            return name;
+        };
+        if !matches!(next.kind, TokenKind::Ident(_)) {
+            return name;
+        }
+        self.bump();
+        let rest = self
+            .expect_ident(Error::ExpectedName)
+            .expect("the next token is an identifier");
+        format!("{name}:{rest}")
     }
 
     /// `..` lines with no blank line between them or before the next declaration.
@@ -617,13 +722,30 @@ impl Parser {
         false
     }
 
+    /// `Bus:Nothing` is one pattern. A colon in column 0 still starts a word.
+    fn skip_qualifier(&self, index: usize) -> usize {
+        let Some(colon) = self.tokens.get(index + 1) else {
+            return index + 1;
+        };
+        if !matches!(colon.kind, TokenKind::Colon) || (colon.line_start && colon.col == 0) {
+            return index + 1;
+        }
+        let Some(rest) = self.tokens.get(index + 2) else {
+            return index + 1;
+        };
+        if matches!(rest.kind, TokenKind::Ident(_)) {
+            index + 3
+        } else {
+            index + 1
+        }
+    }
+
     /// One pattern, without consuming.
     fn skip_one_pattern(&self, index: usize) -> Option<usize> {
         let token = self.tokens.get(index)?;
         match &token.kind {
-            TokenKind::Ident(name) if name == "_" || is_lower(name) || is_upper(name) => {
-                Some(index + 1)
-            }
+            TokenKind::Ident(name) if name == "_" || is_lower(name) => Some(index + 1),
+            TokenKind::Ident(name) if is_upper(name) => Some(self.skip_qualifier(index)),
             TokenKind::True | TokenKind::False | TokenKind::Int(_) | TokenKind::Number(_) | TokenKind::String(_) => {
                 Some(index + 1)
             }
@@ -717,7 +839,7 @@ impl Parser {
             }
             TokenKind::Ident(name) if is_upper(&name) => {
                 self.bump();
-                Ok(Pattern::Unpack(name))
+                Ok(Pattern::Unpack(self.qualify(name)))
             }
             TokenKind::True => {
                 self.bump();
@@ -827,7 +949,7 @@ impl Parser {
             self.group_depth -= 1;
             return Err(self.error(Error::ExpectedConstructor));
         }
-        let name = self.expect_upper(Error::ExpectedConstructor)?;
+        let name = self.expect_qualified(Error::ExpectedConstructor)?;
         let mut fields = Vec::new();
         loop {
             self.skip_newlines();
@@ -865,7 +987,7 @@ impl Parser {
         let start = self.last_span;
         // `& Comparable a, Show a => Sortable a`, or `& Sortable a` when there is no superclass.
         let first_span = self.cur().span;
-        let first_name = self.expect_upper(Error::ExpectedClassName)?;
+        let first_name = self.expect_qualified(Error::ExpectedClassName)?;
         let first_args = self.parse_class_args()?;
         self.skip_newlines();
         let (name, name_span, params, supers) = if self.is(TokenKind::Comma) || self.is(TokenKind::FatArrow)
@@ -879,7 +1001,7 @@ impl Parser {
             }];
             while self.eat(&TokenKind::Comma) {
                 self.skip_newlines();
-                let class_name = self.expect_upper(Error::ExpectedClassName)?;
+                let class_name = self.expect_qualified(Error::ExpectedClassName)?;
                 let args = self.parse_class_args()?;
                 if args.is_empty() {
                     return Err(self.error(Error::ExpectedClassArgument));
@@ -968,10 +1090,10 @@ impl Parser {
 
     fn parse_instance(&mut self) -> Result<Instance, Diagnostic> {
         let start = self.last_span;
-        let mut class_names = vec![self.expect_upper(Error::ExpectedClassName)?];
+        let mut class_names = vec![self.expect_qualified(Error::ExpectedClassName)?];
         while self.eat(&TokenKind::Comma) {
             self.skip_newlines();
-            class_names.push(self.expect_upper(Error::ExpectedClassName)?);
+            class_names.push(self.expect_qualified(Error::ExpectedClassName)?);
         }
         let mut args = Vec::new();
         while !self.is(TokenKind::Newline) && !self.is_eof() {
@@ -992,6 +1114,7 @@ impl Parser {
             let name = self.expect_ident(Error::ExpectedMethodName)?;
             self.expect(&TokenKind::Eq, Error::ExpectedEq)?;
             let word = self.expect_ident(Error::ExpectedWord)?;
+            let word = if is_upper(&word) { self.qualify(word) } else { word };
             methods.push(MethodBind {
                 name,
                 name_span,
@@ -1028,7 +1151,7 @@ impl Parser {
                 break;
             }
             loop {
-                let class_name = self.expect_upper(Error::ExpectedClassName)?;
+                let class_name = self.expect_qualified(Error::ExpectedClassName)?;
                 let mut args = Vec::new();
                 loop {
                     self.skip_newlines();
@@ -1189,7 +1312,8 @@ impl Parser {
             return Ok(Type::Var(self.expect_lower(Error::ExpectedType)?));
         }
         if self.is_upper_ident() {
-            return Ok(Type::Ctor(self.expect_upper(Error::ExpectedType)?));
+            let name = self.expect_qualified(Error::ExpectedType)?;
+            return Ok(Type::Ctor(name));
         }
         if self.eat_group(&TokenKind::LParen) {
             return self.parse_paren();
@@ -1377,8 +1501,10 @@ impl Parser {
                 Ok(self.term(start, TermNode::Lit(Lit::String(value))))
             }
             TokenKind::Ident(name) => {
+                let upper = is_upper(&name);
                 self.bump();
-                Ok(self.term(start, TermNode::Word(name)))
+                let name = if upper { self.qualify(name) } else { name };
+                Ok(self.term(start.merge(self.last_span), TermNode::Word(name)))
             }
             _ => Err(self.error(Error::ExpectedTerm)),
         }
@@ -1957,12 +2083,12 @@ mod tests {
         assert!(!text.contains("note"), "{text}");
         let detached = ok(".. gone\n\n: double ( Int -- Int )\n  dup\n");
         assert!(!detached.contains("gone"), "{detached}");
-        let before_import = ok(".. gone\n\n~ \"Data/Maybe\" (Just)\n\n: id ( Int -- Int )\n  dup\n");
-        assert!(before_import.contains("~ \"Data/Maybe\" (Just)"), "{before_import}");
+        let before_import = ok(".. gone\n\n~ \"Data/Maybe\" Just\n\n: id ( Int -- Int )\n  dup\n");
+        assert!(before_import.contains("~ \"Data/Maybe\" Just"), "{before_import}");
         assert!(!before_import.contains("gone"), "{before_import}");
         assert_eq!(
             err(
-                ".. before the import\n~ \"Data/Maybe\" (Just)\n",
+                ".. before the import\n~ \"Data/Maybe\" Just\n",
                 ParseMode::Source
             ),
             "doc comment must sit above a declaration"
@@ -2112,8 +2238,8 @@ mod tests {
 
     #[test]
     fn import_all_prints() {
-        let text = ok("~ \"Data/Either\" (..)\n\n: getName ( Str -- Str )\n  dup\n");
-        assert!(text.contains("~ \"Data/Either\" (..)"), "{text}");
+        let text = ok("~ \"Data/Either\" ..\n\n: getName ( Str -- Str )\n  dup\n");
+        assert!(text.contains("~ \"Data/Either\" .."), "{text}");
         assert_eq!(
             err("~ public \"Data/Scan\" (scan)\n", ParseMode::Source),
             "expected import path"
@@ -2125,22 +2251,22 @@ mod tests {
         let listed = ok("@ Maybe, Nothing, Just\n\n; Maybe a = Nothing | Just a\n");
         assert!(listed.contains("@ Maybe, Nothing, Just\n"), "{listed}");
         let after_import = ok(
-            "~ \"Data/Clock\" (Time)\n\n@ Time, soon\n\n: soon ( -- Unit )\n  Unit\n",
+            "~ \"Data/Clock\" Time\n\n@ Time, soon\n\n: soon ( -- Unit )\n  Unit\n",
         );
         assert!(after_import.starts_with("@ Time, soon\n"), "{after_import}");
-        assert!(after_import.contains("~ \"Data/Clock\" (Time)"), "{after_import}");
+        assert!(after_import.contains("~ \"Data/Clock\" Time"), "{after_import}");
         let after_word = ok(
             ": soon ( -- Unit )\n  Unit\n\n@ soon\n",
         );
         assert!(after_word.starts_with("@ soon\n"), "{after_word}");
         assert!(after_word.contains(": soon ( -- Unit )"), "{after_word}");
         let between = ok(
-            "~ \"Data/Clock\" (Time)\n\n@ Time\n\n~ \"Data/Sink\" (Sink)\n",
+            "~ \"Data/Clock\" Time\n\n@ Time\n\n~ \"Data/Sink\" Sink\n",
         );
         assert!(between.starts_with("@ Time\n"), "{between}");
-        assert!(between.contains("~ \"Data/Clock\" (Time)"), "{between}");
-        assert!(between.contains("~ \"Data/Sink\" (Sink)"), "{between}");
-        let wrapped = ok("@\n  Stream, Behavior,\n  listen\n\n~ \"Data/Stream\" (Stream)\n");
+        assert!(between.contains("~ \"Data/Clock\" Time"), "{between}");
+        assert!(between.contains("~ \"Data/Sink\" Sink"), "{between}");
+        let wrapped = ok("@\n  Stream, Behavior,\n  listen\n\n~ \"Data/Stream\" Stream\n");
         assert!(wrapped.contains("@ Stream, Behavior, listen\n"), "{wrapped}");
         let empty = ok("@\n\n: main ( -- Unit )\n  Unit\n");
         assert!(empty.contains("@\n"), "{empty}");
@@ -2383,5 +2509,66 @@ mod tests {
             "expected method name"
         );
         assert_eq!(err(": f ( Eq a, => a -- a )\n  dup\n", ParseMode::Source), "expected class name");
+    }
+
+    #[test]
+    fn import_forms_print() {
+        let selective = ok("~ \"Data/Bus\" Bus, bus, send : busSend, stream\n");
+        assert!(
+            selective.contains("~ \"Data/Bus\" Bus, bus, send : busSend, stream"),
+            "{selective}"
+        );
+        let all = ok("~ \"Data/Bus\" ..\n");
+        assert!(all.contains("~ \"Data/Bus\" .."), "{all}");
+        let alias = ok("~ \"Data/Bus\" : Bus\n");
+        assert!(alias.contains("~ \"Data/Bus\" : Bus"), "{alias}");
+        let bare = ok("~ \"Data/Bus\"\n");
+        assert_eq!(bare, "~ \"Data/Bus\"");
+        let same = ok("~ \"Data/Bus\" send : send, send : other\n");
+        assert!(same.contains("~ \"Data/Bus\" send, send : other"), "{same}");
+        let wrapped = ok("~ \"Data/Bus\"\n  Bus,\n  send : busSend\n");
+        assert!(
+            wrapped.contains("~ \"Data/Bus\" Bus, send : busSend"),
+            "{wrapped}"
+        );
+        let indented = ok("~ \"Data/Bus\"\n  : Bus\n");
+        assert!(indented.contains("~ \"Data/Bus\" : Bus"), "{indented}");
+        let qualified = ok(
+            "~ \"Data/Bus\" : Bus\n\n: use ( (Bus:Maybe Int) -- Int )\n  (Bus:Just x) -> x\n  Bus:Nothing -> 0n\n",
+        );
+        assert!(qualified.contains("Bus:Maybe"), "{qualified}");
+        assert!(qualified.contains("(Bus:Just x)"), "{qualified}");
+        assert!(qualified.contains("Bus:Nothing"), "{qualified}");
+        let word = ok("~ \"Data/Bus\"\n: idle ( -- Unit )\n  Unit\n");
+        assert!(word.contains("~ \"Data/Bus\"\n"), "{word}");
+        assert!(word.contains(": idle ( -- Unit )"), "{word}");
+        assert_eq!(
+            err("~ \"Data/Bus\" (send)\n", ParseMode::Source),
+            "expected imported name"
+        );
+        assert_eq!(
+            err("~ \"Data/Bus\" : bus\n", ParseMode::Source),
+            "module segment 'bus' must start with an uppercase letter"
+        );
+        assert_eq!(
+            err("~ \"Data/Bus\" ..\nsend\n", ParseMode::Source),
+            "import is already complete"
+        );
+        assert_eq!(
+            err("~ \"Data/Bus\" : Bus send\n", ParseMode::Source),
+            "import is already complete"
+        );
+        assert_eq!(
+            err("~ \"Data/Bus\" send, ..\n", ParseMode::Source),
+            "expected imported name"
+        );
+        assert_eq!(
+            err("~ \"Data/Bus\" send, send\n", ParseMode::Source),
+            "duplicate definition send"
+        );
+        assert_eq!(
+            err("~ \"Data/Bus\" send : a, send : a\n", ParseMode::Source),
+            "duplicate definition a"
+        );
     }
 }

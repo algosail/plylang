@@ -163,6 +163,8 @@ pub enum Error {
     PrivateInScheme(String),
     /// `name>>` or `>>name` on a type whose constructor was not imported.
     FieldsPrivate(String),
+    /// A name, `..`, or `: Alias` already closed this import.
+    ImportClosed,
 }
 
 impl Error {
@@ -420,6 +422,7 @@ impl Error {
                 format!("public scheme mentions private {name}"),
             ),
             FieldsPrivate(name) => ("PL0132", format!("fields of {name} are private")),
+            ImportClosed => static_text("PL0133", "import is already complete"),
         }
     }
 }
@@ -752,8 +755,13 @@ mod tests {
                 "fields of Box are private",
                 "PL0132",
             ),
+            (
+                Error::ImportClosed,
+                "import is already complete",
+                "PL0133",
+            ),
         ];
-        assert_eq!(samples.len(), 132);
+        assert_eq!(samples.len(), 133);
         for (error, message, code) in samples {
             assert_eq!(error.code(), code, "{message}");
             assert_eq!(error.message(), message);

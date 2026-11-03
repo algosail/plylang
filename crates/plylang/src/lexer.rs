@@ -95,6 +95,8 @@ impl<'a> Lexer<'a> {
                 {
                     break
                 }
+                // `~ "Path" ..` is every published name. `.. name` and `.. text` stay comments.
+                Some('.') if self.group_depth == 0 && self.bare_all() => break,
                 Some('.') if self.group_depth == 0 => {
                     self.bump();
                     while let Some(ch) = self.peek() {
@@ -179,7 +181,10 @@ impl<'a> Lexer<'a> {
             ';' => TokenKind::Data,
             '&' => TokenKind::Class,
             '#' => TokenKind::Instance,
-            '.' if self.group_depth == 0 => return self.doc_line(start),
+            '.' if self.group_depth == 0 && start == self.line_start_at => {
+                return self.doc_line(start)
+            }
+            '.' if self.group_depth == 0 => return self.dot(start),
             '.' => return self.dot(start),
             '"' => return self.string(start),
             '-' => return self.dash(start),
@@ -203,6 +208,15 @@ impl<'a> Lexer<'a> {
             }
         };
         Ok(self.make(kind, start, self.index))
+    }
+
+    /// Bare `..` whose next character is not a name or a space. That is the import-all rune.
+    fn bare_all(&self) -> bool {
+        self.peek_at(1) == Some('.')
+            && !matches!(
+                self.peek_at(2),
+                Some(ch) if is_ident_start(ch) || ch == ' ' || ch == '\t'
+            )
     }
 
     /// `..` at column 0, outside parentheses. One leading space after the marker is not part of the text.
@@ -445,6 +459,27 @@ mod tests {
         }
         assert!(kinds.iter().any(|kind| kind == "Dot"));
         assert!(kinds.iter().any(|kind| kind == "All"));
+        assert_eq!(
+            spell("~ \"Data/Bus\" ..\n"),
+            vec![
+                "Import".to_string(),
+                "String(\"Data/Bus\")".to_string(),
+                "All".to_string(),
+                "Newline".to_string(),
+            ]
+        );
+        assert!(
+            !spell("~ \"Data/Bus\" ..\n")
+                .iter()
+                .any(|kind| kind.starts_with("Doc")),
+        );
+        let commented = spell("~ \"Data/Bus\" .. names\n");
+        assert!(
+            commented.iter().any(|kind| kind.starts_with("Doc") || kind == "Newline")
+                || !commented.iter().any(|kind| kind == "All"),
+            "{commented:?}"
+        );
+        assert!(!commented.iter().any(|kind| kind == "All"), "{commented:?}");
         let inside = spell("(\n..s\n)");
         assert!(inside.iter().any(|kind| kind == "Tail(\"s\")"), "{inside:?}");
         assert!(!inside.iter().any(|kind| kind.starts_with("Doc")), "{inside:?}");

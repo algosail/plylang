@@ -776,6 +776,7 @@ impl Checker {
         produced: usize,
         frame: &mut Frame,
     ) {
+        let canon = self.canonical(name).to_string();
         let Some((dict, extras)) = dicts.split_first() else {
             self.emit_word(name, dicts, stack_args, produced, frame);
             return;
@@ -785,18 +786,18 @@ impl Checker {
                 let base = self.assumption_locals[*index];
                 let mut args = self.materialize_dicts(extras, frame);
                 args.extend(stack_args);
-                self.emit_prop_apply(base, name, args, produced, frame);
+                self.emit_prop_apply(base, &canon, args, produced, frame);
             }
             Dict::Super { .. } => {
                 let base = self.materialize_dict(dict, frame);
                 let mut args = self.materialize_dicts(extras, frame);
                 args.extend(stack_args);
-                self.emit_prop_apply(base, name, args, produced, frame);
+                self.emit_prop_apply(base, &canon, args, produced, frame);
             }
             Dict::Instance { methods, .. } => {
                 let method = methods
                     .iter()
-                    .find(|method| method.name == name)
+                    .find(|method| method.name == canon)
                     .expect("class dictionary contains the method");
                 let mut args = self.materialize_dicts(&method.dicts, frame);
                 args.extend(self.materialize_dicts(extras, frame));
@@ -1301,11 +1302,12 @@ impl Checker {
             Pattern::Unpack(name) => {
                 let shape = self.ctor_shape(name, ty, span)?;
                 let newtype = shape.newtype;
+                let tag = shape.tag.clone();
                 if !newtype {
                     conds.push(Cond {
                         root,
                         steps: steps.to_vec(),
-                        test: PatTest::Tag(name.clone()),
+                        test: PatTest::Tag(tag),
                     });
                 }
                 let width = shape.fields.len();
@@ -1327,6 +1329,7 @@ impl Checker {
             Pattern::Ctor(name, patterns) => {
                 let shape = self.ctor_shape(name, ty, span)?;
                 let newtype = shape.newtype;
+                let tag = shape.tag.clone();
                 if patterns.len() != shape.fields.len() {
                     let count = shape.fields.len();
                     return Err(self.error(
@@ -1338,7 +1341,7 @@ impl Checker {
                     conds.push(Cond {
                         root,
                         steps: steps.to_vec(),
-                        test: PatTest::Tag(name.clone()),
+                        test: PatTest::Tag(tag),
                     });
                 }
                 let width = shape.fields.len();

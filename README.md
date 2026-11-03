@@ -13,7 +13,7 @@ The repository contains the `plylang` compiler and the `plylang-ls` server. Word
 A signature says what a word takes and what it puts. The tail under that prefix stays in place.
 
 ```ply
-~ "Num" (add)
+~ "Num" add
 
 : double ( Num -- Num )
   dup add
@@ -95,7 +95,7 @@ The same permutations as in Factor follow, with names made of letters: `dupd`, `
 `cons` pushes a value and then runs a quotation. The value sits under the quotation, so `5 [ 1 add ] cons` is a quotation of type `(-- Num)` that pushes five and then adds one. The call site does not name that value.
 
 ```ply
-~ "Num" (eq, sub, mul)
+~ "Num" eq, sub, mul
 
 : fact ( Num -- Num )
   dup 0 eq [ drop 1 ] [ dup 1 sub fact mul ] if
@@ -184,15 +184,15 @@ In JavaScript a constructor with no fields is `{ tag: "Nothing" }`. One field is
 A word that walks an array is imported. In the example the quotation sits on top. The name comes from one module, and the instance for the array comes from another.
 
 ```ply
-~ "Map" (map)
-~ "Num" (add)
-~ "Arr" ()
+~ "Map" map
+~ "Num" add
+~ "Arr"
 
 : shifted ( -- (Array Num) )
   < 1 2 3 > [ 1 add ] map
 ```
 
-Empty parentheses bring the instances of a module and bring no names. The result is `2`, `3`, `4`.
+The bare import of `Arr` brings the instances of that module and brings no names. The result is `2`, `3`, `4`.
 
 ## A name for a type
 
@@ -213,7 +213,7 @@ Parameters are written as they are on a type: `- Twin a (Pair a a)`. In a slot a
 `;` with `==` is a distinct type with one constructor and one field. It does not unify with the field. In JavaScript the constructor returns its argument as it is.
 
 ```ply
-~ "Num" (add)
+~ "Num" add
 
 ; Age == Age Num
 
@@ -228,7 +228,7 @@ Zero fields, two fields, or two constructors do not fit `==`. A type with `=` is
 `(StrMap a)` is a dictionary with key `Str`. The key becomes known at run time and is not named in the type ahead of time. There is no literal. An empty dictionary in JavaScript is `Object.create(null)`.
 
 ```ply
-~ "Dict" (empty, put)
+~ "Dict" empty, put
 
 : ages ( -- (StrMap Num) )
   empty "Ada" 36 put
@@ -249,14 +249,14 @@ The order in the example is the dictionary, the key, and the value on top.
 ```
 
 ```ply
-~ "Equal" (Equal, eq)
-~ "Num" ()
+~ "Equal" Equal, eq
+~ "Num"
 
 : same ( Equal a => a a -- Bool )
   eq
 ```
 
-The instance for numbers is declared in the `Num` module. `()` brings the instances of that module and brings no names. The empty import of `Num` gives `same` that instance.
+The instance for numbers is declared in the `Num` module. The bare import of `Num` brings the instances of that module and brings no names. That import gives `same` that instance.
 
 A hand-written instance is a word for each method. A module may write one when it defines the class, the type, or the wrapper in the head, or when the head contains a built-in constructor `Int`, `Num`, `Bool`, `Str`, `Unit`, `Array`, or `StrMap`.
 
@@ -293,17 +293,17 @@ One `*.ply` file is one module. The file itself has no name. The path from the s
 A module names what it publishes with one `@` list. The list may stand anywhere in the file. A name in the list leaves the file. Any other name stays in the file. The same list holds words, types, constructors, synonyms, classes, methods, and names brought in by an import. A type and its constructor share one entry when they share a name. Names are separated by commas. A bare `@` publishes nothing. A second `@` is a duplicate definition.
 
 ```ply
-~ "Data/Maybe" (Just, Nothing, fromMaybe)
-~ "@algosail/example/Num" (add)
+~ "Data/Maybe" Just, Nothing, fromMaybe
+~ "@algosail/example/Num" add
 
 @ Maybe, Nothing, Just, fromMaybe
 ```
 
-Imports stay together and come before the first `:`, `;`, `-`, `&`, or `#`. A path inside this package is written from the source directory. A path into another package is a package specifier. The parentheses name what this file uses. `..` means every published name. Writing an imported name again in the `@` list publishes it. `()` brings instances and no names.
+Imports stay together and come before the first `:`, `;`, `-`, `&`, or `#`. A path inside this package is written from the source directory. A path into another package is a package specifier. The names after the path are what this file uses. `..` means every published name. `: Alias` brings every published name as `Alias:name`, and a call is `Alias:send`. `send : busSend` brings `send` as `busSend`. A bare path brings instances and no names. Writing the local name again in the `@` list publishes it. A colon in column 0 still starts a word.
 
 A test entry, a word `( -- Verdict )` or `suite`, is not a module and has no list. A utility under `test/` is a module and has one. A word `main` with scheme `( -- Unit )` may stay off the list. Node still runs it when it starts that file.
 
-A comment runs from `.` to the end of the line, when the dot is not inside `()`. `..` in column 0, directly above `:`, `;`, `-`, or `&`, is the text of that declaration. One space after `..` is not part of the text. A type has one text for all of its constructors. A class has one text for its name and for all of its methods. A `..` line above `#` does not attach to the declaration.
+A comment runs from `.` to the end of the line, when the dot is not inside `()`. A bare `..` on an import is every published name. `..` followed by a space or a name is still a comment. `..` in column 0, directly above `:`, `;`, `-`, or `&`, is the text of that declaration. One space after `..` is not part of the text. A type has one text for all of its constructors. A class has one text for its name and for all of its methods. A `..` line above `#` does not attach to the declaration.
 
 A declaration stands in column 0 and starts with `@`, `:`, `;`, `-`, `&`, `#`, or `~`.
 

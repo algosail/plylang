@@ -26,6 +26,8 @@ pub(super) struct CtorShape {
     pub fields: Vec<TyId>,
     pub names: Vec<Option<String>>,
     pub newtype: bool,
+    /// Tag stored on the value. A renamed pattern still matches the defining name.
+    pub tag: String,
 }
 
 /// What a slot can still be. `Open` is an infinite scalar with some literals removed.
@@ -293,13 +295,15 @@ impl Checker {
                 Error::ExpectedDataType(self.show_ty(ty)),
             ));
         }
+        let written = name.to_string();
+        let name = self.canonical(name).to_string();
         let Some(ctor) = data.ctors.iter().find(|ctor| ctor.name == name) else {
             return Err(self.error(
                 span,
-                Error::ConstructorNotOf { name: name.to_string(), type_name: data_name.to_string() },
+                Error::ConstructorNotOf { name: written, type_name: data_name.to_string() },
             ));
         };
-        if let Err(error) = self.constructor_open(&data_name, name) {
+        if let Err(error) = self.constructor_open(&data_name, &written) {
             return Err(self.error(span, error));
         }
         let fields = self.instantiate_fields(&data.params, &args, &ctor.fields);
@@ -307,6 +311,7 @@ impl Checker {
             fields,
             names: ctor.names.clone(),
             newtype: data.newtype,
+            tag: name,
         })
     }
 
@@ -316,6 +321,7 @@ impl Checker {
         slots: &[TyId],
         report: Span,
     ) -> Result<(), Diagnostic> {
+        let clauses = self.canonical_clauses(clauses);
         let mut rows = vec![slots
             .iter()
             .map(|ty| self.need_of(*ty, 0))
@@ -344,6 +350,43 @@ impl Checker {
             Error::NonExhaustiveExamples(examples)
         };
         Err(self.error(report, error))
+    }
+
+    /// Exhaustiveness compares pattern names with the constructors of the data type.
+    fn canonical_clauses(&self, clauses: &[Clause]) -> Vec<Clause> {
+        clauses
+            .iter()
+            .map(|clause| {
+                let mut clause = clause.clone();
+                for pattern in &mut clause.patterns {
+                    self.canonical_pattern(pattern);
+                }
+                clause
+            })
+            .collect()
+    }
+
+    fn canonical_pattern(&self, pattern: &mut Pattern) {
+        match pattern {
+            Pattern::Unpack(name) => *name = self.canonical(name).to_string(),
+            Pattern::Ctor(name, fields) => {
+                *name = self.canonical(name).to_string();
+                for field in fields {
+                    self.canonical_pattern(field);
+                }
+            }
+            Pattern::Array(items) => {
+                for item in items {
+                    self.canonical_pattern(item);
+                }
+            }
+            Pattern::Record(fields) => {
+                for (_, field) in fields {
+                    self.canonical_pattern(field);
+                }
+            }
+            Pattern::Wild | Pattern::Bind(_, _) | Pattern::Lit(_) => {}
+        }
     }
 
     fn need_of(&mut self, ty: TyId, depth: usize) -> Need {

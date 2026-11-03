@@ -108,7 +108,7 @@ fn context_of(walked: &Walk, partial: Option<&Token>, at_column_0: bool) -> Cont
         return Context::ImportPath { quoted: true };
     }
     match walked.state {
-        Place::ImportList => Context::ImportName {
+        Place::ImportString | Place::ImportList if !walked.rename => Context::ImportName {
             path: walked.path.clone(),
             seen: walked.seen.clone(),
             has_all: walked.has_all,
@@ -323,23 +323,23 @@ fn imported_words(from: &Path, module: &Module) -> Vec<Named> {
         let Some(provider) = read_module(&file) else {
             continue;
         };
-        for name in selected_names(from, import) {
+        for (local, remote) in selected_names(from, import) {
             let mut load = |start: &Path, path: &str| load_surface(start, path);
-            let Some((_, found)) = surface::lookup(&provider, &file, &name, &mut load) else {
+            let Some((_, found)) = surface::lookup(&provider, &file, &remote, &mut load) else {
                 continue;
             };
             match found {
-                Found::Def(def) if def.name == name => names.push(Named {
-                    label: def.name.clone(),
+                Found::Def(def) if def.name == remote => names.push(Named {
+                    label: local,
                     kind: CompletionKind::Word,
                     detail: scheme_string(&def.scheme),
                     documentation: doc_text(&def.doc),
                     group: "2",
                 }),
                 Found::Data(data) => {
-                    if let Some(ctor) = data.ctors.iter().find(|ctor| ctor.name == name) {
+                    if let Some(ctor) = data.ctors.iter().find(|ctor| ctor.name == remote) {
                         names.push(Named {
-                            label: ctor.name.clone(),
+                            label: local,
                             kind: CompletionKind::Constructor,
                             detail: ctor_detail(&data, ctor),
                             documentation: doc_text(&data.doc),
@@ -348,9 +348,9 @@ fn imported_words(from: &Path, module: &Module) -> Vec<Named> {
                     }
                 }
                 Found::Class(class) => {
-                    if let Some(method) = class.methods.iter().find(|method| method.name == name) {
+                    if let Some(method) = class.methods.iter().find(|method| method.name == remote) {
                         names.push(Named {
-                            label: method.name.clone(),
+                            label: local,
                             kind: CompletionKind::Word,
                             detail: method_line(&class, method),
                             documentation: doc_text(&class.doc),
@@ -374,28 +374,28 @@ fn imported_types(from: &Path, module: &Module) -> Vec<Named> {
         let Some(provider) = read_module(&file) else {
             continue;
         };
-        for name in selected_names(from, import) {
+        for (local, remote) in selected_names(from, import) {
             let mut load = |start: &Path, path: &str| load_surface(start, path);
-            let Some((_, found)) = surface::lookup(&provider, &file, &name, &mut load) else {
+            let Some((_, found)) = surface::lookup(&provider, &file, &remote, &mut load) else {
                 continue;
             };
             match found {
-                Found::Data(data) if data.name == name => names.push(Named {
-                    label: data.name.clone(),
+                Found::Data(data) if data.name == remote => names.push(Named {
+                    label: local,
                     kind: CompletionKind::Type,
                     detail: type_detail(&data),
                     documentation: doc_text(&data.doc),
                     group: "2",
                 }),
-                Found::Synonym(synonym) if synonym.name == name => names.push(Named {
-                    label: synonym.name.clone(),
+                Found::Synonym(synonym) if synonym.name == remote => names.push(Named {
+                    label: local,
                     kind: CompletionKind::Type,
                     detail: synonym_detail(&synonym),
                     documentation: doc_text(&synonym.doc),
                     group: "2",
                 }),
-                Found::Class(class) if class.name == name => names.push(Named {
-                    label: class.name.clone(),
+                Found::Class(class) if class.name == remote => names.push(Named {
+                    label: local,
                     kind: CompletionKind::Class,
                     detail: class_detail(&class),
                     documentation: doc_text(&class.doc),
@@ -408,17 +408,23 @@ fn imported_types(from: &Path, module: &Module) -> Vec<Named> {
     names
 }
 
-fn selected_names(from: &Path, import: &crate::ast::Import) -> Vec<String> {
-    if !import.all {
-        return import.names.clone();
-    }
-    let Some(file) = provider_file(from, &import.path) else {
-        return Vec::new();
+fn selected_names(from: &Path, import: &crate::ast::Import) -> Vec<(String, String)> {
+    let surface = if import.all || import.alias.is_some() {
+        let Some(file) = provider_file(from, &import.path) else {
+            return Vec::new();
+        };
+        let Some(module) = read_module(&file) else {
+            return Vec::new();
+        };
+        surface::public_names(&module)
+    } else {
+        import
+            .names
+            .iter()
+            .map(|imported| imported.remote.clone())
+            .collect()
     };
-    let Some(module) = read_module(&file) else {
-        return Vec::new();
-    };
-    surface::public_names(&module)
+    import.bindings(&surface)
 }
 
 fn found_exports(found: &Found, name: &str) -> Vec<(CompletionKind, String, String)> {
@@ -616,6 +622,8 @@ struct Walk {
     path: String,
     seen: Vec<String>,
     has_all: bool,
+    /// The next identifier is a local spelling, not a name from the provider.
+    rename: bool,
     vars: Vec<String>,
     params: Vec<String>,
     binders: bool,
@@ -681,6 +689,7 @@ fn walk(tokens: &[&Token]) -> Walk {
         path: String::new(),
         seen: Vec::new(),
         has_all: false,
+        rename: false,
         vars: Vec::new(),
         params: Vec::new(),
         binders: true,
@@ -695,6 +704,7 @@ fn walk(tokens: &[&Token]) -> Walk {
             walked.state = Place::Top;
             walked.depth = 0;
             walked.saw_foreign = false;
+            walked.rename = false;
         }
         step(&mut walked, token, next);
         index += 1;
@@ -752,18 +762,38 @@ fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
             _ => {}
         },
         Place::ImportString => match &token.kind {
-            TokenKind::LParen => {
+            TokenKind::Ident(name) => {
                 walked.seen.clear();
                 walked.has_all = false;
+                walked.seen.push(name.clone());
                 walked.state = Place::ImportList;
             }
-            TokenKind::Newline => walked.state = Place::Top,
+            TokenKind::All => {
+                walked.seen.clear();
+                walked.has_all = true;
+                walked.state = Place::ImportList;
+            }
+            TokenKind::Colon => {
+                walked.seen.clear();
+                walked.has_all = true;
+                walked.rename = true;
+                walked.state = Place::ImportList;
+            }
+            TokenKind::LParen | TokenKind::Newline => {}
             _ => {}
         },
         Place::ImportList => match &token.kind {
             TokenKind::RParen => walked.state = Place::Top,
-            TokenKind::Ident(name) => walked.seen.push(name.clone()),
+            TokenKind::Ident(name) => {
+                if walked.rename {
+                    walked.rename = false;
+                } else {
+                    walked.seen.push(name.clone());
+                }
+            }
+            TokenKind::Colon => walked.rename = true,
             TokenKind::All => walked.has_all = true,
+            TokenKind::Comma => walked.rename = false,
             _ => {}
         },
         Place::DefName => match &token.kind {
@@ -977,7 +1007,25 @@ fn scan_line(source: &str, offset: usize) -> (bool, bool) {
         if ch == '.' && depth == 0 {
             let decimal = prev_digit && chars.peek().is_some_and(|next| next.is_ascii_digit());
             if !decimal {
-                in_comment = true;
+                if chars.peek() == Some(&'.') {
+                    let mut ahead = chars.clone();
+                    ahead.next();
+                    let comment = matches!(
+                        ahead.peek().copied(),
+                        Some(next)
+                            if next.is_ascii_alphabetic()
+                                || next == '_'
+                                || next == ' '
+                                || next == '\t'
+                    );
+                    if comment {
+                        in_comment = true;
+                    } else {
+                        chars.next();
+                    }
+                } else {
+                    in_comment = true;
+                }
                 prev_digit = false;
                 continue;
             }
@@ -1717,22 +1765,22 @@ mod tests {
         assert!(paths.iter().all(|item| item.label != "Ghost"), "{paths:?}");
         assert_eq!(paths.iter().find(|item| item.label == "Data/Maybe").unwrap().insert, "Data/Maybe");
 
-        let source = "~ \"Data/Maybe\" (J)\n";
-        let (line, character) = at(source, "(J");
+        let source = "~ \"Data/Maybe\" J\n";
+        let (line, character) = at(source, "J");
         let names = complete(source, &path, line, character);
         assert!(names.iter().any(|item| item.label == "Just"), "{names:?}");
         assert!(names.iter().any(|item| item.label == "fromMaybe"), "{names:?}");
         assert!(names.iter().any(|item| item.label == "Maybe"), "{names:?}");
         assert!(names.iter().any(|item| item.label == ".."), "{names:?}");
 
-        let source = "~ \"Data/Maybe\" (Just)\n\n: use ( Int -- Int )\n  J";
+        let source = "~ \"Data/Maybe\" Just\n\n: use ( Int -- Int )\n  J";
         let (line, character) = at(source, "\n  J");
         let words = complete(source, &path, line, character);
         assert!(words.iter().any(|item| item.label == "Just"), "{words:?}");
         assert!(!words.iter().any(|item| item.label == "Nothing"), "{words:?}");
         assert!(words.iter().any(|item| item.label == "dup"), "{words:?}");
 
-        let source = "~ \"Data/Maybe\" (Maybe)\n\n: use ( M\n  drop\n";
+        let source = "~ \"Data/Maybe\" Maybe\n\n: use ( M\n  drop\n";
         let (line, character) = at(source, "( M");
         let types = complete(source, &path, line, character);
         assert!(types.iter().any(|item| item.label == "Maybe"), "{types:?}");
@@ -1760,8 +1808,8 @@ mod tests {
         .unwrap();
         let app = root.join("src/App.ply");
         fs::write(&app, "").unwrap();
-        let source = "~ \"Data/Num\" ()\n";
-        let (line, character) = at(source, "(");
+        let source = "~ \"Data/Num\" \n";
+        let (line, character) = at(source, "Num\" ");
         let names = complete(source, &app, line, character);
         assert!(names.iter().any(|item| item.label == "add"), "{names:?}");
         let add = names.iter().find(|item| item.label == "add").unwrap();
@@ -1898,7 +1946,7 @@ mod tests {
         .unwrap();
         let app = root.join("src/App.ply");
         fs::write(&app, "").unwrap();
-        let imported = "~ \"Data/Entry\" (Clock)\n\n: get ( Clock -- Clock )\n  1 >>";
+        let imported = "~ \"Data/Entry\" Clock\n\n: get ( Clock -- Clock )\n  1 >>";
         let items = complete(imported, &app, at(imported, "1 >>").0, at(imported, "1 >>").1);
         assert_eq!(
             items.iter().map(|item| item.label.clone()).collect::<Vec<_>>(),
