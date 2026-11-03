@@ -2,6 +2,7 @@ mod anf;
 mod ast;
 mod builtin;
 mod build;
+mod bundle;
 mod check;
 mod codes;
 mod complete;
@@ -21,7 +22,8 @@ pub const LANGUAGE_VERSION: u32 = 1;
 
 pub use ast::Module;
 pub use build::{
-    build, buffer_notes, build_exports, check_buffer, check_package, javascript_file, stack_sites,
+    build, buffer_notes, build_exports, check_buffer, check_package, compile, javascript_file,
+    stack_sites,
     BufferNotes, BuildError,
 };
 pub use check::{check, javascript, StackAt};

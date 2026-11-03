@@ -299,6 +299,9 @@ impl Checker {
                 Error::ConstructorNotOf { name: name.to_string(), type_name: data_name.to_string() },
             ));
         };
+        if let Err(error) = self.constructor_open(&data_name, name) {
+            return Err(self.error(span, error));
+        }
         let fields = self.instantiate_fields(&data.params, &args, &ctor.fields);
         Ok(CtorShape {
             fields,

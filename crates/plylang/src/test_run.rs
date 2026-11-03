@@ -601,7 +601,7 @@ Time   12ms
         temp.write(
             "src/Also.ply",
             "\
-@ suite
+@ suite, Verdict
 
 ; Verdict = Verdict ok : Bool, name : Str, text : Str
 

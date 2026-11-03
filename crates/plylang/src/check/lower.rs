@@ -133,18 +133,25 @@ impl Frame {
 impl Checker {
     fn lower_module(&mut self, module: &Module) -> Result<AnfModule, Diagnostic> {
         self.prepare(module)?;
-        self.check_bodies(module)?;
+        self.check_ready(module)?;
         self.lower_prepared(module)
     }
 
     pub(crate) fn lower_prepared(&mut self, module: &Module) -> Result<AnfModule, Diagnostic> {
         let mut defs = Vec::new();
-        for item in &module.items {
-            if let Item::Def(def) = item {
-                if !def.body.is_empty() || !def.clauses.is_empty() {
-                    defs.push(self.lower_def(module, def)?);
+        let bodies: Vec<crate::ast::Def> = module
+            .items
+            .iter()
+            .chain(self.derived.iter())
+            .filter_map(|item| match item {
+                Item::Def(def) if !def.body.is_empty() || !def.clauses.is_empty() => {
+                    Some(def.clone())
                 }
-            }
+                _ => None,
+            })
+            .collect();
+        for def in &bodies {
+            defs.push(self.lower_def(module, def)?);
         }
         let datas = module
             .items
@@ -1640,12 +1647,7 @@ impl Checker {
     }
 
     fn ctor_width(&self, name: &str) -> Option<usize> {
-        self.datas.values().find_map(|data| {
-            data.ctors
-                .iter()
-                .find(|ctor| ctor.name == name)
-                .map(|ctor| ctor.fields.len())
-        })
+        self.ctor_words.get(name).map(|ctor| ctor.fields)
     }
 
     fn fresh_local(&mut self) -> LocalId {

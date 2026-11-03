@@ -5,7 +5,8 @@
 //! `ply.entry` names one, and a key this tool does not own stays.
 //! `--exports` calls the same alignment. `plylang check` writes nothing.
 //! A word named `main` with scheme `( -- Unit )` is called at the bottom of its
-//! module when Node starts that file.
+//! module when Node starts that file. `plylang compile` writes `script.js`
+//! beside those modules: the same graph, with only the bindings `main` reaches.
 //!
 //! A local import is a module path such as `Data/Either`. A package import is
 //! `@scope/name/...` or an unscoped `name/...`. `plylang check --js` prints the
@@ -19,7 +20,9 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 
 use crate::anf::{js_ident, referenced_words, AnfModule};
-use crate::ast::{scheme_string, push_doc, Def, Exports, Import, Item, Module, StackTail, Type};
+use crate::ast::{
+    scheme_string, push_doc, Data, Def, Exports, Import, Instance, Item, Module, StackTail, Type,
+};
 use crate::check::{
     check_and_note, check_with_imports_key, collect_sites, collect_sites_with_imports_key,
     module_notes, KnownModule, ResolvedImport, StackAt,
@@ -148,6 +151,22 @@ pub fn build(dir: &Path) -> Result<(), BuildError> {
 /// Build the package, then replace `package.json` `exports` with one entry per built module.
 pub fn build_exports(dir: &Path) -> Result<(), BuildError> {
     run_build(dir, true)
+}
+
+/// Write the Node modules, then `script.js`: one classic page script.
+/// Does not rewrite `package.json` `exports`.
+pub fn compile(dir: &Path) -> Result<(), BuildError> {
+    let mut session = open_session(dir)?;
+    session.prepare_page()?;
+    session.check_all()?;
+    session.write_outputs()?;
+    let entry = session
+        .package
+        .entry
+        .clone()
+        .expect("compile package has ply.entry");
+    crate::bundle::write_page(&session.package.out, &entry)?;
+    Ok(())
 }
 
 fn run_build(dir: &Path, write_exports: bool) -> Result<(), BuildError> {
@@ -603,6 +622,23 @@ impl Session {
         Ok(())
     }
 
+    /// `plylang compile` writes one page. `ply.entry` names its module, and
+    /// that module defines `main` with scheme `( -- Unit )`. A `main` of
+    /// another scheme stays PL0115 from the module check.
+    fn prepare_page(&self) -> Result<(), BuildError> {
+        let Some(name) = &self.package.entry else {
+            let path = self.package.root.join("package.json");
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            return Err(pkg_error(&path, &text, Error::BrowserEntry));
+        };
+        let id = *self.by_module.get(name).expect("entry module");
+        match entry_def(&self.units[id].module) {
+            Some(def) if accepts_entry(def) => Ok(()),
+            Some(_) => Ok(()),
+            None => Err(self.fail(id, Span::new(0, 0), Error::BrowserEntry)),
+        }
+    }
+
     fn write_outputs(&self) -> Result<(), BuildError> {
         for output in &self.outputs {
             if let Some(parent) = output.js_path.parent() {
@@ -966,6 +1002,8 @@ impl Session {
         if self.units[id].kind == Kind::External {
             return Ok(());
         }
+        self.units[id].module.items.extend(checked.derived.iter().cloned());
+        let module = self.units[id].module.clone();
         self.check_foreign(id, &checked.foreign_arity)?;
         let module_path = self.units[id].module_path.clone().expect("local module");
         let js_path = self
@@ -1882,6 +1920,9 @@ fn read_package(root: &Path) -> Result<Package, BuildError> {
             Some(name)
         }
     };
+    if ply.get("target").is_some() {
+        return Err(pkg_error(&path, &text, Error::PackageJsonTarget));
+    }
     let name = value
         .get("name")
         .and_then(Value::as_str)
@@ -2459,7 +2500,7 @@ fn target_file(root: &Path, target: &str) -> PathBuf {
     root.join(relative)
 }
 
-fn find_installed(start: &Path, name: &str) -> Option<PathBuf> {
+pub(crate) fn find_installed(start: &Path, name: &str) -> Option<PathBuf> {
     let mut dir = start.parent()?.to_path_buf();
     loop {
         let candidate = dir.join("node_modules").join(name);
@@ -2769,6 +2810,10 @@ fn interface_text(module: &Module) -> String {
         out.push('\n');
         match item {
             Item::Def(def) => push_interface_def(&mut out, def),
+            Item::Data(data) => {
+                out.push_str(&interface_data(module, data));
+                out.push('\n');
+            }
             other => {
                 out.push_str(&other.to_string());
                 out.push('\n');
@@ -2791,8 +2836,66 @@ fn interface_keeps(module: &Module, item: &Item) -> bool {
         Item::Class(class) => {
             list.has(&class.name) || class.methods.iter().any(|method| list.has(&method.name))
         }
-        Item::Instance(_) => true,
+        Item::Instance(instance) => !instance_mentions_unlisted(module, instance),
     }
+}
+
+/// Constructors absent from `@` are not part of the interface.
+/// A listed type with none of its constructors is still mentionable.
+fn interface_data(module: &Module, data: &Data) -> String {
+    let Some(list) = module.exports.list() else {
+        return data.to_string();
+    };
+    if data.foreign {
+        return data.to_string();
+    }
+    let mut kept = data.clone();
+    kept.ctors.retain(|ctor| list.has(&ctor.name));
+    if kept.ctors.is_empty() {
+        kept.foreign = true;
+        kept.newtype = false;
+    }
+    kept.to_string()
+}
+
+fn instance_mentions_unlisted(module: &Module, instance: &Instance) -> bool {
+    instance
+        .args
+        .iter()
+        .any(|ty| type_is_unlisted(module, ty))
+}
+
+fn type_is_unlisted(module: &Module, ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) => false,
+        Type::Ctor(name) => local_unlisted(module, name),
+        Type::App(head, args) => {
+            type_is_unlisted(module, head) || args.iter().any(|ty| type_is_unlisted(module, ty))
+        }
+        Type::Fun(effect) => effect
+            .input
+            .items
+            .iter()
+            .chain(&effect.output.items)
+            .any(|ty| type_is_unlisted(module, ty)),
+        Type::Record(row) => {
+            row.fields.iter().any(|(_, ty)| type_is_unlisted(module, ty))
+                || row.tail_ty().is_some_and(|ty| type_is_unlisted(module, ty))
+        }
+    }
+}
+
+fn local_unlisted(module: &Module, name: &str) -> bool {
+    let local = module.items.iter().any(|item| match item {
+        Item::Data(data) => data.name == name,
+        Item::Synonym(synonym) => synonym.name == name,
+        _ => false,
+    });
+    local
+        && match module.exports.list() {
+            Some(list) => !list.has(name),
+            None => true,
+        }
 }
 
 fn push_interface_def(out: &mut String, def: &Def) {
@@ -3435,10 +3538,32 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::parser::parse;
+    use crate::paths::ParseMode;
+
     use super::{
-        build, build_exports, check_buffer, check_package, exported_arity, relative_specifier,
-        JsExport,
+        build, build_exports, check_buffer, check_package, compile, exported_arity, interface_text,
+        relative_specifier, JsExport,
     };
+
+    #[test]
+    fn an_unexported_constructor_is_omitted_from_the_interface() {
+        let hidden = parse("@ Box\n\n; Box a = Mk a\n", ParseMode::Source).unwrap();
+        let text = interface_text(&hidden);
+        assert!(text.contains("; foreign Box a"), "{text}");
+        assert!(!text.contains("Mk"), "{text}");
+        let shared = parse("@ Box\n\n; Box a = Box a\n", ParseMode::Source).unwrap();
+        let text = interface_text(&shared);
+        assert!(text.contains("= Box a"), "{text}");
+        let one = parse(
+            "@ Maybe, Nothing\n\n; Maybe a = Nothing | Just a\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let text = interface_text(&one);
+        assert!(text.contains("Nothing"), "{text}");
+        assert!(!text.contains("Just"), "{text}");
+    }
 
     struct Temp(PathBuf);
 
@@ -4385,6 +4510,7 @@ mod tests {
         let other = fs::read_to_string(temp.0.join("dist/Other.js")).unwrap();
         assert!(!other.contains("import.meta.main"), "{other}");
         assert!(!temp.0.join("dist/run.js").exists());
+        assert!(!temp.0.join("dist/script.js").exists());
 
         let importer = temp.0.join("use.mjs");
         fs::write(
@@ -4940,6 +5066,220 @@ mod tests {
             &temp.0,
             "import { twice } from \"./dist/App.js\";\nimport { Stream } from \"./dist/Data/Stream.js\";\nconst out = twice(Stream(1));\nif (out.value !== 1) throw new Error(JSON.stringify(out));\n",
         );
+    }
+
+    #[test]
+    fn compile_writes_a_shaken_page_and_keeps_the_node_guard() {
+        let lib = Temp::new("page-lib");
+        lib.write(
+            "package.json",
+            r#"{
+  "name": "@algosail/lib",
+  "type": "module",
+  "ply": { "source": "src", "foreign": "foreign", "out": "dist", "language": 1 },
+  "exports": {
+    ".": { "ply": "./dist/Lib.d.ply", "import": "./dist/Lib.js" },
+    "./Lib": { "ply": "./dist/Lib.d.ply", "import": "./dist/Lib.js" }
+  }
+}
+"#,
+        );
+        lib.write(
+            "src/Lib.ply",
+            "@ ping\n\n: foreign ping ( -- Unit )\n\n: foreign boom ( -- Unit )\n\n: main ( -- Unit )\n  boom\n",
+        );
+        let boom_mark = lib.0.join("boom.txt");
+        let boom_lit = serde_json::to_string(&boom_mark.to_string_lossy().into_owned()).unwrap();
+        lib.write(
+            "foreign/Lib.js",
+            &format!(
+                "import {{\n  inner\n}} from \"./Inner.js\";\n\nexport class Marker {{}}\nlet n = 0;\nexport function ping() {{\n  inner();\n  n += 1;\n  if (!(new Marker() instanceof Marker)) throw new Error(\"class\");\n  if (n !== 1) throw new Error(String(n));\n}}\nexport function boom() {{\n  globalThis.process.getBuiltinModule(\"fs\").appendFileSync({boom_lit}, \"boom\\n\");\n}}\n"
+            ),
+        );
+        lib.write("foreign/Inner.js", "export function inner() {}\n");
+        build(&lib.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        assert!(!lib.0.join("dist/script.js").exists());
+
+        let app = Temp::new("page-app");
+        let app_mark = app.0.join("app.txt");
+        let app_lit = serde_json::to_string(&app_mark.to_string_lossy().into_owned()).unwrap();
+        app.write(
+            "package.json",
+            r#"{
+  "name": "@algosail/app",
+  "type": "module",
+  "dependencies": { "@algosail/lib": "0.0.0" },
+  "ply": { "source": "src", "foreign": "foreign", "out": "dist", "language": 1, "entry": "App" },
+  "exports": {}
+}
+"#,
+        );
+        app.write(
+            "src/Face.ply",
+            "@ ping\n~ \"@algosail/lib\" (ping)\n",
+        );
+        app.write(
+            "src/App.ply",
+            "@\n~ \"Face\" (ping)\n\n: foreign touch ( -- Unit )\n\n: spare ( -- Unit )\n  touch\n\n: main ( -- Unit )\n  ping drop\n  touch\n",
+        );
+        app.write(
+            "foreign/App.js",
+            &format!(
+                "export function touch() {{\n  globalThis.process.getBuiltinModule(\"fs\").appendFileSync({app_lit}, \"ran\\n\");\n}}\n"
+            ),
+        );
+        let link = app.0.join("node_modules/@algosail/lib");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&lib.0, &link).unwrap();
+
+        check_package(&app.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        assert!(!app.0.join("dist").exists());
+        build(&app.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        assert!(!app.0.join("dist/script.js").exists());
+        compile(&app.0).unwrap_or_else(|error| panic!("{}", error.render()));
+
+        let module = fs::read_to_string(app.0.join("dist/App.js")).unwrap();
+        assert!(module.contains("if (plyIsEntry) main();"), "{module}");
+        assert!(module.contains("function spare"), "{module}");
+        let script = fs::read_to_string(app.0.join("dist/script.js")).unwrap();
+        assert!(script.contains("class Marker"), "{script}");
+        assert!(script.contains("function inner"), "{script}");
+        assert!(script.contains("function ping"), "{script}");
+        assert!(script.contains("function touch"), "{script}");
+        assert!(!script.contains("function spare"), "{script}");
+        assert!(!script.contains("function boom"), "{script}");
+        assert!(!script.contains("boom.txt"), "{script}");
+        assert!(script.trim_end().ends_with(".main();"), "{script}");
+        assert!(!script.contains("from \"node:"), "{script}");
+        assert!(!script.contains("import.meta"), "{script}");
+        assert!(!script.contains("plyIsEntry"), "{script}");
+        assert!(!script.contains("\nexport ") && !script.contains("\nimport "), "{script}");
+        assert!(!app.0.join("dist/run.js").exists());
+
+        let plain = Temp::new("page-plain");
+        fs::write(plain.0.join("script.js"), &script).unwrap();
+        let checked = Command::new("node")
+            .arg("--check")
+            .arg(plain.0.join("script.js"))
+            .output()
+            .unwrap();
+        assert!(
+            checked.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+
+        let importer = app.0.join("use.mjs");
+        fs::write(&importer, "import \"./dist/App.js\";\nimport { ping } from \"./dist/Face.js\";\nif (typeof ping !== \"function\") throw new Error(\"ping\");\n").unwrap();
+        let imported = Command::new("node").arg(&importer).current_dir(&app.0).output().unwrap();
+        assert!(
+            imported.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&imported.stderr)
+        );
+        assert!(!app_mark.exists(), "import called main");
+        assert!(!boom_mark.exists(), "import called the dependency main");
+
+        let ran = Command::new("node")
+            .arg(app.0.join("dist/script.js"))
+            .current_dir(&app.0)
+            .output()
+            .unwrap();
+        assert!(
+            ran.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        assert_eq!(fs::read_to_string(&app_mark).unwrap(), "ran\n");
+        assert!(!boom_mark.exists(), "page called the dependency main");
+
+        fs::remove_file(&app_mark).unwrap();
+        let module_run = Command::new("node")
+            .arg(app.0.join("dist/App.js"))
+            .output()
+            .unwrap();
+        assert!(
+            module_run.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&module_run.stderr)
+        );
+        assert_eq!(fs::read_to_string(&app_mark).unwrap(), "ran\n");
+        assert!(!boom_mark.exists());
+    }
+
+    #[test]
+    fn compile_rejects_a_bad_package() {
+        let temp = Temp::new("page-bad");
+        temp.write(
+            "package.json",
+            r#"{ "ply": { "language": 1, "target": "web" } }"#,
+        );
+        let error = check_package(&temp.0).unwrap_err();
+        assert_eq!(error.code, "PL0127", "{}", error.message);
+        assert_eq!(error.message, "package.json ply.target is not a field");
+        temp.write(
+            "package.json",
+            r#"{ "ply": { "language": 1, "target": "node" } }"#,
+        );
+        let error = check_package(&temp.0).unwrap_err();
+        assert_eq!(error.code, "PL0127");
+        temp.write(
+            "package.json",
+            r#"{ "ply": { "language": 1, "target": 1 } }"#,
+        );
+        let error = check_package(&temp.0).unwrap_err();
+        assert_eq!(error.code, "PL0127");
+
+        temp.write("package.json", r#"{ "ply": { "language": 1 } }"#);
+        temp.write("src/App.ply", "@\n\n: main ( -- Unit )\n  Unit\n");
+        check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let error = compile(&temp.0).unwrap_err();
+        assert_eq!(error.code, "PL0129", "{}", error.render());
+        assert!(!temp.0.join("dist").exists());
+
+        temp.write(
+            "package.json",
+            r#"{ "ply": { "language": 1, "entry": "App" } }"#,
+        );
+        temp.write("src/App.ply", "@\n\n: idle ( -- Unit )\n  Unit\n");
+        check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let error = compile(&temp.0).unwrap_err();
+        assert_eq!(error.code, "PL0129", "{}", error.render());
+
+        temp.write("src/App.ply", "@\n\n: main ( -- Num )\n  1\n");
+        let error = check_package(&temp.0).unwrap_err();
+        assert_eq!(error.code, "PL0115");
+        let error = compile(&temp.0).unwrap_err();
+        assert_eq!(error.code, "PL0115");
+
+        temp.write(
+            "src/App.ply",
+            "@\n\n: foreign touch ( -- Unit )\n\n: main ( -- Unit )\n  touch\n",
+        );
+        temp.write(
+            "foreign/App.js",
+            "import { readFileSync } from \"node:fs\";\nexport function touch() { readFileSync(\"x\"); }\n",
+        );
+        build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        assert!(!temp.0.join("dist/script.js").exists());
+        let error = compile(&temp.0).unwrap_err();
+        assert_eq!(error.code, "PL0130", "{}", error.render());
+        assert!(error.message.contains("node:fs"), "{}", error.message);
+        assert!(!temp.0.join("dist/script.js").exists());
+
+        temp.write("foreign/App.js", "export default function touch() {}\n");
+        let error = compile(&temp.0).unwrap_err();
+        assert_eq!(error.code, "PL0130", "{}", error.message);
+        assert!(error.message.contains("export default"), "{}", error.message);
+
+        temp.write(
+            "foreign/App.js",
+            "import { x } from \"left-pad\";\nexport function touch() { return x; }\n",
+        );
+        let error = compile(&temp.0).unwrap_err();
+        assert_eq!(error.code, "PL0130", "{}", error.message);
+        assert!(error.message.contains("left-pad"), "{}", error.message);
+        assert!(!temp.0.join("dist/script.js").exists());
     }
 
     fn touch_js(mark: &std::path::Path) -> String {

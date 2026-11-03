@@ -151,8 +151,18 @@ pub enum Error {
     MissingPublicList,
     /// A name in the `@` list is neither declared here nor imported.
     PublicName(String),
+    /// `package.json` contains `ply.target`.
+    PackageJsonTarget,
     /// Not produced. The `@` list may stand anywhere. A second `@` is a duplicate definition.
     PublicNotHere,
+    /// `plylang compile` has no `ply.entry`, or the entry module has no `main`.
+    BrowserEntry,
+    /// The page script cannot inline this import or this JavaScript form.
+    BrowserLoad(String),
+    /// A public scheme, constructor field, synonym, or class method names a type this module did not list.
+    PrivateInScheme(String),
+    /// `name>>` or `>>name` on a type whose constructor was not imported.
+    FieldsPrivate(String),
 }
 
 impl Error {
@@ -396,7 +406,20 @@ impl Error {
             ),
             MissingPublicList => static_text("PL0125", "module has no name list"),
             PublicName(name) => ("PL0126", format!("listed name {name} is not defined")),
+            PackageJsonTarget => {
+                static_text("PL0127", "package.json ply.target is not a field")
+            }
             PublicNotHere => static_text("PL0128", "@ is the module's name list"),
+            BrowserEntry => static_text(
+                "PL0129",
+                "plylang compile needs ply.entry and a main of scheme ( -- Unit )",
+            ),
+            BrowserLoad(spec) => ("PL0130", format!("compile cannot load \"{spec}\"")),
+            PrivateInScheme(name) => (
+                "PL0131",
+                format!("public scheme mentions private {name}"),
+            ),
+            FieldsPrivate(name) => ("PL0132", format!("fields of {name} are private")),
         }
     }
 }
@@ -704,8 +727,33 @@ mod tests {
                 "@ is the module's name list",
                 "PL0128",
             ),
+            (
+                Error::PackageJsonTarget,
+                "package.json ply.target is not a field",
+                "PL0127",
+            ),
+            (
+                Error::BrowserEntry,
+                "plylang compile needs ply.entry and a main of scheme ( -- Unit )",
+                "PL0129",
+            ),
+            (
+                Error::BrowserLoad("node:fs".into()),
+                "compile cannot load \"node:fs\"",
+                "PL0130",
+            ),
+            (
+                Error::PrivateInScheme("Listing".into()),
+                "public scheme mentions private Listing",
+                "PL0131",
+            ),
+            (
+                Error::FieldsPrivate("Box".into()),
+                "fields of Box are private",
+                "PL0132",
+            ),
         ];
-        assert_eq!(samples.len(), 127);
+        assert_eq!(samples.len(), 132);
         for (error, message, code) in samples {
             assert_eq!(error.code(), code, "{message}");
             assert_eq!(error.message(), message);

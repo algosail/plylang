@@ -74,6 +74,8 @@ pub(crate) struct ResolvedImport<'a> {
 pub(crate) struct CheckedModule {
     pub anf: crate::anf::AnfModule,
     pub foreign_arity: Vec<(String, usize)>,
+    /// Derived definitions and the instances of public types.
+    pub derived: Vec<Item>,
 }
 
 /// Stack at one term, rendered after the whole definition has been checked.
@@ -115,7 +117,7 @@ pub(crate) fn check_with_imports_key(
             checker.import_resolved(imported.provider, imported.import, imported.known)?;
         }
         checker.prepare(module)?;
-        checker.check_bodies(module)?;
+        checker.check_ready(module)?;
         let mut foreign_arity = Vec::new();
         for item in &module.items {
             if let Item::Def(def) = item {
@@ -127,7 +129,12 @@ pub(crate) fn check_with_imports_key(
             }
         }
         let anf = checker.lower_prepared(module)?;
-        Ok(CheckedModule { anf, foreign_arity })
+        let derived = checker.derived.clone();
+        Ok(CheckedModule {
+            anf,
+            foreign_arity,
+            derived,
+        })
     })
 }
 
@@ -159,6 +166,12 @@ pub(crate) fn check_and_note(
             return ImportNotes {
                 error: Some(error),
                 sites: Vec::new(),
+            };
+        }
+        if let Err(error) = checker.derive_comparable(module) {
+            return ImportNotes {
+                error: Some(error),
+                sites: checker.render_sites(),
             };
         }
         let error = checker.check_bodies(module).err();
@@ -225,6 +238,7 @@ pub(crate) fn collect_sites_with_imports_key(
         if checker.prepare(module).is_err() {
             return Vec::new();
         }
+        let _ = checker.derive_comparable(module);
         let _ = checker.check_bodies(module);
         checker.render_sites()
     })
@@ -516,6 +530,12 @@ struct Scope {
     nested: bool,
 }
 
+/// A constructor word that is in scope, with the type it builds.
+struct CtorWord {
+    type_name: String,
+    fields: usize,
+}
+
 struct Checker {
     tys: Vec<TyNode>,
     stacks: Vec<StackNode>,
@@ -583,6 +603,12 @@ struct Checker {
     relax_visibility: bool,
     /// Identity of the module being checked. Local `#` lines use it.
     module_key: String,
+    /// Constructor words in scope. Lowering reads the field count from here,
+    /// not from whichever data declaration happens to share the name.
+    ctor_words: HashMap<String, CtorWord>,
+    /// `Comparable` instances derived for this module. The def is lowered.
+    /// A public type's instance is also appended to the module.
+    derived: Vec<Item>,
 }
 
 impl Checker {
@@ -634,6 +660,8 @@ impl Checker {
             guarded: Vec::new(),
             relax_visibility: false,
             module_key: String::new(),
+            ctor_words: HashMap::new(),
+            derived: Vec::new(),
         };
         checker.preload();
         checker
@@ -686,11 +714,19 @@ impl Checker {
         self.guarded.clear();
         self.relax_visibility = false;
         self.module_key.clear();
+        self.ctor_words.clear();
+        self.derived.clear();
         self.preload();
     }
 
     fn check_module(&mut self, module: &Module) -> Result<(), Diagnostic> {
         self.prepare(module)?;
+        self.check_ready(module)
+    }
+
+    /// Derived instances are visible to the bodies that follow them.
+    fn check_ready(&mut self, module: &Module) -> Result<(), Diagnostic> {
+        self.derive_comparable(module)?;
         self.check_bodies(module)
     }
 
@@ -725,7 +761,7 @@ impl Checker {
                 self.declare_instance(instance, module, true, &origin)?;
             }
         }
-        Ok(())
+        self.check_closed_surface(module)
     }
 
     fn check_bodies(&mut self, module: &Module) -> Result<(), Diagnostic> {
@@ -737,6 +773,218 @@ impl Checker {
             }
         }
         Ok(())
+    }
+
+    /// A public name may mention an exported type, a builtin, or an imported type.
+    /// A type declared here and absent from `@` would be printed without a definition.
+    fn check_closed_surface(&mut self, module: &Module) -> Result<(), Diagnostic> {
+        let Some(list) = module.exports.list() else {
+            return Ok(());
+        };
+        for item in &module.items {
+            let (span, hidden) = match item {
+                Item::Def(def) if list.has(&def.name) => {
+                    (def.name_span, hidden_in_scheme(module, &def.scheme))
+                }
+                Item::Data(data) => {
+                    let mut hidden = None;
+                    for ctor in &data.ctors {
+                        if !list.has(&ctor.name) {
+                            continue;
+                        }
+                        for field in &ctor.fields {
+                            if let Some(name) = hidden_type(module, &field.ty) {
+                                hidden = Some(name);
+                                break;
+                            }
+                        }
+                    }
+                    (data.name_span, hidden)
+                }
+                Item::Synonym(synonym) if list.has(&synonym.name) => {
+                    (synonym.name_span, hidden_type(module, &synonym.rhs))
+                }
+                Item::Class(class)
+                    if list.has(&class.name)
+                        || class.methods.iter().any(|method| list.has(&method.name)) =>
+                {
+                    let mut hidden = None;
+                    for method in &class.methods {
+                        if let Some(name) = hidden_in_scheme(module, &method.scheme) {
+                            hidden = Some(name);
+                            break;
+                        }
+                    }
+                    (class.name_span, hidden)
+                }
+                _ => continue,
+            };
+            if let Some(name) = hidden {
+                return Err(self.error(span, Error::PrivateInScheme(name)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Build a `Comparable` instance for a sum or product whose fields are comparable.
+    /// A function field or a `Ref` field has none. A handwritten instance stays.
+    fn derive_comparable(&mut self, module: &Module) -> Result<(), Diagnostic> {
+        if module.language.is_some() {
+            return Ok(());
+        }
+        let added_eq = !self.words.contains_key("eq");
+        if !self.comparable_ready() {
+            return Ok(());
+        }
+        let mut pending: Vec<usize> = module
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                Item::Data(data) if self.derivable(data) => Some(index),
+                _ => None,
+            })
+            .collect();
+        loop {
+            let mut later = Vec::new();
+            let mut progress = false;
+            for index in pending {
+                let Item::Data(data) = &module.items[index] else {
+                    continue;
+                };
+                let data = data.clone();
+                if let Some(items) = self.derive_one(module, &data)? {
+                    progress = true;
+                    self.derived.extend(items);
+                } else {
+                    later.push(index);
+                }
+            }
+            if !progress {
+                break;
+            }
+            pending = later;
+        }
+        self.use_dicts.clear();
+        if added_eq && self.derived.is_empty() {
+            self.words.remove("eq");
+        }
+        Ok(())
+    }
+
+    /// `Comparable` is the class in scope, and `eq` is that class's method.
+    fn comparable_ready(&mut self) -> bool {
+        let Some(class) = self.classes.get("Comparable").cloned() else {
+            return false;
+        };
+        let Some(method) = class.methods.iter().find(|method| method.name == "eq") else {
+            return false;
+        };
+        if let Some(existing) = self.words.get("eq") {
+            return existing
+                .constraints
+                .iter()
+                .any(|constraint| constraint.class_name == "Comparable");
+        }
+        if !self.visible_classes.contains("Comparable") {
+            return false;
+        }
+        self.words.insert("eq".to_string(), method.scheme.clone());
+        true
+    }
+
+    fn derivable(&self, data: &crate::ast::Data) -> bool {
+        if data.foreign || data.ctors.is_empty() || self.has_comparable(&data.name) {
+            return false;
+        }
+        if self.words.contains_key(&format!("eq{}", data.name)) {
+            return false;
+        }
+        data.ctors.iter().all(|ctor| {
+            ctor.fields
+                .iter()
+                .all(|field| !type_blocks_eq(&field.ty))
+        })
+    }
+
+    fn has_comparable(&self, data_name: &str) -> bool {
+        self.instances.iter().any(|inst| {
+            if inst.class_name != "Comparable" || inst.args.len() != 1 {
+                return false;
+            }
+            let ty = self.expose(inst.args[0]);
+            matches!(&self.tys[ty.0 as usize], TyNode::Ctor(name, _) if name == data_name)
+        })
+    }
+
+    /// `Ok(None)` when a field has no `Comparable` instance. The attempt is removed.
+    fn derive_one(
+        &mut self,
+        module: &Module,
+        data: &crate::ast::Data,
+    ) -> Result<Option<Vec<Item>>, Diagnostic> {
+        let source = eq_source(data);
+        let parsed = parse(&source, ParseMode::Source).unwrap_or_else(|error| {
+            panic!("derived eq for {}: {}\n{source}", data.name, error.message)
+        });
+        let mut def = None;
+        let mut instance = None;
+        for item in parsed.items {
+            match item {
+                Item::Def(item) => def = Some(item),
+                Item::Instance(item) => instance = Some(item),
+                _ => {}
+            }
+        }
+        let Some(mut def) = def else {
+            panic!("derived eq for {} has no word\n{source}", data.name);
+        };
+        let Some(mut instance) = instance else {
+            panic!("derived eq for {} has no instance\n{source}", data.name);
+        };
+        let base = 1_000_000_000u32 + (self.derived.len() as u32) * 10_000;
+        shift_def(&mut def, base);
+        shift_instance(&mut instance, base);
+        let mark = self.instances.len();
+        let sites = self.sites.len();
+        let word = def.name.clone();
+        let saved = self.relax_visibility;
+        self.relax_visibility = true;
+        let registered = self.register_def(&def);
+        self.relax_visibility = saved;
+        registered?;
+        let origin = self.module_key.clone();
+        self.relax_visibility = true;
+        let declared = self.declare_instance(&instance, module, true, &origin);
+        self.relax_visibility = saved;
+        if let Err(error) = declared {
+            self.words.remove(&word);
+            self.instances.truncate(mark);
+            self.sites.truncate(sites);
+            if error.code == "PL0087" || error.code == "PL0088" {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        self.relax_visibility = true;
+        let checked = self.check_body(&def);
+        self.relax_visibility = saved;
+        if let Err(error) = checked {
+            self.words.remove(&word);
+            self.instances.truncate(mark);
+            self.sites.truncate(sites);
+            self.use_dicts.clear();
+            if error.code == "PL0088" {
+                return Ok(None);
+            }
+            return Err(Diagnostic::with_code(data.name_span, error.code, error.message));
+        }
+        self.sites.truncate(sites);
+        let mut items = vec![Item::Def(def)];
+        if derived_is_public(module, data) {
+            items.push(Item::Instance(instance));
+        }
+        Ok(Some(items))
     }
 
     fn preload(&mut self) {
@@ -766,6 +1014,7 @@ impl Checker {
             },
         );
         self.installed.insert("Unit".to_string());
+        self.note_ctor("Unit", "Unit", 0);
     }
 
     fn load_aliases(&mut self, names: &[&str], signature: &str) {
@@ -867,6 +1116,7 @@ impl Checker {
             if export {
                 let word_span = if only.is_none() { ctor.span } else { span };
                 self.export_word(&ctor.name, scheme.clone(), word_span)?;
+                self.note_ctor(&data.name, &ctor.name, fields.len());
             }
             ctors.push(CtorInfo {
                 name: ctor.name.clone(),
@@ -954,8 +1204,31 @@ impl Checker {
                 continue;
             };
             self.export_word(&ctor.name, scheme, span)?;
+            self.note_ctor(data_name, &ctor.name, ctor.fields.len());
         }
         Ok(())
+    }
+
+    fn note_ctor(&mut self, type_name: &str, ctor: &str, fields: usize) {
+        self.ctor_words.insert(
+            ctor.to_string(),
+            CtorWord {
+                type_name: type_name.to_string(),
+                fields,
+            },
+        );
+    }
+
+    /// The constructor word in scope builds `type_name`.
+    fn constructor_open(&self, type_name: &str, ctor: &str) -> Result<(), Error> {
+        match self.ctor_words.get(ctor) {
+            Some(word) if word.type_name == type_name => Ok(()),
+            Some(_) => Err(Error::ConstructorNotOf {
+                name: ctor.to_string(),
+                type_name: type_name.to_string(),
+            }),
+            None => Err(Error::UndefinedWord(ctor.to_string())),
+        }
     }
 
     fn export_ctors_named(
@@ -1030,6 +1303,11 @@ impl Checker {
         for known_module in known {
             for item in &known_module.module.items {
                 if let Item::Data(data) = item {
+                    // A type absent from `@` stays in its file. A public constructor
+                    // is staged when that name is imported.
+                    if !type_is_public(&known_module.module, &data.name) {
+                        continue;
+                    }
                     self.add_data(data, Some(&none), &known_module.origin, import.span)?;
                 }
             }
@@ -1230,6 +1508,9 @@ impl Checker {
         for known_module in known {
             for item in &known_module.module.items {
                 if let Item::Synonym(synonym) = item {
+                    if !type_is_public(&known_module.module, &synonym.name) {
+                        continue;
+                    }
                     self.synonyms
                         .entry(synonym.name.clone())
                         .or_insert_with(|| SynBody::from(synonym, true));
@@ -1890,6 +2171,9 @@ impl Checker {
             return Err(self.error(span, Error::ExpectedDataType(self.show_ty(ty))));
         }
         let ctor = &data.ctors[0];
+        if self.constructor_open(&data_name, &ctor.name).is_err() {
+            return Err(self.error(span, Error::FieldsPrivate(data_name)));
+        }
         let Some(index) = ctor.names.iter().position(|field| field.as_deref() == Some(name)) else {
             return Err(self.error(
                 span,
@@ -5548,6 +5832,255 @@ enum Bottom {
     Named(String),
 }
 
+fn hidden_in_scheme(module: &Module, scheme: &Scheme) -> Option<String> {
+    for constraint in &scheme.constraints {
+        for arg in &constraint.args {
+            if let Some(name) = hidden_type(module, arg) {
+                return Some(name);
+            }
+        }
+    }
+    for ty in scheme
+        .effect
+        .input
+        .items
+        .iter()
+        .chain(&scheme.effect.output.items)
+    {
+        if let Some(name) = hidden_type(module, ty) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// `name` is a type or synonym declared in this module and absent from `@`.
+fn hidden_type(module: &Module, ty: &Type) -> Option<String> {
+    match ty {
+        Type::Var(_) => None,
+        Type::Ctor(name) => hidden_local(module, name),
+        Type::App(head, args) => hidden_type(module, head).or_else(|| {
+            args.iter().find_map(|arg| hidden_type(module, arg))
+        }),
+        Type::Fun(effect) => hidden_in_stacks(module, effect),
+        Type::Record(row) => row
+            .fields
+            .iter()
+            .find_map(|(_, ty)| hidden_type(module, ty))
+            .or_else(|| row.tail_ty().and_then(|ty| hidden_type(module, ty))),
+    }
+}
+
+fn hidden_in_stacks(module: &Module, effect: &StackEffect) -> Option<String> {
+    effect
+        .input
+        .items
+        .iter()
+        .chain(&effect.output.items)
+        .find_map(|ty| hidden_type(module, ty))
+}
+
+fn hidden_local(module: &Module, name: &str) -> Option<String> {
+    let local = module.items.iter().any(|item| match item {
+        Item::Data(data) => data.name == name,
+        Item::Synonym(synonym) => synonym.name == name,
+        _ => false,
+    });
+    if local && !type_is_public(module, name) {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+fn type_blocks_eq(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) => false,
+        Type::Ctor(name) => name == "Ref",
+        Type::App(head, args) => type_blocks_eq(head) || args.iter().any(type_blocks_eq),
+        Type::Fun(_) => true,
+        Type::Record(row) => {
+            row.fields.iter().any(|(_, ty)| type_blocks_eq(ty))
+                || row.tail_ty().is_some_and(type_blocks_eq)
+        }
+    }
+}
+
+fn derived_is_public(module: &Module, data: &crate::ast::Data) -> bool {
+    let Some(list) = module.exports.list() else {
+        return false;
+    };
+    list.has(&data.name) || data.ctors.iter().any(|ctor| list.has(&ctor.name))
+}
+
+fn eq_vars(data: &crate::ast::Data) -> Vec<String> {
+    let mut found = Vec::new();
+    for ctor in &data.ctors {
+        for field in &ctor.fields {
+            collect_eq_vars(&field.ty, &mut found);
+        }
+    }
+    data.params
+        .iter()
+        .filter(|param| found.iter().any(|have| have == *param))
+        .cloned()
+        .collect()
+}
+
+fn collect_eq_vars(ty: &Type, found: &mut Vec<String>) {
+    match ty {
+        Type::Var(name) => {
+            if !found.iter().any(|have| have == name) {
+                found.push(name.clone());
+            }
+        }
+        Type::Ctor(_) => {}
+        Type::App(head, args) => {
+            collect_eq_vars(head, found);
+            for arg in args {
+                collect_eq_vars(arg, found);
+            }
+        }
+        Type::Fun(effect) => {
+            for ty in effect.input.items.iter().chain(&effect.output.items) {
+                collect_eq_vars(ty, found);
+            }
+        }
+        Type::Record(row) => {
+            for (_, ty) in &row.fields {
+                collect_eq_vars(ty, found);
+            }
+            if let Some(ty) = row.tail_ty() {
+                collect_eq_vars(ty, found);
+            }
+        }
+    }
+}
+
+fn eq_source(data: &crate::ast::Data) -> String {
+    let word = format!("eq{}", data.name);
+    let head = if data.params.is_empty() {
+        data.name.clone()
+    } else {
+        format!("({} {})", data.name, data.params.join(" "))
+    };
+    let effect = format!("{head} {head} -- Bool");
+    let constrained = eq_vars(data);
+    let scheme = if constrained.is_empty() {
+        format!("( {effect} )")
+    } else {
+        let vars = constrained.join(" ");
+        let classes = constrained
+            .iter()
+            .map(|var| format!("Comparable {var}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("( {vars}. {classes} => {effect} )")
+    };
+    let mut body = String::new();
+    for ctor in &data.ctors {
+        let left = ctor_pattern(&ctor.name, ctor.fields.len(), "l");
+        let right = ctor_pattern(&ctor.name, ctor.fields.len(), "r");
+        body.push_str(&format!("  {left} {right} ->\n"));
+        if ctor.fields.is_empty() {
+            body.push_str("    true\n");
+            continue;
+        }
+        body.push_str("    l0 r0 eq\n");
+        for index in 1..ctor.fields.len() {
+            body.push_str(&format!("    l{index} r{index} [ eq ] cons cons\n"));
+            body.push_str("    [ false ]\n");
+            body.push_str("    if\n");
+        }
+    }
+    if data.ctors.len() > 1 {
+        body.push_str("  _ _ ->\n    false\n");
+    }
+    format!(": {word} {scheme}\n{body}\n# Comparable {head}\n  eq = {word}\n")
+}
+
+fn ctor_pattern(name: &str, fields: usize, side: &str) -> String {
+    if fields == 0 {
+        return format!("({name})");
+    }
+    let names = (0..fields)
+        .map(|index| format!("{side}{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("({name} {names})")
+}
+
+fn shift_span(span: Span, base: u32) -> Span {
+    Span {
+        start: span.start.saturating_add(base),
+        end: span.end.saturating_add(base),
+    }
+}
+
+fn shift_def(def: &mut crate::ast::Def, base: u32) {
+    def.span = shift_span(def.span, base);
+    def.name_span = shift_span(def.name_span, base);
+    for clause in &mut def.clauses {
+        clause.span = shift_span(clause.span, base);
+        for pattern in &mut clause.patterns {
+            shift_pattern(pattern, base);
+        }
+        for term in &mut clause.body {
+            shift_term(term, base);
+        }
+    }
+    for term in &mut def.body {
+        shift_term(term, base);
+    }
+}
+
+fn shift_instance(instance: &mut Instance, base: u32) {
+    instance.span = shift_span(instance.span, base);
+    for binding in &mut instance.methods {
+        binding.name_span = shift_span(binding.name_span, base);
+    }
+}
+
+fn shift_pattern(pattern: &mut crate::ast::Pattern, base: u32) {
+    match pattern {
+        crate::ast::Pattern::Bind(span, _) => *span = shift_span(*span, base),
+        crate::ast::Pattern::Ctor(_, fields) | crate::ast::Pattern::Array(fields) => {
+            for field in fields {
+                shift_pattern(field, base);
+            }
+        }
+        crate::ast::Pattern::Record(fields) => {
+            for (_, field) in fields {
+                shift_pattern(field, base);
+            }
+        }
+        crate::ast::Pattern::Wild | crate::ast::Pattern::Lit(_) | crate::ast::Pattern::Unpack(_) => {
+        }
+    }
+}
+
+fn shift_term(term: &mut Term, base: u32) {
+    term.span = shift_span(term.span, base);
+    match &mut term.node {
+        TermNode::Quote(terms) | TermNode::Array(terms) => {
+            for term in terms {
+                shift_term(term, base);
+            }
+        }
+        TermNode::Record(fields) => {
+            for (_, term) in fields {
+                shift_term(term, base);
+            }
+        }
+        TermNode::Word(_)
+        | TermNode::Lit(_)
+        | TermNode::Field(_)
+        | TermNode::FieldSet(_)
+        | TermNode::FieldInsert(_)
+        | TermNode::Bind(_) => {}
+    }
+}
+
 fn known_at<'a>(known: &'a [KnownModule], origin: &str) -> Option<&'a KnownModule> {
     known.iter().find(|known_module| known_module.origin == origin)
 }
@@ -6330,6 +6863,158 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn an_unlisted_type_does_not_enter_the_importer() {
+        let element = parse(
+            "@ Prop, Mark\n\n; Prop = Mark key : Str, value : Str\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let child = parse(
+            "@ Child\n\n; Mark = Mark host : Int, walk : Int, data : Int\n\n; Child = Child\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let known_element = vec![super::KnownModule::new("Element".to_string(), element.clone())];
+        let known_child = vec![super::KnownModule::new("Child".to_string(), child.clone())];
+        let module = parse(
+            "~ \"Element\" (Prop, Mark)\n~ \"Child\" (Child)\n\n: page ( Str Str -- Prop )\n  Mark\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        super::check_with_imports(
+            &module,
+            &[
+                super::ResolvedImport {
+                    provider: &element,
+                    import: &module.imports[0],
+                    known: &known_element,
+                },
+                super::ResolvedImport {
+                    provider: &child,
+                    import: &module.imports[1],
+                    known: &known_child,
+                },
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_public_scheme_cannot_mention_a_private_type() {
+        err(
+            "@ show\n\n; Secret = Secret\n\n: show ( Secret -- Secret )\n  dup drop\n",
+            "public scheme mentions private Secret",
+        );
+        ok("@\n\n; Secret = Secret\n\n: show ( Secret -- Secret )\n  dup drop\n");
+    }
+
+    #[test]
+    fn fields_stay_with_the_constructor() {
+        ok(
+            "@ Box\n\n; Box a = Mk one : a, two : a\n\n: read ( a. (Box a) -- a )\n  one>>\n",
+        );
+        let provider = parse(
+            "@ Box, Mk\n\n; Box a = Mk one : a, two : a\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let known = vec![super::KnownModule::new("Data/Box".to_string(), provider.clone())];
+        let hidden = parse(
+            "~ \"Data/Box\" (Box)\n\n: read ( a. (Box a) -- a )\n  one>>\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let error = super::check_with_imports(
+            &hidden,
+            &[super::ResolvedImport {
+                provider: &provider,
+                import: &hidden.imports[0],
+                known: &known,
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(error.message, "fields of Box are private");
+        let open = parse(
+            "~ \"Data/Box\" (Box, Mk)\n\n: read ( a. (Box a) -- a )\n  one>>\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        super::check_with_imports(
+            &open,
+            &[super::ResolvedImport {
+                provider: &provider,
+                import: &open.imports[0],
+                known: &known,
+            }],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn comparable_is_derived_for_a_product_of_ints() {
+        ok(
+            "\
+& Comparable a
+  eq ( a a -- Bool )
+
+: eqInt ( Int Int -- Bool )
+  drop drop true
+
+# Comparable Int
+  eq = eqInt
+
+; Person = Person name : Int, age : Int
+
+: same ( Person Person -- Bool )
+  eq
+",
+        );
+        ok(
+            "\
+& Comparable a
+  eq ( a a -- Bool )
+
+: eqInt ( Int Int -- Bool )
+  drop drop true
+
+# Comparable Int
+  eq = eqInt
+
+; Answer = No | Yes Int
+
+: same ( Answer Answer -- Bool )
+  eq
+",
+        );
+        err(
+            "\
+& Comparable a
+  eq ( a a -- Bool )
+
+; Task = Task ( Int -- Int )
+
+: same ( Task Task -- Bool )
+  eq
+",
+            "no instance for Comparable Task",
+        );
+        err(
+            "\
+& Comparable a
+  eq ( a a -- Bool )
+
+; foreign Ref a
+
+; Cell = Cell (Ref Int)
+
+: same ( Cell Cell -- Bool )
+  eq
+",
+            "no instance for Comparable Cell",
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::io::IsTerminal;
 
 use plylang::{
-    build_exports, check_package, javascript_file, mode_from_path, parse, test_package,
+    build_exports, check_package, compile, javascript_file, mode_from_path, parse, test_package,
     write_docs,
 };
 
@@ -15,6 +15,7 @@ const USAGE: &[&str] = &[
     "       plylang check --js <file>",
     "       plylang check --parse <file>",
     "       plylang build [dir] [--exports]",
+    "       plylang compile [dir]",
     "       plylang test [pattern]",
     "       plylang docs [dir] [--out <file>]",
 ];
@@ -35,6 +36,7 @@ fn main() -> ExitCode {
     }
     match command.as_str() {
         "build" => build_command(args),
+        "compile" => compile_command(args),
         "check" => check_command(args),
         "docs" => docs_command(args),
         "test" => test_command(args),
@@ -107,6 +109,23 @@ fn test_command(mut args: impl Iterator<Item = String>) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn compile_command(mut args: impl Iterator<Item = String>) -> ExitCode {
+    let mut dir = None;
+    while let Some(arg) = args.next() {
+        if is_help(&arg) {
+            usage(false);
+            return ExitCode::SUCCESS;
+        }
+        if arg.starts_with('-') || dir.is_some() {
+            usage(true);
+            return ExitCode::from(2);
+        }
+        dir = Some(arg);
+    }
+    let dir = dir.unwrap_or_else(|| ".".to_string());
+    finish_package(compile(Path::new(&dir)))
 }
 
 fn build_command(mut args: impl Iterator<Item = String>) -> ExitCode {

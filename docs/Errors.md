@@ -1045,8 +1045,48 @@ Fix: write one `@` list. A bare `@` publishes nothing.
 
 Fix: declare it, import it, or remove it from the list.
 
+## PL0127
+
+`package.json ply.target is not a field`
+
+`ply.target` is present. The page script is not a package field.
+
+Fix: remove `ply.target`. `plylang compile` writes the page.
+
 ## PL0128
 
 `@ is the module's name list`
 
 This code is not produced. The `@` list may stand anywhere in the file. A second `@` is a duplicate definition.
+
+## PL0129
+
+`plylang compile needs ply.entry and a main of scheme ( -- Unit )`
+
+`plylang compile` writes one page script. `ply.entry` names that module, and the module defines `main` with scheme `( -- Unit )`.
+
+Fix: set `ply.entry` to that module and give it a `main` of scheme `( -- Unit )`. A `main` with another scheme is PL0115.
+
+## PL0130
+
+`compile cannot load "SPEC"`
+
+The page script could not inline `SPEC`. The graph is the JavaScript this compiler wrote and the foreign files those modules import. A `node:` import, a package without `ply`, a file outside that package, an import cycle, or an unsupported `export` stops `plylang compile`.
+
+Fix: import a Ply package this compiler built, or keep that JavaScript in the foreign file of a Ply package. The modules in the output directory stay separate and keep the Node entry guard.
+
+## PL0131
+
+`public scheme mentions private NAME`
+
+A name in the `@` list, or a constructor or class method that is printed with it, mentions `NAME`. `NAME` is a type or a synonym declared in this file and absent from the `@` list. The interface would name it without a definition.
+
+Fix: list `NAME`, or stop mentioning it in what this module publishes. A type imported from another module is already defined there.
+
+## PL0132
+
+`fields of NAME are private`
+
+`name>>` or `>>name` read a field of `NAME`, and the constructor of `NAME` is not in scope. Listing the type name does not list a constructor whose name differs.
+
+Fix: import the constructor, or use a word this module published for that value. In the file that declares `NAME`, the constructor is in scope.
