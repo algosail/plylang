@@ -61,25 +61,20 @@ pub struct ImportedName {
 pub struct Import {
     pub span: Span,
     pub path: String,
-    /// Chosen names. Empty when the import is `..`, an alias, or only instances.
+    /// Chosen names. Empty when the import is an alias or only instances.
     pub names: Vec<ImportedName>,
-    /// `..` opens every published name under its own spelling.
-    pub all: bool,
     /// `: Alias` opens every published name as `Alias:name`.
     pub alias: Option<String>,
 }
 
 impl Import {
     /// The published name behind a spelling in this file.
-    /// `..` answers every spelling. An alias answers only `Alias:name`.
+    /// An alias answers only `Alias:name`.
     pub fn remote_of<'a>(&'a self, local: &'a str) -> Option<&'a str> {
         if let Some(alias) = &self.alias {
             let mut prefix = String::from(alias);
             prefix.push(':');
             return local.strip_prefix(&prefix).filter(|rest| !rest.is_empty());
-        }
-        if self.all {
-            return Some(local);
         }
         self.names
             .iter()
@@ -93,12 +88,6 @@ impl Import {
             return surface
                 .iter()
                 .map(|remote| (remote.clone(), format!("{alias}:{remote}")))
-                .collect();
-        }
-        if self.all {
-            return surface
-                .iter()
-                .map(|name| (name.clone(), name.clone()))
                 .collect();
         }
         self.names
@@ -414,9 +403,6 @@ impl fmt::Display for Import {
         write!(formatter, "~ \"{}\"", self.path)?;
         if let Some(alias) = &self.alias {
             return write!(formatter, " : {alias}");
-        }
-        if self.all {
-            return write!(formatter, " ..");
         }
         if self.names.is_empty() {
             return Ok(());

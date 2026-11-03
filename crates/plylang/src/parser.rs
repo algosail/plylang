@@ -203,20 +203,6 @@ impl Parser {
                 span: start.merge(self.last_span),
                 path,
                 names: Vec::new(),
-                all: false,
-                alias: None,
-            });
-        }
-        if self.eat(&TokenKind::All) {
-            self.skip_newlines();
-            if !self.ends_import() {
-                return Err(self.error(Error::ImportClosed));
-            }
-            return Ok(Import {
-                span: start.merge(self.last_span),
-                path,
-                names: Vec::new(),
-                all: true,
                 alias: None,
             });
         }
@@ -235,7 +221,6 @@ impl Parser {
                 span: start.merge(self.last_span),
                 path,
                 names: Vec::new(),
-                all: false,
                 alias: Some(alias),
             });
         }
@@ -282,7 +267,6 @@ impl Parser {
             span: start.merge(self.last_span),
             path,
             names,
-            all: false,
             alias: None,
         })
     }
@@ -2238,8 +2222,10 @@ mod tests {
 
     #[test]
     fn import_all_prints() {
-        let text = ok("~ \"Data/Either\" ..\n\n: getName ( Str -- Str )\n  dup\n");
-        assert!(text.contains("~ \"Data/Either\" .."), "{text}");
+        assert_eq!(
+            err("~ \"Data/Either\" *\n", ParseMode::Source),
+            "unexpected character"
+        );
         assert_eq!(
             err("~ public \"Data/Scan\" (scan)\n", ParseMode::Source),
             "expected import path"
@@ -2518,8 +2504,6 @@ mod tests {
             selective.contains("~ \"Data/Bus\" Bus, bus, send : busSend, stream"),
             "{selective}"
         );
-        let all = ok("~ \"Data/Bus\" ..\n");
-        assert!(all.contains("~ \"Data/Bus\" .."), "{all}");
         let alias = ok("~ \"Data/Bus\" : Bus\n");
         assert!(alias.contains("~ \"Data/Bus\" : Bus"), "{alias}");
         let bare = ok("~ \"Data/Bus\"\n");
@@ -2551,15 +2535,15 @@ mod tests {
             "module segment 'bus' must start with an uppercase letter"
         );
         assert_eq!(
-            err("~ \"Data/Bus\" ..\nsend\n", ParseMode::Source),
-            "import is already complete"
+            err("~ \"Data/Bus\" *\n", ParseMode::Source),
+            "unexpected character"
         );
         assert_eq!(
             err("~ \"Data/Bus\" : Bus send\n", ParseMode::Source),
             "import is already complete"
         );
         assert_eq!(
-            err("~ \"Data/Bus\" send, ..\n", ParseMode::Source),
+            err("~ \"Data/Bus\" send, |\n", ParseMode::Source),
             "expected imported name"
         );
         assert_eq!(

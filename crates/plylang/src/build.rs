@@ -4731,7 +4731,7 @@ mod tests {
         );
         temp.write(
             "src/UseAll.ply",
-            "@ use\n~ \"Door\" ..\n\n: use ( -- Num )\n  answer\n",
+            "@ use\n~ \"Door\" answer\n\n: use ( -- Num )\n  answer\n",
         );
         build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         let door = fs::read_to_string(temp.0.join("dist/Door.js")).unwrap();
@@ -5141,10 +5141,10 @@ mod tests {
             "src/Data/Stream.ply",
             "@ Stream\n~ \"Classes/Mappable\" Mappable, map\n\n; Stream a = Stream a\n\n: mapStream ( a b. (Stream a) (a -- b) -- (Stream b) )\n  (Stream x) q ->\n    x q call\n    Stream\n\n# Mappable Stream\n  map = mapStream\n",
         );
-        temp.write("src/Stream.ply", "@ Stream\n~ \"Data/Stream\" ..\n");
+        temp.write("src/Stream.ply", "@ Stream\n~ \"Data/Stream\" Stream\n");
         temp.write(
             "src/App.ply",
-            "@ twice\n~ \"Stream\" ..\n~ \"Classes/Mappable\" map\n\n: twice ( (Stream Num) -- (Stream Num) )\n  [ dup drop ] map\n",
+            "@ twice\n~ \"Stream\" Stream\n~ \"Classes/Mappable\" map\n\n: twice ( (Stream Num) -- (Stream Num) )\n  [ dup drop ] map\n",
         );
         build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         let facade = fs::read_to_string(temp.0.join("dist/Stream.js")).unwrap();

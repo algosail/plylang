@@ -163,7 +163,7 @@ pub enum Error {
     PrivateInScheme(String),
     /// `name>>` or `>>name` on a type whose constructor was not imported.
     FieldsPrivate(String),
-    /// A name, `..`, or `: Alias` already closed this import.
+    /// `: Alias` already closed this import.
     ImportClosed,
 }
 

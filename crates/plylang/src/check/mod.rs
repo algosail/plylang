@@ -1350,7 +1350,7 @@ impl Checker {
             .map(|known_module| known_module.origin.as_str())
             .unwrap_or("");
         let surface = surface_names(origin, known);
-        if import.alias.is_none() && !import.all {
+        if import.alias.is_none() {
             for imported in &import.names {
                 if !surface.iter().any(|have| have == &imported.remote) {
                     return Err(self.import_missing(import, &imported.remote));
@@ -7327,7 +7327,7 @@ mod tests {
         )
         .unwrap();
         check_import(
-            "~ \"Data/Person\" ..\n\n: use ( Human -- Human )\n  older\n",
+            "~ \"Data/Person\" : Person\n\n: use ( Person:Human -- Person:Human )\n  Person:older\n",
         )
         .unwrap();
         let missing = check_import(

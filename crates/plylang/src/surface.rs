@@ -126,7 +126,7 @@ fn push(names: &mut Vec<String>, seen: &mut HashSet<String>, name: String) {
 
 type Load<'a> = dyn FnMut(&Path, &str) -> Option<(PathBuf, Module)> + 'a;
 
-/// Names another file receives from `..`.
+/// Names on this module's `@` list.
 pub(crate) fn public_names(module: &Module) -> Vec<String> {
     match &module.exports {
         Exports::List(list) => {

@@ -25,7 +25,7 @@ pub enum TokenKind {
     /// Kept so error numbers stay put. The lexer does not produce this token.
     #[allow(dead_code)]
     FieldInsert(String),
-    /// `..` in an import list.
+    /// Bare `..` inside parentheses.
     All,
     /// `.`
     Dot,

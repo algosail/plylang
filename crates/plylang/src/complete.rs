@@ -67,8 +67,8 @@ pub fn complete(source: &str, path: &Path, line: u32, character: u32) -> Vec<Com
         Context::Keyword => keywords(path.to_string_lossy().ends_with(".d.ply"), replace),
         Context::Modifier { foreign } => modifiers(foreign, replace),
         Context::ImportPath { quoted } => import_paths(path, replace, quoted),
-        Context::ImportName { path: import, seen, has_all } => {
-            import_names(path, &import, &seen, has_all, replace)
+        Context::ImportName { path: import, seen, closed } => {
+            import_names(path, &import, &seen, closed, replace)
         }
         Context::Type { vars } => {
             let module = parsed_module(source, path, offset);
@@ -96,7 +96,7 @@ enum Context {
     Keyword,
     Modifier { foreign: bool },
     ImportPath { quoted: bool },
-    ImportName { path: String, seen: Vec<String>, has_all: bool },
+    ImportName { path: String, seen: Vec<String>, closed: bool },
     Type { vars: Vec<String> },
     Word,
 }
@@ -111,7 +111,7 @@ fn context_of(walked: &Walk, partial: Option<&Token>, at_column_0: bool) -> Cont
         Place::ImportString | Place::ImportList if !walked.rename => Context::ImportName {
             path: walked.path.clone(),
             seen: walked.seen.clone(),
-            has_all: walked.has_all,
+            closed: walked.closed,
         },
         Place::Import => Context::ImportPath { quoted: false },
         Place::Vis | Place::DefName => Context::Modifier { foreign: walked.saw_foreign },
@@ -160,10 +160,10 @@ fn import_names(
     from: &Path,
     import: &str,
     seen: &[String],
-    has_all: bool,
+    closed: bool,
     replace: Span,
 ) -> Vec<Completion> {
-    if has_all {
+    if closed {
         return Vec::new();
     }
     let mut items = Vec::new();
@@ -183,12 +183,6 @@ fn import_names(
                 }
             }
         }
-    }
-    if !seen.iter().any(|name| name == "..") {
-        push(
-            &mut items,
-            entry("..", "..", CompletionKind::Keyword, "every public name", "", "9", replace),
-        );
     }
     items
 }
@@ -409,7 +403,7 @@ fn imported_types(from: &Path, module: &Module) -> Vec<Named> {
 }
 
 fn selected_names(from: &Path, import: &crate::ast::Import) -> Vec<(String, String)> {
-    let surface = if import.all || import.alias.is_some() {
+    let surface = if import.alias.is_some() {
         let Some(file) = provider_file(from, &import.path) else {
             return Vec::new();
         };
@@ -621,7 +615,7 @@ struct Walk {
     state: Place,
     path: String,
     seen: Vec<String>,
-    has_all: bool,
+    closed: bool,
     /// The next identifier is a local spelling, not a name from the provider.
     rename: bool,
     vars: Vec<String>,
@@ -688,7 +682,7 @@ fn walk(tokens: &[&Token]) -> Walk {
         state: Place::Top,
         path: String::new(),
         seen: Vec::new(),
-        has_all: false,
+        closed: false,
         rename: false,
         vars: Vec::new(),
         params: Vec::new(),
@@ -764,18 +758,13 @@ fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
         Place::ImportString => match &token.kind {
             TokenKind::Ident(name) => {
                 walked.seen.clear();
-                walked.has_all = false;
+                walked.closed = false;
                 walked.seen.push(name.clone());
-                walked.state = Place::ImportList;
-            }
-            TokenKind::All => {
-                walked.seen.clear();
-                walked.has_all = true;
                 walked.state = Place::ImportList;
             }
             TokenKind::Colon => {
                 walked.seen.clear();
-                walked.has_all = true;
+                walked.closed = true;
                 walked.rename = true;
                 walked.state = Place::ImportList;
             }
@@ -792,7 +781,6 @@ fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
                 }
             }
             TokenKind::Colon => walked.rename = true,
-            TokenKind::All => walked.has_all = true,
             TokenKind::Comma => walked.rename = false,
             _ => {}
         },
@@ -1007,25 +995,7 @@ fn scan_line(source: &str, offset: usize) -> (bool, bool) {
         if ch == '.' && depth == 0 {
             let decimal = prev_digit && chars.peek().is_some_and(|next| next.is_ascii_digit());
             if !decimal {
-                if chars.peek() == Some(&'.') {
-                    let mut ahead = chars.clone();
-                    ahead.next();
-                    let comment = matches!(
-                        ahead.peek().copied(),
-                        Some(next)
-                            if next.is_ascii_alphabetic()
-                                || next == '_'
-                                || next == ' '
-                                || next == '\t'
-                    );
-                    if comment {
-                        in_comment = true;
-                    } else {
-                        chars.next();
-                    }
-                } else {
-                    in_comment = true;
-                }
+                in_comment = true;
                 prev_digit = false;
                 continue;
             }
@@ -1771,7 +1741,7 @@ mod tests {
         assert!(names.iter().any(|item| item.label == "Just"), "{names:?}");
         assert!(names.iter().any(|item| item.label == "fromMaybe"), "{names:?}");
         assert!(names.iter().any(|item| item.label == "Maybe"), "{names:?}");
-        assert!(names.iter().any(|item| item.label == ".."), "{names:?}");
+        assert!(!names.iter().any(|item| item.label == "*"), "{names:?}");
 
         let source = "~ \"Data/Maybe\" Just\n\n: use ( Int -- Int )\n  J";
         let (line, character) = at(source, "\n  J");

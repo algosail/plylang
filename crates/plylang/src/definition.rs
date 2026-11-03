@@ -508,11 +508,6 @@ mod tests {
         assert_eq!(hub_def.path, found.path);
         assert_eq!(hub_def.span, anchor.span);
 
-        let all = "~ \"Data/Num\" ..\n\n: use ( Int -- Int )\n  add\n";
-        let all_add = definition(&all, &app, 3, 2).unwrap();
-        assert_eq!(slice(provider, all_add.span), "add");
-        let hidden = "~ \"Data/Num\" ..\n\n: use ( Int -- Int )\n  hidden\n";
-        assert!(definition(&hidden, &app, 3, 2).is_none());
         let empty = "~ \"Data/Num\"\n\n: use ( Int -- Int )\n  add\n";
         assert!(definition(&empty, &app, 3, 2).is_none());
     }
@@ -544,7 +539,7 @@ mod tests {
         temp.write("src/Lib.ply", lib);
         temp.write("src/Door.ply", "@ answer, eqNum\n~ \"Lib\" answer, eqNum\n");
         let app = temp.0.join("src/App.ply");
-        let source = "~ \"Door\" ..\n\n: use ( Num Num -- Bool )\n  eqNum\n";
+        let source = "~ \"Door\" eqNum\n\n: use ( Num Num -- Bool )\n  eqNum\n";
         let found = definition(&source, &app, 3, 2).unwrap();
         assert_eq!(found.path, temp.0.join("src/Lib.ply"));
         assert_eq!(slice(lib, found.span), "eqNum");

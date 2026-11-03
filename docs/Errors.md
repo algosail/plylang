@@ -27,7 +27,7 @@ Fix: treat the message as a compiler bug. Report the full text.
 
 `unexpected character`
 
-The character is not part of Ply. `{`, `}`, and `+` are this error. A space or a mark such as `*` or `@` is this error.
+The character is not part of Ply. `{`, `}`, and `+` are this error. A mark that is not a rune, such as `*` or `%`, is this error.
 
 Fix: delete the character or rewrite the token. A field of a type with one constructor is `name>>` or `>>name`. The stack word for Factor's `-rot` is `unrot`.
 
@@ -1095,6 +1095,6 @@ Fix: import the constructor, or use a word this module published for that value.
 
 `import is already complete`
 
-`..` and `: Alias` each finish the import. A name after either, or a second form on the same import, has nowhere to go.
+`: Alias` finishes the import. A name after it, or a second form on the same import, has nowhere to go.
 
-Fix: put the names on their own `~` line, or list them instead of `..` and `: Alias`.
+Fix: put the names on their own `~` line, or list them instead of `: Alias`.

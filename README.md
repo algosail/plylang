@@ -299,11 +299,11 @@ A module names what it publishes with one `@` list. The list may stand anywhere 
 @ Maybe, Nothing, Just, fromMaybe
 ```
 
-Imports stay together and come before the first `:`, `;`, `-`, `&`, or `#`. A path inside this package is written from the source directory. A path into another package is a package specifier. The names after the path are what this file uses. `..` means every published name. `: Alias` brings every published name as `Alias:name`, and a call is `Alias:send`. `send : busSend` brings `send` as `busSend`. A bare path brings instances and no names. Writing the local name again in the `@` list publishes it. A colon in column 0 still starts a word.
+Imports stay together and come before the first `:`, `;`, `-`, `&`, or `#`. A path inside this package is written from the source directory. A path into another package is a package specifier. The names after the path are what this file uses. `: Alias` brings every published name as `Alias:name`, and a call is `Alias:send`. `send : busSend` brings `send` as `busSend`. A bare path brings instances and no names. Writing the local name again in the `@` list publishes it. A colon in column 0 still starts a word.
 
 A test entry, a word `( -- Verdict )` or `suite`, is not a module and has no list. A utility under `test/` is a module and has one. A word `main` with scheme `( -- Unit )` may stay off the list. Node still runs it when it starts that file.
 
-A comment runs from `.` to the end of the line, when the dot is not inside `()`. A bare `..` on an import is every published name. `..` followed by a space or a name is still a comment. `..` in column 0, directly above `:`, `;`, `-`, or `&`, is the text of that declaration. One space after `..` is not part of the text. A type has one text for all of its constructors. A class has one text for its name and for all of its methods. A `..` line above `#` does not attach to the declaration.
+A comment runs from `.` to the end of the line, when the dot is not inside `()`. `..` in column 0, directly above `:`, `;`, `-`, or `&`, is the text of that declaration. One space after `..` is not part of the text. A type has one text for all of its constructors. A class has one text for its name and for all of its methods. A `..` line above `#` does not attach to the declaration.
 
 A declaration stands in column 0 and starts with `@`, `:`, `;`, `-`, `&`, `#`, or `~`.
 
