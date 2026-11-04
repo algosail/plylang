@@ -165,6 +165,10 @@ pub enum Error {
     FieldsPrivate(String),
     /// `: Alias` already closed this import.
     ImportClosed,
+    /// The initial program of a place reads or writes that place, or a place declared later.
+    PlaceNotReady(String),
+    /// `=name` or `=>name` and `name` is not a place in scope.
+    UndefinedPlace(String),
 }
 
 impl Error {
@@ -423,6 +427,8 @@ impl Error {
             ),
             FieldsPrivate(name) => ("PL0132", format!("fields of {name} are private")),
             ImportClosed => static_text("PL0133", "import is already complete"),
+            PlaceNotReady(name) => ("PL0134", format!("place {name} is not ready")),
+            UndefinedPlace(name) => ("PL0135", format!("no place {name}")),
         }
     }
 }
@@ -760,8 +766,18 @@ mod tests {
                 "import is already complete",
                 "PL0133",
             ),
+            (
+                Error::PlaceNotReady("base".into()),
+                "place base is not ready",
+                "PL0134",
+            ),
+            (
+                Error::UndefinedPlace("base".into()),
+                "no place base",
+                "PL0135",
+            ),
         ];
-        assert_eq!(samples.len(), 133);
+        assert_eq!(samples.len(), 135);
         for (error, message, code) in samples {
             assert_eq!(error.code(), code, "{message}");
             assert_eq!(error.message(), message);

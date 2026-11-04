@@ -13,8 +13,8 @@
 use std::collections::HashMap;
 
 use crate::anf::{
-    Access, AnfCtor, AnfData, AnfDef, AnfModule, Choice, Cond, DictField, DictValue, Expr, Let,
-    LocalId, PatTest, QuoteForm, Value,
+    js_ident, Access, AnfCtor, AnfData, AnfDef, AnfModule, AnfPlace, Choice, Cond, DictField,
+    DictValue, Expr, Let, LocalId, PatTest, QuoteForm, Value,
 };
 use crate::builtin::{self, Lowering};
 use crate::ast::{Item, Lit, Module, Pattern, Term, TermNode};
@@ -153,6 +153,23 @@ impl Checker {
         for def in &bodies {
             defs.push(self.lower_def(module, def)?);
         }
+        let mut places = Vec::new();
+        for item in &module.items {
+            let Item::Place(place) = item else {
+                continue;
+            };
+            if place.body.is_empty() {
+                continue;
+            }
+            let mut init = self.lower_def(module, &super::place_def(place))?;
+            init.name = format!("ply$init${}", js_ident(&place.name));
+            init.export = false;
+            places.push(AnfPlace {
+                name: place.name.clone(),
+                export: place_is_exported(module, &place.name),
+                init,
+            });
+        }
         let datas = module
             .items
             .iter()
@@ -175,6 +192,7 @@ impl Checker {
         let mut anf = AnfModule {
             datas,
             defs,
+            places,
             needs_unit: false,
         };
         anf.needs_unit = module_uses_unit(&anf);
@@ -340,6 +358,8 @@ impl Checker {
             }
             TermNode::FieldSet(name) => self.lower_set_field(term.span, name, stack, frame)?,
             TermNode::FieldInsert(name) => self.lower_insert_field(term.span, name, stack, frame)?,
+            TermNode::PlaceSet(name) => self.lower_place_set(term.span, name, stack, frame)?,
+            TermNode::PlaceBind(name) => self.lower_place_bind(term.span, name, stack, frame)?,
             TermNode::Array(elements) => self.lower_array(elements, stack, frame)?,
             TermNode::Record(fields) => self.lower_record(fields, stack, frame)?,
             TermNode::Bind(names) => self.lower_bind(term.span, names, stack, frame)?,
@@ -369,6 +389,85 @@ impl Checker {
         });
         frame.stack.push(Operand::Local(id));
         self.stack_cons(stack, ty)
+    }
+
+    fn lower_place_set(
+        &mut self,
+        span: Span,
+        name: &str,
+        stack: StackId,
+        frame: &mut Frame,
+    ) -> Result<StackId, Diagnostic> {
+        let output = self.check_place_set(span, name, stack)?;
+        let value = frame.pop_one(self);
+        let value = frame.force(self, value)?;
+        frame.lets.push(Let {
+            binds: Vec::new(),
+            value: Value::Call {
+                word: format!("ply_set_{name}"),
+                args: vec![value],
+            },
+        });
+        Ok(output)
+    }
+
+    /// The quotation runs under a new frame. Its body stays inside the thunk,
+    /// so the helper restores the previous frame when that body throws.
+    fn lower_place_bind(
+        &mut self,
+        span: Span,
+        name: &str,
+        stack: StackId,
+        frame: &mut Frame,
+    ) -> Result<StackId, Diagnostic> {
+        let output = self.check_place_bind(span, name, stack)?;
+        let quote = frame.pop_one(self);
+        let value = frame.pop_one(self);
+        let value = frame.force(self, value)?;
+        let quote = self.realize_operand(quote)?;
+        let (arity, produced) = self.quote_arity(&quote);
+        let base = take_base(self, frame, arity)?;
+        let expr = self.reduce_quote(quote, base);
+        if expr.result.len() < produced {
+            panic!(
+                "=> {name} produced {produced}, the quotation left {}",
+                expr.result.len()
+            );
+        }
+        let split = expr.result.len() - produced;
+        let below = expr.result[..split].to_vec();
+        let inner = expr.result[split..].to_vec();
+        let thunk = self.fresh_local();
+        frame.lets.push(Let {
+            binds: vec![thunk],
+            value: Value::Quote(QuoteForm {
+                params: Vec::new(),
+                body: Expr {
+                    lets: expr.lets,
+                    result: inner.clone(),
+                },
+            }),
+        });
+        let outer = self.fresh_vec(inner.len());
+        for (from, to) in inner.iter().zip(&outer) {
+            if let Some(arity) = self.fn_arity.get(from).copied() {
+                self.fn_arity.insert(*to, arity);
+            }
+        }
+        frame.lets.push(Let {
+            binds: outer.clone(),
+            value: Value::Call {
+                word: format!("ply_bind_{name}"),
+                args: vec![value, thunk],
+            },
+        });
+        frame.stack = below
+            .into_iter()
+            .chain(outer)
+            .map(Operand::Local)
+            .collect();
+        self.note_produced(output, produced, frame);
+        Ok(output)
     }
 
     fn lower_set_field(
@@ -1921,8 +2020,16 @@ fn take_base(
     drain_results(checker, frame)
 }
 
+fn place_is_exported(module: &crate::ast::Module, name: &str) -> bool {
+    match &module.exports {
+        crate::ast::Exports::List(list) => list.has(name),
+        crate::ast::Exports::Closed => true,
+    }
+}
+
 fn module_uses_unit(module: &AnfModule) -> bool {
     module.defs.iter().any(|def| expr_uses_unit(&def.body))
+        || module.places.iter().any(|place| expr_uses_unit(&place.init.body))
 }
 
 fn expr_uses_unit(expr: &Expr) -> bool {
@@ -3170,6 +3277,74 @@ const twice = useVia(Mk(2n));
 if (twice.tag !== "Mk" || twice.value.tag !== "Mk" || twice.value.value !== 2n) {
   throw new Error("via " + JSON.stringify(twice));
 }
+"#,
+        );
+    }
+
+    #[test]
+    fn javascript_runs_a_place() {
+        run(
+            r#"
+: foreign nadd ( Num Num -- Num )
+: foreign nmul ( Num Num -- Num )
+: foreign boom ( -- Num )
+
+= base Num
+  10
+
+: seed ( -- Num )
+  base
+
+= scale Num
+  seed
+
+: bumped ( -- Num )
+  base 1 nadd dup =base
+
+: held ( Num -- Num )
+  [ base ] =>base
+
+: poke ( Num -- Num )
+  [ 4 =base ] =>base
+  base
+
+: nest ( -- Num )
+  20 [ 3 [ base scale nmul ] =>scale ] =>base
+
+: addTo ( Num Num -- Num )
+  [ base nadd ] =>base
+
+: explode ( Num ( -- Num ) -- Num )
+  =>base
+
+: outer ( -- Num )
+  base
+
+: scaled ( -- Num )
+  scale
+"#,
+            r#"
+function nadd(a, b) { return a + b; }
+function nmul(a, b) { return a * b; }
+function boom() { throw new Error("boom"); }
+if (base() !== 10) throw new Error("init " + base());
+if (scale() !== 10) throw new Error("scale init " + scale());
+if (held(4) !== 4) throw new Error("held " + held(4));
+if (base() !== 10) throw new Error("held leaked " + base());
+if (poke(20) !== 10) throw new Error("poke");
+if (base() !== 10) throw new Error("poke leaked " + base());
+if (nest() !== 60) throw new Error("nest " + nest());
+if (base() !== 10 || scale() !== 10) throw new Error("nest leaked");
+if (addTo(3, 20) !== 23) throw new Error("add " + addTo(3, 20));
+if (base() !== 10) throw new Error("add leaked " + base());
+let threw = false;
+try { explode(5, boom); } catch (e) { threw = e.message === "boom"; }
+if (!threw) throw new Error("no throw");
+if (base() !== 10) throw new Error("throw leaked " + base());
+if (bumped() !== 11) throw new Error("bumped " + bumped());
+if (base() !== 11) throw new Error("stored " + base());
+if (outer() !== 11) throw new Error("outer " + outer());
+if (scaled() !== 10) throw new Error("scale stayed " + scaled());
 "#,
         );
     }

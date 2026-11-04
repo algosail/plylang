@@ -94,7 +94,7 @@ impl Parser {
 
     /// Imports, one `@` list, and declarations, in any order. The list may
     /// stand anywhere. A second `@` is a duplicate definition. Imports stay
-    /// before the first `:`, `;`, `-`, `&`, or `#`. A bare `@` publishes
+    /// before the first `:`, `;`, `-`, `&`, `#`, or `=`. A bare `@` publishes
     /// nothing. Commas separate names. A newline does not, so the list ends
     /// at the next column-0 declaration.
     fn parse_contents(&mut self) -> Result<(Exports, Vec<Import>, Vec<Item>), Diagnostic> {
@@ -136,6 +136,7 @@ impl Parser {
                 Item::Data(data) => data.doc = doc,
                 Item::Synonym(synonym) => synonym.doc = doc,
                 Item::Def(def) => def.doc = doc,
+                Item::Place(place) => place.doc = doc,
                 Item::Class(class) => class.doc = doc,
                 Item::Instance(_) => {}
             }
@@ -187,6 +188,7 @@ impl Parser {
             || self.is(TokenKind::Colon)
             || self.is(TokenKind::Export)
             || self.is(TokenKind::Language)
+            || (self.is(TokenKind::Eq) && self.at_column_0())
     }
 
     fn parse_import(&mut self) -> Result<Import, Diagnostic> {
@@ -285,6 +287,7 @@ impl Parser {
             || self.is(TokenKind::Export)
             || self.is(TokenKind::Language)
             || (self.is(TokenKind::Colon) && self.at_column_0())
+            || (self.is(TokenKind::Eq) && self.at_column_0())
     }
 
     fn at_column_0(&self) -> bool {
@@ -367,6 +370,9 @@ impl Parser {
         }
         if self.is(TokenKind::Colon) {
             return self.parse_def().map(Item::Def);
+        }
+        if self.is(TokenKind::Eq) {
+            return self.parse_place().map(Item::Place);
         }
         Err(self.error(Error::ExpectedDeclaration))
     }
@@ -627,6 +633,45 @@ impl Parser {
         })
     }
 
+    /// `= name Type` at column 0, then a program `( -- Type )`.
+    /// A glued `=name` is a term, not this declaration.
+    fn parse_place(&mut self) -> Result<crate::ast::Place, Diagnostic> {
+        let start = self.cur().span;
+        self.expect(&TokenKind::Eq, Error::ExpectedEq)?;
+        let name_span = self.cur().span;
+        let name = self.expect_ident(Error::ExpectedDefinitionName)?;
+        if self.is_eof() || self.cur().line_start || self.is(TokenKind::Newline) {
+            return Err(self.error(Error::ExpectedType));
+        }
+        let ty = self.parse_type_item()?;
+        let same_line = self.parse_same_line_terms()?;
+        let body = if self.mode == ParseMode::Interface {
+            if !same_line.is_empty() {
+                return Err(self.error(Error::InterfaceHasBody));
+            }
+            self.reject_following_body(Error::InterfaceHasBody)?;
+            Vec::new()
+        } else if !same_line.is_empty() {
+            let mut body = same_line;
+            body.extend(self.parse_body()?);
+            body
+        } else {
+            let body = self.parse_body()?;
+            if body.is_empty() {
+                return Err(self.error_at(name_span, Error::MissingBody));
+            }
+            body
+        };
+        Ok(crate::ast::Place {
+            span: start.merge(self.last_span),
+            name_span,
+            name,
+            ty,
+            body,
+            doc: String::new(),
+        })
+    }
+
     /// Terms after the scheme on the declaration line. `->` here is not an equation.
     fn parse_same_line_terms(&mut self) -> Result<Vec<Term>, Diagnostic> {
         let mut terms = Vec::new();
@@ -700,6 +745,7 @@ impl Parser {
                 | TokenKind::Instance
                 | TokenKind::Colon
                 | TokenKind::Export
+                | TokenKind::Eq
         ) {
             return true;
         }
@@ -1459,6 +1505,14 @@ impl Parser {
                 self.bump();
                 Ok(self.term(start, TermNode::FieldInsert(name)))
             }
+            TokenKind::PlaceSet(name) => {
+                self.bump();
+                Ok(self.term(start, TermNode::PlaceSet(name)))
+            }
+            TokenKind::PlaceBind(name) => {
+                self.bump();
+                Ok(self.term(start, TermNode::PlaceBind(name)))
+            }
             TokenKind::LBrace => {
                 self.bump();
                 self.group_depth += 1;
@@ -1836,6 +1890,8 @@ impl Parser {
                 | TokenKind::Field(_)
                 | TokenKind::FieldSet(_)
                 | TokenKind::FieldInsert(_)
+                | TokenKind::PlaceSet(_)
+                | TokenKind::PlaceBind(_)
                 | TokenKind::LBrack
                 | TokenKind::LAngle
                 | TokenKind::LBrace
@@ -1877,6 +1933,7 @@ fn check_duplicates(module: &Module) -> Result<(), Diagnostic> {
             }
             Item::Synonym(synonym) => claim(&mut types, &synonym.name, synonym.name_span)?,
             Item::Def(def) => claim(&mut words, &def.name, def.name_span)?,
+            Item::Place(place) => claim(&mut words, &place.name, place.name_span)?,
             Item::Class(class) => claim(&mut classes, &class.name, class.name_span)?,
             Item::Instance(_) => {}
         }
@@ -2553,6 +2610,42 @@ mod tests {
         assert_eq!(
             err("~ \"Data/Bus\" send : a, send : a\n", ParseMode::Source),
             "duplicate definition a"
+        );
+    }
+
+    #[test]
+    fn parses_a_place() {
+        let text = ok(".. The base.\n= base Num\n  10\n");
+        assert!(text.contains(".. The base."), "{text}");
+        assert!(text.contains("= base Num"), "{text}");
+        assert!(text.contains("10"), "{text}");
+        let same = ok("= nums (Array Num) < 1 2 >\n");
+        assert!(same.contains("= nums (Array Num)"), "{same}");
+        assert!(same.contains("< 1 2 >"), "{same}");
+        let word = ok(": use ( Num -- Num )\n  =base [ base ] =>base\n");
+        assert!(word.contains("=base"), "{word}");
+        assert!(word.contains("=>base"), "{word}");
+        let qualified = ok(": use ( Num -- )\n  =Alias:base =>Alias:base\n");
+        assert!(qualified.contains("=Alias:base"), "{qualified}");
+        assert!(qualified.contains("=>Alias:base"), "{qualified}");
+        let class = ok("& Eq a => Ord a\n  compare ( a a -- Bool )\n");
+        assert!(class.contains("Eq a => Ord a"), "{class}");
+        let binding = ok("# Eq Int\n  eq = eqInt\n");
+        assert!(binding.contains("eq = eqInt"), "{binding}");
+        assert_eq!(err("= base Num\n", ParseMode::Source), "missing body");
+        assert_eq!(err("=base\n", ParseMode::Source), "expected declaration");
+        let interface = parse("language 1\n@ base\n\n= base Num\n", ParseMode::Interface)
+            .unwrap_or_else(|error| panic!("{}", error.message));
+        let printed = interface.to_string();
+        assert!(printed.contains("= base Num"), "{printed}");
+        assert!(!printed.contains("10"), "{printed}");
+        assert_eq!(
+            err("language 1\n= base Num\n  10\n", ParseMode::Interface),
+            "interface declaration has a body"
+        );
+        assert_eq!(
+            err("language 1\n= base Num 10\n", ParseMode::Interface),
+            "interface declaration has a body"
         );
     }
 }

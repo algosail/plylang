@@ -13,7 +13,18 @@ pub type LocalId = u32;
 pub struct AnfModule {
     pub datas: Vec<AnfData>,
     pub defs: Vec<AnfDef>,
+    /// Source order. An empty list leaves the JavaScript unchanged.
+    pub places: Vec<AnfPlace>,
     pub needs_unit: bool,
+}
+
+/// One place. `init` fills the first frame and is not exported.
+/// The reader, the writer, and the binder are emitted beside the slot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnfPlace {
+    pub name: String,
+    pub export: bool,
+    pub init: AnfDef,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -202,8 +213,77 @@ impl AnfModule {
             out.push_str(&def_export(def));
             out.push('\n');
         }
+        for place in &self.places {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&place_runtime(place));
+        }
         out
     }
+}
+
+/// The slot is a stack of frames. The binder restores the previous frame
+/// when the quotation throws. Init runs at load, after the functions exist.
+fn place_runtime(place: &AnfPlace) -> String {
+    let js_name = js_ident(&place.name);
+    let slot = format!("ply$place${js_name}");
+    let set = js_ident(&format!("ply_set_{}", place.name));
+    let bind = js_ident(&format!("ply_bind_{}", place.name));
+    let init = js_ident(&place.init.name);
+    let mut out = String::new();
+    out.push_str(&format!("const {slot} = [];\n"));
+    out.push_str(&function_text(
+        place.export,
+        &js_name,
+        &place.name,
+        "",
+        &format!("  return {slot}[{slot}.length - 1];\n"),
+    ));
+    out.push('\n');
+    out.push_str(&function_text(
+        place.export,
+        &set,
+        &set,
+        "value",
+        &format!("  {slot}[{slot}.length - 1] = value;\n"),
+    ));
+    out.push('\n');
+    out.push_str(&function_text(
+        place.export,
+        &bind,
+        &bind,
+        "value, quot",
+        &format!(
+            "  {slot}.push(value);\n  try {{\n    return quot();\n  }} finally {{\n    {slot}.pop();\n  }}\n"
+        ),
+    ));
+    out.push('\n');
+    let mut init_def = place.init.clone();
+    init_def.export = false;
+    out.push_str(&def_export(&init_def));
+    out.push('\n');
+    out.push_str(&format!("{slot}.push({init}());\n"));
+    out
+}
+
+fn function_text(
+    export: bool,
+    js_name: &str,
+    export_name: &str,
+    params: &str,
+    body: &str,
+) -> String {
+    let keyword = if export && js_name == export_name {
+        "export function"
+    } else {
+        "function"
+    };
+    let mut out = format!("{keyword} {js_name}({params}) {{\n{body}}}");
+    if export && js_name != export_name {
+        out.push_str(&format!("\nexport {{ {js_name} as {export_name} }};"));
+    }
+    out
 }
 
 fn ctor_export(ctor: &AnfCtor) -> String {
@@ -532,6 +612,9 @@ pub(crate) fn referenced_words(module: &AnfModule) -> Vec<String> {
     let mut names = Vec::new();
     for def in &module.defs {
         collect_words(&def.body, &mut names);
+    }
+    for place in &module.places {
+        collect_words(&place.init.body, &mut names);
     }
     names
 }

@@ -24,8 +24,8 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ast::{
-    Class, EffectRow, Exports, Import, Instance, Item, Lit, Module, RecordTail, Scheme, Stack,
-    StackEffect, StackTail, Synonym, Term, TermNode, Type,
+    Class, Def, EffectRow, Exports, Import, Instance, Item, Lit, Module, Place, RecordTail,
+    Scheme, Stack, StackEffect, StackTail, Synonym, Term, TermNode, Type, Vis,
 };
 
 use crate::builtin;
@@ -611,6 +611,8 @@ struct Checker {
     /// `Comparable` instances derived for this module. The def is lowered.
     /// A public type's instance is also appended to the module.
     derived: Vec<Item>,
+    /// Place names in this check. The reader scheme lives in `words`.
+    places: HashSet<String>,
 }
 
 impl Checker {
@@ -665,6 +667,7 @@ impl Checker {
             ctor_words: HashMap::new(),
             renamed: HashMap::new(),
             derived: Vec::new(),
+            places: HashSet::new(),
         };
         checker.preload();
         checker
@@ -720,6 +723,7 @@ impl Checker {
         self.ctor_words.clear();
         self.renamed.clear();
         self.derived.clear();
+        self.places.clear();
         self.preload();
     }
 
@@ -744,7 +748,7 @@ impl Checker {
                     }
                 }
                 Item::Synonym(synonym) => self.register_synonym(synonym)?,
-                Item::Def(_) | Item::Class(_) | Item::Instance(_) => {}
+                Item::Def(_) | Item::Class(_) | Item::Instance(_) | Item::Place(_) => {}
             }
         }
         self.check_synonym_bodies(module)?;
@@ -756,6 +760,7 @@ impl Checker {
                 }
                 Item::Class(class) => self.register_class(class)?,
                 Item::Def(def) => self.register_def(def)?,
+                Item::Place(place) => self.register_place(place)?,
                 Item::Synonym(_) | Item::Instance(_) => {}
             }
         }
@@ -769,6 +774,23 @@ impl Checker {
     }
 
     fn check_bodies(&mut self, module: &Module) -> Result<(), Diagnostic> {
+        let mut unready: HashSet<String> = module
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Place(place) => Some(place.name.clone()),
+                _ => None,
+            })
+            .collect();
+        for item in &module.items {
+            if let Item::Place(place) = item {
+                self.reject_unready_place(place, &unready)?;
+                unready.remove(&place.name);
+                if !place.body.is_empty() {
+                    self.check_body(&place_def(place))?;
+                }
+            }
+        }
         for item in &module.items {
             if let Item::Def(def) = item {
                 if !def.body.is_empty() || !def.clauses.is_empty() {
@@ -807,6 +829,9 @@ impl Checker {
                 }
                 Item::Synonym(synonym) if list.has(&synonym.name) => {
                     (synonym.name_span, hidden_type(module, &synonym.rhs))
+                }
+                Item::Place(place) if list.has(&place.name) => {
+                    (place.name_span, hidden_type(module, &place.ty))
                 }
                 Item::Class(class)
                     if list.has(&class.name)
@@ -1306,7 +1331,7 @@ impl Checker {
                             .entry(synonym.name.clone())
                             .or_insert(synonym.params.len());
                     }
-                    Item::Def(_) | Item::Class(_) | Item::Instance(_) => {}
+                    Item::Def(_) | Item::Class(_) | Item::Instance(_) | Item::Place(_) => {}
                 }
             }
         }
@@ -1495,6 +1520,18 @@ impl Checker {
             registered?;
             found = true;
         }
+        if let Some(place) = find_place(provider, remote) {
+            let mut place = place.clone();
+            place.name = local.to_string();
+            place.name_span = import.span;
+            place.body.clear();
+            let saved = self.relax_visibility;
+            self.relax_visibility = true;
+            let registered = self.register_place(&place);
+            self.relax_visibility = saved;
+            registered?;
+            found = true;
+        }
         if find_class_item(provider, remote).is_some() {
             self.visible_classes.insert(local.to_string());
             found = true;
@@ -1630,6 +1667,133 @@ impl Checker {
         Ok(())
     }
 
+    /// The reader is `( -- Type )`: one shared implicit tail, the same shape as
+    /// a parsed `( -- a )`. `=name` and `=>name` are terms, not words.
+    /// The stored type is elaborated as written, so a free variable is PL0058.
+    fn register_place(&mut self, place: &Place) -> Result<(), Diagnostic> {
+        if self.builtin_words.contains(&place.name) {
+            return Err(self.error(
+                place.name_span,
+                Error::CannotRedefineBuiltin(place.name.clone()),
+            ));
+        }
+        if self.words.contains_key(&place.name) {
+            return Err(self.error(
+                place.name_span,
+                Error::DuplicateDefinition(place.name.clone()),
+            ));
+        }
+        let mut scope = Scope::new();
+        let ty = self.elab_type(&place.ty, &mut scope, place.name_span)?;
+        // A fresh Empty would be `. -- . a` and would not unify with a word's
+        // implicit tail. One quantified tail is `( ..s -- ..s a )`.
+        let tail = self.fresh_tail(&mut scope, "", true);
+        let effect = self.implicit_effect(&mut scope);
+        let output = self.stack_cons(tail, ty);
+        self.words.insert(
+            place.name.clone(),
+            SemScheme {
+                tys: scope.quantified_tys,
+                tails: scope.quantified_tails,
+                rows: scope.quantified_rows,
+                constraints: Vec::new(),
+                input: tail,
+                output,
+                effect_vars: scope.quantified_effects,
+                effect,
+            },
+        );
+        self.places.insert(place.name.clone());
+        Ok(())
+    }
+
+    /// A fresh copy of the stored type, the same way a read instantiates it.
+    fn instantiate_place(
+        &mut self,
+        span: Span,
+        name: &str,
+    ) -> Result<(TyId, EffectId), Diagnostic> {
+        if !self.places.contains(name) {
+            return Err(self.error(span, Error::UndefinedPlace(name.to_string())));
+        }
+        let scheme = self
+            .words
+            .get(name)
+            .cloned()
+            .expect("a place has a reader");
+        let (_, output, effect, _) = self.instantiate_scheme(&scheme, false);
+        self.join_effect(effect, span)?;
+        let Some((_, ty)) = self.top_slot(output) else {
+            panic!("place {name} has no output");
+        };
+        Ok((ty, effect))
+    }
+
+    fn check_place_set(
+        &mut self,
+        span: Span,
+        name: &str,
+        stack: StackId,
+    ) -> Result<StackId, Diagnostic> {
+        let (ty, effect) = self.instantiate_place(span, name)?;
+        let (rest, got) = self.pop_slot(stack, span)?;
+        self.unify_ty(got, ty)
+            .map_err(|message| self.error(span, message))?;
+        self.pending_here = Some((stack, rest, effect));
+        Ok(rest)
+    }
+
+    /// Value under the quotation. The quotation runs on the stack under that
+    /// value, and its outputs are the result. The value is not restored.
+    fn check_place_bind(
+        &mut self,
+        span: Span,
+        name: &str,
+        stack: StackId,
+    ) -> Result<StackId, Diagnostic> {
+        let (place_ty, place_effect) = self.instantiate_place(span, name)?;
+        let (below, func) = self.pop_slot(stack, span)?;
+        let (rest, value) = self.pop_slot(below, span)?;
+        self.unify_ty(value, place_ty)
+            .map_err(|message| self.error(span, message))?;
+        let func = self.expose(func);
+        if !matches!(self.tys[func.0 as usize], TyNode::Fun(_, _, _)) {
+            let output = self.stack_var();
+            let effect = self.effect_var();
+            let expected = self.ty_fun(rest, output, effect);
+            self.unify_ty(func, expected)
+                .map_err(|message| self.error(span, message))?;
+        }
+        let func = self.expose(func);
+        let TyNode::Fun(input, output, effect) = self.tys[func.0 as usize].clone() else {
+            return Err(self.error(
+                span,
+                Error::TypeMismatch {
+                    expected: "a quotation".to_string(),
+                    found: self.show_ty(func),
+                },
+            ));
+        };
+        self.unify_stack(input, rest)
+            .map_err(|message| self.error(span, message))?;
+        self.run_quote(func, Some(rest))?;
+        self.join_effect(effect, span)?;
+        let _ = place_effect;
+        self.pending_here = Some((stack, output, effect));
+        Ok(output)
+    }
+
+    fn reject_unready_place(
+        &self,
+        place: &Place,
+        unready: &HashSet<String>,
+    ) -> Result<(), Diagnostic> {
+        if let Some((span, name)) = unready_mention(&place.body, unready) {
+            return Err(self.error(span, Error::PlaceNotReady(name)));
+        }
+        Ok(())
+    }
+
     fn check_body(&mut self, def: &crate::ast::Def) -> Result<(), Diagnostic> {
         let scheme = self.lookup(&def.name).expect("def was registered");
         let (input, output, effect, constraints) = self.instantiate_scheme(&scheme, true);
@@ -1718,6 +1882,8 @@ impl Checker {
                 Ok(self.stack_cons(stack, ty))
             }
             TermNode::Bind(names) => self.check_bind(term.span, names, stack),
+            TermNode::PlaceSet(name) => self.check_place_set(term.span, name, stack),
+            TermNode::PlaceBind(name) => self.check_place_bind(term.span, name, stack),
         };
         let (after, here) = match &result {
             Ok(after) => (Some(*after), self.pending_here.take()),
@@ -6123,8 +6289,63 @@ fn shift_term(term: &mut Term, base: u32) {
         | TermNode::Field(_)
         | TermNode::FieldSet(_)
         | TermNode::FieldInsert(_)
+        | TermNode::PlaceSet(_)
+        | TermNode::PlaceBind(_)
         | TermNode::Bind(_) => {}
     }
+}
+
+fn place_def(place: &Place) -> Def {
+    Def {
+        span: place.span,
+        name_span: place.name_span,
+        vis: Vis::PUBLIC,
+        name: place.name.clone(),
+        scheme: Scheme {
+            vars: Vec::new(),
+            constraints: Vec::new(),
+            effect: StackEffect {
+                input: Stack {
+                    tail: StackTail::Empty,
+                    items: Vec::new(),
+                },
+                output: Stack {
+                    tail: StackTail::Empty,
+                    items: vec![place.ty.clone()],
+                },
+                effects: None,
+            },
+        },
+        body: place.body.clone(),
+        clauses: Vec::new(),
+        doc: place.doc.clone(),
+    }
+}
+
+fn unready_mention(terms: &[Term], unready: &HashSet<String>) -> Option<(Span, String)> {
+    for term in terms {
+        match &term.node {
+            TermNode::Word(name) | TermNode::PlaceSet(name) | TermNode::PlaceBind(name)
+                if unready.contains(name) =>
+            {
+                return Some((term.span, name.clone()));
+            }
+            TermNode::Quote(inner) | TermNode::Array(inner) => {
+                if let Some(found) = unready_mention(inner, unready) {
+                    return Some(found);
+                }
+            }
+            TermNode::Record(fields) => {
+                for (_, value) in fields {
+                    if let Some(found) = unready_mention(std::slice::from_ref(value), unready) {
+                        return Some(found);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn known_at<'a>(known: &'a [KnownModule], origin: &str) -> Option<&'a KnownModule> {
@@ -6280,6 +6501,13 @@ fn data_of_ctor<'a>(module: &'a Module, name: &str) -> Option<&'a crate::ast::Da
 fn find_def<'a>(module: &'a Module, name: &str) -> Option<&'a crate::ast::Def> {
     module.items.iter().find_map(|item| match item {
         Item::Def(def) if def.name == name => Some(def),
+        _ => None,
+    })
+}
+
+fn find_place<'a>(module: &'a Module, name: &str) -> Option<&'a Place> {
+    module.items.iter().find_map(|item| match item {
+        Item::Place(place) if place.name == name => Some(place),
         _ => None,
     })
 }
@@ -7672,5 +7900,80 @@ mod tests {
             "& Eq a\n  eq ( a a -- Bool )\n\n& Eq a => Ord a\n  compare ( a a -- Bool )\n\n& Eq a => Show a\n  show ( a -- Str )\n\n: bad ( Ord a, Show a => a a -- Bool )\n  eq\n",
             "incoherent instance",
         );
+    }
+
+    #[test]
+    fn a_place_reads_writes_and_binds() {
+        ok("\
+= base Num
+  10
+
+: seed ( -- Num )
+  base
+
+= scale Num
+  seed
+
+: read ( -- Num )
+  base
+
+: write ( Num -- )
+  =base
+
+: around ( Num -- Num )
+  [ base ] =>base
+
+: poke ( Num -- Num )
+  [ 4 =base ] =>base
+  base
+
+: nest ( -- Num )
+  20 [ 3 [ base ] =>scale ] =>base
+");
+        err("= base Num\n  base\n", "place base is not ready");
+        err("= base Num\n  [ base ] call\n", "place base is not ready");
+        err("= base Num\n  1 =base\n", "place base is not ready");
+        err(
+            "= base Num\n  scale\n\n= scale Num\n  1\n",
+            "place scale is not ready",
+        );
+        err(": w ( Num -- )\n  =missing\n", "no place missing");
+        err(": w ( Num ( -- Num ) -- Num )\n  =>missing\n", "no place missing");
+        err("= base a\n  0\n", "type variable a is not quantified");
+    }
+
+    #[test]
+    fn an_imported_place_opens_its_writer_and_binder() {
+        let provider = parse(
+            "@ base\n\n= base Num\n  10\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let known = vec![super::KnownModule::new("Lib".to_string(), provider.clone())];
+        let check_import = |source: &str| {
+            let module = parse(source, ParseMode::Source).unwrap();
+            super::check_with_imports(
+                &module,
+                &[super::ResolvedImport {
+                    provider: &provider,
+                    import: &module.imports[0],
+                    known: &known,
+                }],
+            )
+        };
+        check_import(
+            "~ \"Lib\" base\n\n: use ( Num -- Num )\n  dup =base [ base ] =>base\n",
+        )
+        .unwrap();
+        check_import(
+            "~ \"Lib\" base : floor\n\n: use ( Num -- Num )\n  dup =floor [ floor ] =>floor\n",
+        )
+        .unwrap();
+        check_import(
+            "~ \"Lib\" : Box\n\n: use ( Num -- Num )\n  dup =Box:base [ Box:base ] =>Box:base\n",
+        )
+        .unwrap();
+        let missing = check_import("~ \"Lib\"\n\n: use ( Num -- )\n  =base\n").unwrap_err();
+        assert_eq!(missing.message, "no place base");
     }
 }

@@ -137,6 +137,11 @@ fn render_page(out: &mut String, title: &str, page: &Page, seen: &mut HashMap<St
             Item::Def(def) if docs_def(&page.module, def) => {
                 words.push((def.name.clone(), format_word(def), def.doc.clone()))
             }
+            Item::Place(place) if docs_name(&page.module, &place.name) => words.push((
+                place.name.clone(),
+                format_place(place),
+                place.doc.clone(),
+            )),
             _ => {}
         }
     }
@@ -213,6 +218,9 @@ fn append_published(
             }
             crate::surface::Found::Def(def) => {
                 words.push((def.name.clone(), format_word(&def), def.doc.clone()));
+            }
+            crate::surface::Found::Place(place) => {
+                words.push((place.name.clone(), format_place(&place), place.doc.clone()));
             }
         }
     }
@@ -321,6 +329,10 @@ fn join_doc(lines: &[String]) -> String {
     } else {
         lines.join("\n")
     }
+}
+
+fn format_place(place: &crate::ast::Place) -> String {
+    format!("= {} {}", place.name, type_string(&place.ty))
 }
 
 fn format_word(def: &Def) -> String {

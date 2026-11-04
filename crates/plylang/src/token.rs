@@ -37,6 +37,10 @@ pub enum TokenKind {
     FatArrow,
     Colon,
     Eq,
+    /// `=name` writes the current frame of a place. Glued; a space is `Eq`.
+    PlaceSet(String),
+    /// `=>name` runs a quotation under a new frame of a place. Glued.
+    PlaceBind(String),
     /// `==` on a `;` type. One constructor, one field, erased in JavaScript.
     EqEq,
     Pipe,

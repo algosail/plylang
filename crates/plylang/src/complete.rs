@@ -226,7 +226,7 @@ fn type_names(from: &Path, module: Option<&Module>, vars: &[String], replace: Sp
                         replace,
                     ),
                 ),
-                Item::Def(_) | Item::Instance(_) => {}
+                Item::Def(_) | Item::Instance(_) | Item::Place(_) => {}
             }
         }
         for name in imported_types(from, module) {
@@ -258,6 +258,18 @@ fn word_names(from: &Path, module: Option<&Module>, replace: Span) -> Vec<Comple
                         push(&mut items, method_entry(class, method, "1", replace));
                     }
                 }
+                Item::Place(place) => push(
+                    &mut items,
+                    entry(
+                        &place.name,
+                        &place.name,
+                        CompletionKind::Word,
+                        &format!("-- {}", type_string(&place.ty)),
+                        &place.doc,
+                        "1",
+                        replace,
+                    ),
+                ),
                 Item::Synonym(_) | Item::Instance(_) => {}
             }
         }
@@ -328,6 +340,13 @@ fn imported_words(from: &Path, module: &Module) -> Vec<Named> {
                     kind: CompletionKind::Word,
                     detail: scheme_string(&def.scheme),
                     documentation: doc_text(&def.doc),
+                    group: "2",
+                }),
+                Found::Place(place) if place.name == remote => names.push(Named {
+                    label: local,
+                    kind: CompletionKind::Word,
+                    detail: format!("-- {}", type_string(&place.ty)),
+                    documentation: doc_text(&place.doc),
                     group: "2",
                 }),
                 Found::Data(data) => {
@@ -468,6 +487,13 @@ fn found_exports(found: &Found, name: &str) -> Vec<(CompletionKind, String, Stri
                 CompletionKind::Word,
                 scheme_string(&def.scheme),
                 doc_text(&def.doc),
+            ));
+        }
+        Found::Place(place) if place.name == name => {
+            entries.push((
+                CompletionKind::Word,
+                format!("-- {}", type_string(&place.ty)),
+                doc_text(&place.doc),
             ));
         }
         _ => {}
@@ -1294,7 +1320,7 @@ fn add_fields(env: &mut FieldEnv, module: &Module) {
                     rhs: synonym.rhs.clone(),
                 });
             }
-            Item::Def(_) | Item::Class(_) | Item::Instance(_) => {}
+            Item::Def(_) | Item::Class(_) | Item::Instance(_) | Item::Place(_) => {}
         }
     }
 }

@@ -104,6 +104,8 @@ pub enum Item {
     /// Transparent synonym. Saturated uses expand to the right-hand side.
     Synonym(Synonym),
     Def(Def),
+    /// One value the module keeps off the stack. The name reads it.
+    Place(Place),
     Class(Class),
     Instance(Instance),
 }
@@ -180,6 +182,18 @@ pub struct Def {
     /// Equation body. Non-empty only when `body` is empty.
     /// Patterns are bottom to top: the rightmost pattern is the top of the stack.
     pub clauses: Vec<Clause>,
+    /// Text of the `..` lines directly above this declaration. Empty if there are none.
+    pub doc: String,
+}
+
+/// `= name Type` and a program `( -- Type )`. The program runs once, when the module loads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Place {
+    pub span: Span,
+    pub name_span: Span,
+    pub name: String,
+    pub ty: Type,
+    pub body: Vec<Term>,
     /// Text of the `..` lines directly above this declaration. Empty if there are none.
     pub doc: String,
 }
@@ -332,6 +346,10 @@ pub enum TermNode {
     Field(String),
     /// `>>name`. The new value is above the base. The result is a new value.
     FieldSet(String),
+    /// `=name` writes the current frame.
+    PlaceSet(String),
+    /// `=>name` runs the quotation under a new frame and restores the previous one.
+    PlaceBind(String),
     /// `+name`. The record is below the new value. The label must be absent.
     FieldInsert(String),
     /// `< 1 2 3 >`. Elements are constants, not a stack program.
@@ -429,6 +447,7 @@ impl fmt::Display for Item {
             Self::Data(data) => write!(formatter, "{data}"),
             Self::Synonym(synonym) => write!(formatter, "{synonym}"),
             Self::Def(def) => write!(formatter, "{def}"),
+            Self::Place(place) => write!(formatter, "{place}"),
             Self::Class(class) => write!(formatter, "{class}"),
             Self::Instance(instance) => write!(formatter, "{instance}"),
         }
@@ -494,6 +513,17 @@ impl fmt::Display for Def {
                 write!(formatter, "{}", clause_string(clause))?;
             }
         } else if !self.body.is_empty() {
+            write!(formatter, "{}", body_string(&self.body, 2))?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Place {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_doc(formatter, &self.doc)?;
+        write!(formatter, "= {} {}", self.name, type_string(&self.ty))?;
+        if !self.body.is_empty() {
             write!(formatter, "{}", body_string(&self.body, 2))?;
         }
         Ok(())
@@ -803,6 +833,8 @@ fn term_string(term: &Term, indent: usize) -> String {
         TermNode::Bind(names) => format!("{} ->", names.join(" ")),
         TermNode::Field(name) => format!("{name}>>"),
         TermNode::FieldSet(name) => format!(">>{name}"),
+        TermNode::PlaceSet(name) => format!("={name}"),
+        TermNode::PlaceBind(name) => format!("=>{name}"),
         TermNode::FieldInsert(name) => format!("+{name}"),
         TermNode::Lit(lit) => lit_string(lit),
         TermNode::Array(elements) => {

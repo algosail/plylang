@@ -152,6 +152,14 @@ impl<'a> Lexer<'a> {
             ':' => TokenKind::Colon,
             ',' => TokenKind::Comma,
             '|' => TokenKind::Pipe,
+            // `=>name` and `=name` are one word. A space leaves `=>` or `=`.
+            '=' if self.peek() == Some('>') && self.peek_at(1).is_some_and(is_ident_start) => {
+                self.bump();
+                TokenKind::PlaceBind(self.glued_place_name())
+            }
+            '=' if self.peek().is_some_and(is_ident_start) => {
+                TokenKind::PlaceSet(self.glued_place_name())
+            }
             '=' if self.peek() == Some('>') => {
                 self.bump();
                 TokenKind::FatArrow
@@ -206,6 +214,26 @@ impl<'a> Lexer<'a> {
             }
         };
         Ok(self.make(kind, start, self.index))
+    }
+
+    /// The identifier glued to `=` or `=>`. `Alias:name` stays one name.
+    fn glued_place_name(&mut self) -> String {
+        let name_at = self.index;
+        while self.peek().is_some_and(is_ident_continue) {
+            self.bump();
+        }
+        let mut name = self.source[name_at..self.index].to_string();
+        let upper = name.chars().next().is_some_and(|ch| ch.is_ascii_uppercase());
+        if upper && self.peek() == Some(':') && self.peek_at(1).is_some_and(is_ident_start) {
+            self.bump();
+            name.push(':');
+            let rest_at = self.index;
+            while self.peek().is_some_and(is_ident_continue) {
+                self.bump();
+            }
+            name.push_str(&self.source[rest_at..self.index]);
+        }
+        name
     }
 
     /// `..` at column 0, outside parentheses. One leading space after the marker is not part of the text.

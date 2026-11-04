@@ -299,13 +299,15 @@ A module names what it publishes with one `@` list. The list may stand anywhere 
 @ Maybe, Nothing, Just, fromMaybe
 ```
 
-Imports stay together and come before the first `:`, `;`, `-`, `&`, or `#`. A path inside this package is written from the source directory. A path into another package is a package specifier. The names after the path are what this file uses. `: Alias` brings every published name as `Alias:name`, and a call is `Alias:send`. `send : busSend` brings `send` as `busSend`. A bare path brings instances and no names. Writing the local name again in the `@` list publishes it. A colon in column 0 still starts a word.
+Imports stay together and come before the first `:`, `;`, `-`, `&`, `#`, or `=`. A path inside this package is written from the source directory. A path into another package is a package specifier. The names after the path are what this file uses. `: Alias` brings every published name as `Alias:name`, and a call is `Alias:send`. `send : busSend` brings `send` as `busSend`. A bare path brings instances and no names. Writing the local name again in the `@` list publishes it. A colon in column 0 still starts a word.
 
 A test entry, a word `( -- Verdict )` or `suite`, is not a module and has no list. A utility under `test/` is a module and has one. A word `main` with scheme `( -- Unit )` may stay off the list. Node still runs it when it starts that file.
 
-A comment runs from `.` to the end of the line, when the dot is not inside `()`. `..` in column 0, directly above `:`, `;`, `-`, or `&`, is the text of that declaration. One space after `..` is not part of the text. A type has one text for all of its constructors. A class has one text for its name and for all of its methods. A `..` line above `#` does not attach to the declaration.
+A comment runs from `.` to the end of the line, when the dot is not inside `()`. `..` in column 0, directly above `:`, `;`, `-`, `&`, or `=`, is the text of that declaration. One space after `..` is not part of the text. A type has one text for all of its constructors. A class has one text for its name and for all of its methods. A `..` line above `#` does not attach to the declaration.
 
-A declaration stands in column 0 and starts with `@`, `:`, `;`, `-`, `&`, `#`, or `~`.
+A declaration stands in column 0 and starts with `@`, `:`, `;`, `-`, `&`, `#`, `~`, or `=`.
+
+A place is one value the module keeps off the stack. `= base Num` declares it. The program under that line has scheme `( -- Num )` and runs once, when the module loads. After that, `base` reads the current frame `( -- Num )`. `=base` writes the top value `( Num -- )`. `=>base` runs the quotation under a new frame and restores the previous frame afterwards, including when the quotation throws: `( ..s Num ( ..s -- ..t ) -- ..t )`. The stored type is monomorphic. Importing `base` also opens `=base` and `=>base`. The program that fills the place does not read or write it.
 
 A package is described by `package.json`.
 

@@ -9,13 +9,14 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::ast::{Class, Data, Def, Exports, Import, Instance, Item, Module, Synonym};
+use crate::ast::{Class, Data, Def, Exports, Import, Instance, Item, Module, Place, Synonym};
 
 pub(crate) enum Found {
     Data(Data),
     Synonym(Synonym),
     Def(Def),
     Class(Class),
+    Place(Place),
 }
 
 /// `true` when this file declares `name` as a type, constructor, synonym,
@@ -25,6 +26,7 @@ pub(crate) fn defines(module: &Module, name: &str) -> bool {
         Item::Data(data) => data.name == name || data.ctors.iter().any(|ctor| ctor.name == name),
         Item::Synonym(synonym) => synonym.name == name,
         Item::Def(def) => def.name == name,
+        Item::Place(place) => place.name == name,
         Item::Class(class) => {
             class.name == name || class.methods.iter().any(|method| method.name == name)
         }
@@ -84,6 +86,11 @@ pub(crate) fn own_public_values(module: &Module) -> Vec<String> {
                 if let Item::Def(def) = item {
                     if list.has(&def.name) {
                         names.push(def.name.clone());
+                    }
+                }
+                if let Item::Place(place) = item {
+                    if list.has(&place.name) {
+                        names.push(place.name.clone());
                     }
                 }
             }
@@ -251,6 +258,9 @@ fn own_found(module: &Module, name: &str) -> Option<Found> {
             }
             Item::Def(def) if def.name == name && def_published(module, def) => {
                 return Some(Found::Def(def.clone()));
+            }
+            Item::Place(place) if place.name == name && listed(&place.name) => {
+                return Some(Found::Place(place.clone()));
             }
             Item::Class(class) if class.name == name && listed(&class.name) => {
                 return Some(Found::Class(class.clone()));

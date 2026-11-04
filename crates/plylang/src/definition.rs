@@ -42,6 +42,9 @@ pub fn definition(source: &str, path: &Path, line: u32, character: u32) -> Optio
             let space = name_space_at(&tokens, index);
             resolve(path, &module, &tokens, offset, &name, space)
         }
+        TokenKind::PlaceSet(name) | TokenKind::PlaceBind(name) => {
+            resolve(path, &module, &tokens, offset, name, NameSpace::Value)
+        }
         _ => None,
     }
 }
@@ -70,6 +73,7 @@ fn module_anchor(module: &Module) -> Span {
             Item::Data(data) => return data.name_span,
             Item::Synonym(synonym) => return synonym.name_span,
             Item::Def(def) => return def.name_span,
+            Item::Place(place) => return place.name_span,
             Item::Class(class) => return class.name_span,
             Item::Instance(instance) => return instance.span,
         }
@@ -113,6 +117,7 @@ fn local_value(
 ) -> Option<Definition> {
     local_binder(module, tokens, offset, name)
         .or_else(|| def_span(module, name))
+        .or_else(|| place_span(module, name))
         .or_else(|| ctor_span(module, name))
         .or_else(|| method_span(module, name))
         .map(|span| here(path, span))
@@ -179,6 +184,7 @@ fn qualified_name(tokens: &[Token], index: usize, name: &str) -> String {
 fn found_span(found: &Found, name: &str, target: Target) -> Option<Span> {
     match (found, target) {
         (Found::Def(def), Target::Value) if def.name == name => Some(def.name_span),
+        (Found::Place(place), Target::Value) if place.name == name => Some(place.name_span),
         (Found::Data(data), Target::Type) if data.name == name => Some(data.name_span),
         (Found::Data(data), Target::Value) => data
             .ctors
@@ -199,6 +205,13 @@ fn found_span(found: &Found, name: &str, target: Target) -> Option<Span> {
 fn def_span(module: &Module, name: &str) -> Option<Span> {
     module.items.iter().find_map(|item| match item {
         Item::Def(def) if def.name == name => Some(def.name_span),
+        _ => None,
+    })
+}
+
+fn place_span(module: &Module, name: &str) -> Option<Span> {
+    module.items.iter().find_map(|item| match item {
+        Item::Place(place) if place.name == name => Some(place.name_span),
         _ => None,
     })
 }
@@ -252,24 +265,34 @@ fn local_binder(module: &Module, tokens: &[Token], offset: u32, name: &str) -> O
         return None;
     }
     for item in &module.items {
-        let Item::Def(def) = item else {
-            continue;
-        };
-        if def.span.start > offset || offset >= def.span.end {
-            continue;
-        }
-        if let Some(span) = binders_in(&def.body, tokens, offset, name) {
-            return Some(span);
-        }
-        for clause in &def.clauses {
-            if let Some(span) = binders_in(&clause.body, tokens, offset, name) {
-                return Some(span);
+        match item {
+            Item::Def(def) => {
+                if def.span.start > offset || offset >= def.span.end {
+                    continue;
+                }
+                if let Some(span) = binders_in(&def.body, tokens, offset, name) {
+                    return Some(span);
+                }
+                for clause in &def.clauses {
+                    if let Some(span) = binders_in(&clause.body, tokens, offset, name) {
+                        return Some(span);
+                    }
+                    if clause.span.start <= offset && offset < clause.span.end {
+                        if let Some(span) = clause_binder(clause, tokens, name) {
+                            return Some(span);
+                        }
+                    }
+                }
             }
-            if clause.span.start <= offset && offset < clause.span.end {
-                if let Some(span) = clause_binder(clause, tokens, name) {
+            Item::Place(place) => {
+                if place.span.start > offset || offset >= place.span.end {
+                    continue;
+                }
+                if let Some(span) = binders_in(&place.body, tokens, offset, name) {
                     return Some(span);
                 }
             }
+            _ => {}
         }
     }
     None

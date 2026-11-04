@@ -109,7 +109,7 @@ Fix: use a compiler that supports that version, or set the version to `1`.
 
 `doc comment must sit above a declaration`
 
-A column-0 `..` block belongs on the next `:`, `;`, `-`, or `&`. It is sitting on an import or on something that is not a declaration.
+A column-0 `..` block belongs on the next `:`, `;`, `-`, `&`, or `=`. It is sitting on an import or on something that is not a declaration.
 
 Fix: move the block so it touches that declaration, with a single newline between them. A `.` line comment can sit anywhere.
 
@@ -125,7 +125,7 @@ Fix: move the import above the declarations.
 
 `declaration must start at column 0`
 
-`:`, `;`, `-`, `&`, and `#` start at column 0. An indented line is still part of the previous body.
+`:`, `;`, `-`, `&`, `#`, and `=` start at column 0. An indented line is still part of the previous body. `=name` without a space is a word inside a body, not a declaration.
 
 Fix: move the declaration to column 0.
 
@@ -133,7 +133,7 @@ Fix: move the declaration to column 0.
 
 `expected declaration`
 
-The parser expected an import or a declaration. A word starts with `:`, a data type or newtype with `;`, a synonym with `-`, a class with `&`, an instance with `#`, and an import with `~`. The name `def` is an ordinary identifier.
+The parser expected an import or a declaration. A word starts with `:`, a data type or newtype with `;`, a synonym with `-`, a class with `&`, an instance with `#`, a place with `=`, and an import with `~`. The name `def` is an ordinary identifier.
 
 Fix: start the line with one of those marks. `: name` is a word. `def : name` is this error.
 
@@ -1098,3 +1098,19 @@ Fix: import the constructor, or use a word this module published for that value.
 `: Alias` finishes the import. A name after it, or a second form on the same import, has nowhere to go.
 
 Fix: put the names on their own `~` line, or list them instead of `: Alias`.
+
+## PL0134
+
+`place NAME is not ready`
+
+The program under `= NAME` reads `NAME`, writes `=NAME`, binds `=>NAME`, or mentions a place that is declared later. That program runs once, when the module loads, and this place's frame does not exist until the program has finished. A later place is still empty.
+
+Fix: fill the place from a value that does not use it. A word below the declaration may read and write it.
+
+## PL0135
+
+`no place NAME`
+
+`=NAME` or `=>NAME` names a place, and `NAME` is not one. A place is `= NAME Type` in this file, or a place whose reader this file imports. Importing the reader also opens `=NAME` and `=>NAME`.
+
+Fix: declare the place, or import its reader. `NAME` alone reads it. The glued word writes or binds.

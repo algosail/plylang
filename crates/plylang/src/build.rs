@@ -21,7 +21,8 @@ use serde_json::Value;
 
 use crate::anf::{js_ident, referenced_words, AnfModule};
 use crate::ast::{
-    scheme_string, push_doc, Data, Def, Exports, Import, Instance, Item, Module, StackTail, Type,
+    push_doc, scheme_string, type_string, Data, Def, Exports, Import, Instance, Item, Module,
+    StackTail, Type,
 };
 use crate::check::{
     check_and_note, check_with_imports_key, collect_sites, collect_sites_with_imports_key,
@@ -1200,6 +1201,12 @@ impl Session {
         imports: &[Import],
         deps: &[usize],
     ) -> Option<String> {
+        if let Some((home, _)) = self.place_helper(id, name) {
+            if home == id {
+                return None;
+            }
+            return self.unit_js_spec(home, from_js);
+        }
         for (import, dep) in imports.iter().zip(deps) {
             let surface = self.value_surface(*dep);
             if import
@@ -1361,8 +1368,46 @@ impl Session {
         import.bindings(&self.value_surface(dep))
     }
 
+    /// `ply_set_` and `ply_bind_` come from the module that declares the place.
+    /// A facade that only reexports the reader is not that module.
+    fn place_helper(&self, id: usize, name: &str) -> Option<(usize, String)> {
+        let local = name
+            .strip_prefix("ply_set_")
+            .or_else(|| name.strip_prefix("ply_bind_"))?;
+        let mut seen = HashSet::new();
+        self.place_defining(id, local, &mut seen)
+    }
+
+    fn place_defining(
+        &self,
+        id: usize,
+        local: &str,
+        seen: &mut HashSet<usize>,
+    ) -> Option<(usize, String)> {
+        if !seen.insert(id) {
+            return None;
+        }
+        if self.units[id].module.items.iter().any(|item| {
+            matches!(item, Item::Place(place) if place.name == local)
+        }) {
+            return Some((id, local.to_string()));
+        }
+        let imports = self.units[id].module.imports.clone();
+        let deps = self.units[id].deps.clone();
+        for (import, dep) in imports.iter().zip(deps) {
+            let Some(remote) = import.remote_of(local) else {
+                continue;
+            };
+            if let Some(found) = self.place_defining(dep, remote, seen) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
     /// A referenced name that was not already grouped. An import binds
     /// `(remote, local)`. An instance word keeps its own name.
+    /// A place helper's remote name is the defining module's `ply_set_` or `ply_bind_`.
     fn extra_pair(
         &self,
         _id: usize,
@@ -1370,6 +1415,14 @@ impl Session {
         imports: &[Import],
         deps: &[usize],
     ) -> (String, String) {
+        if let Some((_, canon)) = self.place_helper(_id, name) {
+            let prefix = if name.starts_with("ply_bind_") {
+                "ply_bind_"
+            } else {
+                "ply_set_"
+            };
+            return (format!("{prefix}{canon}"), name.to_string());
+        }
         for (import, dep) in imports.iter().zip(deps) {
             if let Some((remote, _)) = import
                 .bindings(&self.value_surface(*dep))
@@ -2825,6 +2878,7 @@ fn interface_text(module: &Module) -> String {
         out.push('\n');
         match item {
             Item::Def(def) => push_interface_def(&mut out, def),
+            Item::Place(place) => push_interface_place(&mut out, place),
             Item::Data(data) => {
                 out.push_str(&interface_data(module, data));
                 out.push('\n');
@@ -2848,6 +2902,7 @@ fn interface_keeps(module: &Module, item: &Item) -> bool {
         }
         Item::Synonym(synonym) => list.has(&synonym.name),
         Item::Def(def) => crate::surface::js_exports_def(module, def),
+        Item::Place(place) => list.has(&place.name),
         Item::Class(class) => {
             list.has(&class.name) || class.methods.iter().any(|method| list.has(&method.name))
         }
@@ -2925,6 +2980,15 @@ fn push_interface_def(out: &mut String, def: &Def) {
     out.push_str(" )\n");
 }
 
+fn push_interface_place(out: &mut String, place: &crate::ast::Place) {
+    push_doc(out, &place.doc);
+    out.push_str("= ");
+    out.push_str(&place.name);
+    out.push(' ');
+    out.push_str(&type_string(&place.ty));
+    out.push('\n');
+}
+
 fn closed_interface(module: &Module) -> String {
     let mut out = String::from("language 1\n");
     for import in &module.imports {
@@ -2954,6 +3018,10 @@ fn closed_interface(module: &Module) -> String {
                 out.push_str(" ( ");
                 out.push_str(&scheme_string(&def.scheme));
                 out.push_str(" )\n");
+            }
+            Item::Place(place) => {
+                out.push('\n');
+                push_interface_place(&mut out, place);
             }
             Item::Class(class) => {
                 out.push('\n');
@@ -3019,6 +3087,11 @@ fn local_runtime_names(module: &Module) -> HashSet<String> {
             }
             Item::Def(def) => {
                 names.insert(def.name.clone());
+            }
+            Item::Place(place) => {
+                names.insert(place.name.clone());
+                names.insert(format!("ply_set_{}", place.name));
+                names.insert(format!("ply_bind_{}", place.name));
             }
             Item::Class(_) | Item::Instance(_) | Item::Synonym(_) => {}
         }
@@ -5372,6 +5445,140 @@ mod tests {
         assert_eq!(error.code, "PL0130", "{}", error.message);
         assert!(error.message.contains("left-pad"), "{}", error.message);
         assert!(!temp.0.join("dist/script.js").exists());
+    }
+
+    #[test]
+    fn a_place_keeps_one_frame_stack_in_its_defining_module() {
+        let exports = r#"
+    "./Lib": { "ply": "./dist/Lib.d.ply", "import": "./dist/Lib.js" },
+    "./Door": { "ply": "./dist/Door.d.ply", "import": "./dist/Door.js" },
+    "./App": { "ply": "./dist/App.d.ply", "import": "./dist/App.js" },
+    "./Floor": { "ply": "./dist/Floor.d.ply", "import": "./dist/Floor.js" },
+    "./Use": { "ply": "./dist/Use.d.ply", "import": "./dist/Use.js" }
+"#;
+        let temp = Temp::new("place");
+        temp.write("package.json", &package_json(exports));
+        temp.write(
+            "src/Lib.ply",
+            "\
+@ base
+
+.. The current base.
+= base Num
+  10
+",
+        );
+        temp.write("src/Door.ply", "@ base\n~ \"Lib\" base\n");
+        temp.write(
+            "src/App.ply",
+            "\
+@ read, store, inside
+
+~ \"Lib\" base
+
+: read ( -- Num )
+  base
+
+: store ( Num -- )
+  =base
+
+: inside ( Num -- Num )
+  [ base ] =>base
+",
+        );
+        temp.write(
+            "src/Floor.ply",
+            "\
+@ read, set, around
+
+~ \"Lib\" base : floor
+
+: read ( -- Num )
+  floor
+
+: set ( Num -- )
+  =floor
+
+: around ( Num -- Num )
+  [ floor ] =>floor
+",
+        );
+        temp.write(
+            "src/Use.ply",
+            "\
+@ around
+
+~ \"Door\" base
+
+: around ( Num -- Num )
+  [ base ] =>base
+",
+        );
+        build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let lib = fs::read_to_string(temp.0.join("dist/Lib.js")).unwrap();
+        assert!(lib.contains("const ply$place$base = [];"), "{lib}");
+        assert!(lib.contains("export function base()"), "{lib}");
+        assert!(lib.contains("export function ply_set_base(value)"), "{lib}");
+        assert!(lib.contains("export function ply_bind_base(value, quot)"), "{lib}");
+        assert!(lib.contains("ply$place$base.push(value);"), "{lib}");
+        assert!(lib.contains("ply$place$base.pop();"), "{lib}");
+        assert!(lib.contains("function ply$init$base("), "{lib}");
+        assert!(lib.contains("ply$place$base.push(ply$init$base());"), "{lib}");
+        assert!(!lib.contains("export function ply$init$"), "{lib}");
+        let iface = fs::read_to_string(temp.0.join("dist/Lib.d.ply")).unwrap();
+        assert!(iface.contains("= base Num\n"), "{iface}");
+        assert!(iface.contains(".. The current base."), "{iface}");
+        assert!(!iface.contains("10"), "{iface}");
+        let door = fs::read_to_string(temp.0.join("dist/Door.js")).unwrap();
+        assert!(door.contains("export { base } from \"./Lib.js\";"), "{door}");
+        assert!(!door.contains("ply_bind_base"), "{door}");
+        let app = fs::read_to_string(temp.0.join("dist/App.js")).unwrap();
+        assert!(app.contains("ply_set_base"), "{app}");
+        assert!(app.contains("ply_bind_base"), "{app}");
+        assert!(app.contains("from \"./Lib.js\""), "{app}");
+        let floor = fs::read_to_string(temp.0.join("dist/Floor.js")).unwrap();
+        assert!(floor.contains("base as floor"), "{floor}");
+        assert!(floor.contains("ply_set_base as ply_set_floor"), "{floor}");
+        assert!(floor.contains("ply_bind_base as ply_bind_floor"), "{floor}");
+        assert!(floor.contains("from \"./Lib.js\""), "{floor}");
+        let use_js = fs::read_to_string(temp.0.join("dist/Use.js")).unwrap();
+        assert!(use_js.contains("from \"./Door.js\""), "{use_js}");
+        assert!(use_js.contains("ply_bind_base"), "{use_js}");
+        assert!(use_js.contains("from \"./Lib.js\""), "{use_js}");
+        assert!(!use_js.contains("ply_bind_base } from \"./Door.js\""), "{use_js}");
+        node(
+            &temp.0,
+            "\
+import { base } from \"./dist/Lib.js\";
+import { read, store, inside } from \"./dist/App.js\";
+if (base() !== 10 || read() !== 10) throw new Error(\"init\");
+if (inside(4) !== 4) throw new Error(\"inside\");
+if (base() !== 10) throw new Error(\"inside leaked\");
+store(7);
+if (base() !== 7 || read() !== 7) throw new Error(\"store\");
+",
+        );
+        node(
+            &temp.0,
+            "\
+import { base } from \"./dist/Lib.js\";
+import { read, set, around } from \"./dist/Floor.js\";
+if (read() !== 10) throw new Error(\"floor\");
+if (around(4) !== 4) throw new Error(\"around\");
+if (base() !== 10) throw new Error(\"around leaked\");
+set(6);
+if (base() !== 6 || read() !== 6) throw new Error(\"set\");
+",
+        );
+        node(
+            &temp.0,
+            "\
+import { base } from \"./dist/Lib.js\";
+import { around } from \"./dist/Use.js\";
+if (around(5) !== 5) throw new Error(\"facade\");
+if (base() !== 10) throw new Error(\"facade leaked\");
+",
+        );
     }
 
     fn touch_js(mark: &std::path::Path) -> String {

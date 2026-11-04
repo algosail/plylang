@@ -6,8 +6,8 @@
 use std::path::Path;
 
 use crate::ast::{
-    method_line, scheme_string, Ctor, Data, Def, Item, Module, Scheme, Stack, StackEffect,
-    StackTail, Synonym, Type,
+    method_line, scheme_string, type_string, Ctor, Data, Def, Item, Module, Place, Scheme, Stack,
+    StackEffect, StackTail, Synonym, Type,
 };
 use crate::build::{load_surface, stack_sites};
 use crate::surface::{self, Found};
@@ -48,7 +48,11 @@ pub fn hover_with_sites(
                 let (full, span) = qualified_span(&tokens, token, name);
                 word_hover(path, &module, &full, span, &sites)
             }
-            TokenKind::Field(_) | TokenKind::FieldSet(_) | TokenKind::FieldInsert(_) => sites
+            TokenKind::Field(_)
+            | TokenKind::FieldSet(_)
+            | TokenKind::FieldInsert(_)
+            | TokenKind::PlaceSet(_)
+            | TokenKind::PlaceBind(_) => sites
                 .iter()
                 .find(|site| site.span == token.span)
                 .map(context_only),
@@ -136,6 +140,28 @@ fn declared_line(path: &Path, module: &Module, name: &str) -> Option<Declared> {
 }
 
 fn gap_hover(source: &str, module: &Module, offset: u32, sites: &[StackAt]) -> Option<String> {
+    if let Some(place) = module.items.iter().find_map(|item| match item {
+        Item::Place(place)
+            if !place.body.is_empty() && place.span.start <= offset && offset <= place.span.end =>
+        {
+            Some(place)
+        }
+        _ => None,
+    }) {
+        let first = place.body.first()?.span;
+        let last = place.body.last()?.span;
+        let window_start = line_start(source, first.start);
+        let window_end = line_end(source, last.end.saturating_sub(1));
+        if offset < window_start || offset > window_end {
+            return None;
+        }
+        let place_sites: Vec<&StackAt> = sites
+            .iter()
+            .filter(|site| place.span.start <= site.span.start && site.span.end <= place.span.end)
+            .collect();
+        let text = stack_at_gap(&place_sites, offset)?;
+        return Some(blocks(&[text]));
+    }
     let def = module.items.iter().find_map(|item| match item {
         Item::Def(def)
             if (!def.body.is_empty() || !def.clauses.is_empty())
@@ -235,8 +261,20 @@ fn local_scheme(module: &Module, name: &str) -> Option<Declared> {
                 return Some(declared_def(def));
             }
         }
+        if let Item::Place(place) = item {
+            if place.name == name {
+                return Some(declared_place(place));
+            }
+        }
     }
     synonym_or_ctor(module, name)
+}
+
+fn declared_place(place: &Place) -> Declared {
+    Declared {
+        line: format!(": {} ( -- {} )", place.name, type_string(&place.ty)),
+        doc: place.doc.clone(),
+    }
 }
 
 fn declared_def(def: &Def) -> Declared {
@@ -268,6 +306,7 @@ fn imported_scheme(path: &Path, module: &Module, name: &str) -> Option<Declared>
 fn declared_found(found: &Found, name: &str) -> Option<Declared> {
     match found {
         Found::Def(def) if def.name == name => Some(declared_def(def)),
+        Found::Place(place) if place.name == name => Some(declared_place(place)),
         Found::Data(data) => {
             for ctor in &data.ctors {
                 if ctor.name == name {
@@ -296,7 +335,7 @@ fn declared_found(found: &Found, name: &str) -> Option<Declared> {
                 doc: class.doc.clone(),
             }
         }),
-        Found::Def(_) | Found::Synonym(_) => None,
+        Found::Def(_) | Found::Synonym(_) | Found::Place(_) => None,
     }
 }
 
