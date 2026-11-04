@@ -1,4 +1,4 @@
-//! Completions at the cursor: words, types, import paths, import names, and product fields.
+//! Completions at the cursor: words, types, import paths, import names, alias members, and product fields.
 //! A file that does not parse still completes from the lines above the cursor.
 
 use std::collections::HashMap;
@@ -56,6 +56,10 @@ pub fn complete(source: &str, path: &Path, line: u32, character: u32) -> Vec<Com
             .map(|replace| import_paths(path, replace, true))
             .unwrap_or_default();
     };
+    if let Some(mut items) = complete_alias(path, offset, &tokens) {
+        items.sort_by(|left, right| left.sort.cmp(&right.sort));
+        return items;
+    }
     let partial = tokens.iter().find(|token| is_partial(token, offset));
     let before = tokens_before(&tokens, offset, partial);
     let walked = walk(&before);
@@ -318,6 +322,136 @@ impl Named {
             replace,
         )
     }
+}
+
+/// `Alias:` and `Alias:partial`. The insert is the published name, so `F:co`
+/// becomes `F:compose`. A colon at column 0 still starts a word.
+fn complete_alias(path: &Path, offset: usize, tokens: &[Token]) -> Option<Vec<Completion>> {
+    let cursor = alias_cursor(tokens, offset)?;
+    let Some(import_path) = alias_import_path(tokens, offset, &cursor.alias) else {
+        return None;
+    };
+    let Some(file) = provider_file(path, &import_path) else {
+        return Some(Vec::new());
+    };
+    let Some(provider) = read_module(&file) else {
+        return Some(Vec::new());
+    };
+    let surface = surface::public_names(&provider);
+    let mut items = Vec::new();
+    for remote in &surface {
+        let mut load = |start: &Path, path: &str| load_surface(start, path);
+        let Some((_, found)) = surface::lookup(&provider, &file, remote, &mut load) else {
+            continue;
+        };
+        for (kind, detail, doc) in found_exports(&found, remote) {
+            if !kind_in(kind, cursor.space) {
+                continue;
+            }
+            push(
+                &mut items,
+                entry(&remote, &remote, kind, &detail, &doc, "2", cursor.replace),
+            );
+        }
+    }
+    Some(items)
+}
+
+/// `~ "Path" : Alias` above the cursor. The use `Alias:` is not this import.
+fn alias_import_path(tokens: &[Token], offset: usize, alias: &str) -> Option<String> {
+    let mut found = None;
+    let mut index = 0;
+    while index < tokens.len() && (tokens[index].span.start as usize) < offset {
+        if matches!(tokens[index].kind, TokenKind::Import) {
+            let mut next = index + 1;
+            if let Some(TokenKind::String(path)) = tokens.get(next).map(|token| &token.kind) {
+                next += 1;
+                while matches!(tokens.get(next).map(|token| &token.kind), Some(TokenKind::Newline))
+                {
+                    next += 1;
+                }
+                if matches!(tokens.get(next).map(|token| &token.kind), Some(TokenKind::Colon)) {
+                    next += 1;
+                    if let Some(TokenKind::Ident(name)) = tokens.get(next).map(|token| &token.kind) {
+                        if name == alias {
+                            found = Some(path.clone());
+                        }
+                    }
+                }
+            }
+        }
+        index += 1;
+    }
+    found
+}
+
+fn kind_in(kind: CompletionKind, space: NameSpace) -> bool {
+    match space {
+        NameSpace::Either => true,
+        NameSpace::Type => matches!(
+            kind,
+            CompletionKind::Type | CompletionKind::Class | CompletionKind::TypeVar
+        ),
+        NameSpace::Value => matches!(
+            kind,
+            CompletionKind::Word | CompletionKind::Constructor | CompletionKind::Field
+        ),
+    }
+}
+
+/// The cursor is on a glued `Alias:` or on the name typed after it.
+fn alias_cursor(tokens: &[Token], offset: usize) -> Option<AliasCursor> {
+    let index = tokens.iter().position(|token| {
+        !matches!(token.kind, TokenKind::Eof | TokenKind::Newline)
+            && (token.span.start as usize) < offset
+            && offset <= (token.span.end as usize)
+    })?;
+    let token = &tokens[index];
+    match &token.kind {
+        TokenKind::Colon => {
+            if offset != token.span.end as usize {
+                return None;
+            }
+            Some(AliasCursor {
+                alias: glued_alias(tokens, index)?,
+                replace: Span::new(offset, offset),
+                space: name_space_at(tokens, index),
+            })
+        }
+        TokenKind::Ident(_) => {
+            let colon_at = index.checked_sub(1)?;
+            if !matches!(tokens[colon_at].kind, TokenKind::Colon) {
+                return None;
+            }
+            Some(AliasCursor {
+                alias: glued_alias(tokens, colon_at)?,
+                replace: token.span,
+                space: name_space_at(tokens, index),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn glued_alias(tokens: &[Token], colon_at: usize) -> Option<String> {
+    let colon = &tokens[colon_at];
+    if colon.line_start && colon.col == 0 {
+        return None;
+    }
+    let prev = tokens.get(colon_at.checked_sub(1)?)?;
+    let TokenKind::Ident(name) = &prev.kind else {
+        return None;
+    };
+    if !is_upper(name) || prev.span.end != colon.span.start {
+        return None;
+    }
+    Some(name.clone())
+}
+
+struct AliasCursor {
+    alias: String,
+    replace: Span,
+    space: NameSpace,
 }
 
 fn imported_words(from: &Path, module: &Module) -> Vec<Named> {
@@ -1780,6 +1914,94 @@ mod tests {
         let (line, character) = at(source, "( M");
         let types = complete(source, &path, line, character);
         assert!(types.iter().any(|item| item.label == "Maybe"), "{types:?}");
+    }
+
+    #[test]
+    fn completes_members_of_an_import_alias() {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("plylang-complete-alias-{nanos}"));
+        let _cleanup = Cleanup(root.clone());
+        fs::create_dir_all(root.join("src/Data")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{
+  "name": "@algosail/c",
+  "ply": { "source": "src", "out": "dist", "language": 1 }
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/Data/Maybe.ply"),
+            "\
+@ Maybe, Nothing, Just, fromMaybe, Box, wrap
+
+.. A choice.
+; Maybe a = Nothing | Just a
+
+.. The other value.
+: fromMaybe ( a (Maybe a) -- a )
+  Nothing ->
+  Just -> nip
+
+.. A box.
+& Box a
+  wrap ( a -- a )
+",
+        )
+        .unwrap();
+        let path = root.join("src/Use.ply");
+        fs::write(&path, "").unwrap();
+
+        let kinds = "; Maybe a = Nothing | Just a\n\n: use ( Maybe:";
+        let open = labels(kinds, "Maybe:");
+        assert!(open.iter().any(|label| label == "Maybe"), "{open:?}");
+        assert!(open.iter().any(|label| label == "Int"), "{open:?}");
+
+        let signature = "~ \"Data/Maybe\" : M\n\n: use ( M:";
+        let (line, character) = at(signature, "M:");
+        let types = complete(signature, &path, line, character);
+        let maybe = types.iter().find(|item| item.label == "Maybe").expect("type Maybe");
+        assert_eq!(maybe.kind, CompletionKind::Type);
+        assert_eq!(maybe.insert, "Maybe");
+        assert_eq!(maybe.detail, "Maybe a");
+        assert_eq!(maybe.documentation, "A choice.");
+        assert_eq!(
+            &signature[maybe.replace.start as usize..maybe.replace.end as usize],
+            ""
+        );
+        let class = types.iter().find(|item| item.label == "Box").expect("class Box");
+        assert_eq!(class.kind, CompletionKind::Class);
+        assert_eq!(class.detail, "& Box a");
+        assert_eq!(class.documentation, "A box.");
+        assert!(!types.iter().any(|item| item.label == "Just"), "{types:?}");
+        assert!(!types.iter().any(|item| item.label == "fromMaybe"), "{types:?}");
+        assert!(!types.iter().any(|item| item.label == "dup"), "{types:?}");
+        assert!(!types.iter().any(|item| item.label == "M:Maybe"), "{types:?}");
+
+        let body = "~ \"Data/Maybe\" : M\n\n: use ( Int -- Int )\n  M:";
+        let (line, character) = at(body, "M:");
+        let words = complete(body, &path, line, character);
+        let just = words.iter().find(|item| item.label == "Just").expect("Just");
+        assert_eq!(just.kind, CompletionKind::Constructor);
+        assert_eq!(just.insert, "Just");
+        assert_eq!(just.detail, "a. a -- (Maybe a)");
+        assert!(words.iter().any(|item| item.label == "Nothing"), "{words:?}");
+        let from = words.iter().find(|item| item.label == "fromMaybe").expect("fromMaybe");
+        assert_eq!(from.kind, CompletionKind::Word);
+        assert_eq!(from.detail, "a (Maybe a) -- a");
+        assert_eq!(from.documentation, "The other value.");
+        let wrap = words.iter().find(|item| item.label == "wrap").expect("wrap");
+        assert_eq!(wrap.kind, CompletionKind::Word);
+        assert!(!words.iter().any(|item| item.label == "Maybe"), "{words:?}");
+        assert!(!words.iter().any(|item| item.label == "Box"), "{words:?}");
+        assert!(!words.iter().any(|item| item.label == "dup"), "{words:?}");
+
+        let partial = "~ \"Data/Maybe\" : M\n\n: use ( Int -- Int )\n  M:fr";
+        let (line, character) = at(partial, "M:fr");
+        let words = complete(partial, &path, line, character);
+        let from = words.iter().find(|item| item.label == "fromMaybe").expect("fromMaybe");
+        assert_eq!(from.insert, "fromMaybe");
+        assert_eq!(&partial[from.replace.start as usize..from.replace.end as usize], "fr");
     }
 
     #[test]

@@ -342,6 +342,9 @@ fn snippet_javascript(path: &Path) -> Result<String, BuildError> {
 pub struct BufferNotes {
     pub error: Option<Diagnostic>,
     pub sites: Vec<StackAt>,
+    /// Canonical paths this check loaded, including a module reached through a
+    /// closed file. An open importer is stale when one of these files changes.
+    pub deps: Vec<PathBuf>,
 }
 
 /// Check one editor buffer. Inside a package, imports resolve as in `plylang build`.
@@ -362,7 +365,16 @@ pub fn stack_sites(path: &Path, source: &str) -> Vec<StackAt> {
 }
 
 /// The diagnostic and the stack notes of one buffer, from one check.
+/// Dependencies are read from disk.
 pub fn buffer_notes(path: &Path, source: &str) -> BufferNotes {
+    buffer_notes_open(path, source, &[])
+}
+
+/// Check one buffer. `open` is unsaved editor text, as `(path, text)`.
+/// A loaded file that is open is read from that text. A closed file is read
+/// from disk. The buffer being checked is `source`, even when `open` also
+/// names its path.
+pub fn buffer_notes_open(path: &Path, source: &str, open: &[(&Path, &str)]) -> BufferNotes {
     let mode = if path.to_string_lossy().ends_with(".d.ply") {
         ParseMode::Interface
     } else {
@@ -374,6 +386,7 @@ pub fn buffer_notes(path: &Path, source: &str) -> BufferNotes {
             return BufferNotes {
                 error: Some(error),
                 sites: Vec::new(),
+                deps: Vec::new(),
             };
         }
     };
@@ -387,6 +400,7 @@ pub fn buffer_notes(path: &Path, source: &str) -> BufferNotes {
         return BufferNotes {
             error: entry_error.or(error),
             sites,
+            deps: Vec::new(),
         };
     };
     let package = match read_package(&root) {
@@ -399,27 +413,36 @@ pub fn buffer_notes(path: &Path, source: &str) -> BufferNotes {
                     error.message,
                 ))),
                 sites: collect_sites(&module),
+                deps: Vec::new(),
             };
         }
     };
+    let mut overlays = HashMap::new();
+    for (file, text) in open {
+        overlays.insert(canonical(file), *text);
+    }
     let mut doc = OpenDoc {
         package,
         units: Vec::new(),
         by_file: HashMap::new(),
         by_module: HashMap::new(),
         exports_cache: HashMap::new(),
+        open: overlays,
+        touched: Vec::new(),
     };
     doc.push_buffer(path, module.clone());
     if let Err(error) = doc.visit(0, &mut Vec::new(), None) {
         return BufferNotes {
             error: entry_error.or(Some(error)),
             sites: collect_sites(&module),
+            deps: doc.dependency_paths(),
         };
     }
     let mut notes = doc.noted();
     if let Some(error) = entry_error {
         notes.error = Some(error);
     }
+    notes.deps = doc.dependency_paths();
     notes
 }
 
@@ -1499,15 +1522,20 @@ struct DocUnit {
     deps: Vec<usize>,
 }
 
-struct OpenDoc {
+struct OpenDoc<'a> {
     package: Package,
     units: Vec<DocUnit>,
     by_file: HashMap<PathBuf, usize>,
     by_module: HashMap<String, usize>,
     exports_cache: HashMap<PathBuf, HashMap<String, String>>,
+    /// Unsaved text keyed by the canonical path. Disk is the fallback.
+    open: HashMap<PathBuf, &'a str>,
+    /// Every file `load` considered, in visit order. A parse failure still
+    /// records the path, so the importer is known before the module parses.
+    touched: Vec<PathBuf>,
 }
 
-impl OpenDoc {
+impl<'a> OpenDoc<'a> {
     fn push_buffer(&mut self, path: &Path, module: Module) {
         let file = canonical(path);
         let source_root = canonical(&self.package.source);
@@ -1704,26 +1732,43 @@ impl OpenDoc {
             return Err(missing(span, import_path));
         }
         let canonical = canonical(&file);
+        self.touched.push(canonical.clone());
         if let Some(id) = self.by_file.get(&canonical).copied() {
             return Ok(id);
         }
-        let source = fs::read_to_string(&file).map_err(|error| {
-            let os = Error::Os(error.to_string());
-            Diagnostic::with_code(span, os.code(), format!("{}: {}", file.display(), os.message()))
-        })?;
         let mode = if file.to_string_lossy().ends_with(".d.ply") {
             ParseMode::Interface
         } else {
             ParseMode::Source
         };
-        let module = parse(&source, mode).map_err(|error| {
-            let (line, col) = line_col(&source, error.span.start);
-            Diagnostic::with_code(
-                span,
-                error.code,
-                format!("{}:{line}:{col}: {}", file.display(), error.message),
-            )
-        })?;
+        // The editor copy wins over disk, including when the parse fails.
+        let module = {
+            let from_editor = self.open.get(&canonical).copied();
+            let disk = if from_editor.is_none() {
+                Some(fs::read_to_string(&file).map_err(|error| {
+                    let os = Error::Os(error.to_string());
+                    Diagnostic::with_code(
+                        span,
+                        os.code(),
+                        format!("{}: {}", file.display(), os.message()),
+                    )
+                })?)
+            } else {
+                None
+            };
+            let source = match from_editor {
+                Some(text) => text,
+                None => disk.as_deref().unwrap(),
+            };
+            parse(source, mode).map_err(|error| {
+                let (line, col) = line_col(source, error.span.start);
+                Diagnostic::with_code(
+                    span,
+                    error.code,
+                    format!("{}:{line}:{col}: {}", file.display(), error.message),
+                )
+            })?
+        };
         Ok(self.insert(canonical, module, package_root, module_path))
     }
 
@@ -1777,6 +1822,7 @@ impl OpenDoc {
                     Error::MissingPublicList,
                 )),
                 sites: self.sites(),
+                deps: Vec::new(),
             };
         }
         let noted = check_and_note(&self.units[0].module, &resolved, &key);
@@ -1784,12 +1830,25 @@ impl OpenDoc {
             return BufferNotes {
                 error: noted.error,
                 sites: noted.sites,
+                deps: Vec::new(),
             };
         }
         BufferNotes {
             error: noted.error,
             sites: collect_sites(&self.units[0].module),
+            deps: Vec::new(),
         }
+    }
+
+    fn dependency_paths(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for path in &self.touched {
+            if path == &self.units[0].path || out.contains(path) {
+                continue;
+            }
+            out.push(path.clone());
+        }
+        out
     }
 
     fn buffer_needs_public(&self) -> bool {
@@ -3750,6 +3809,50 @@ mod tests {
             error.message
         );
         assert!(error.message.contains("missing body"), "{}", error.message);
+    }
+
+    #[test]
+    fn open_text_hides_an_export_from_an_importer() {
+        let temp = Temp::new("open-export");
+        temp.write(
+            "package.json",
+            &package_json(
+                r#"
+    "./Data/Lib": { "ply": "./dist/Data/Lib.d.ply", "import": "./dist/Data/Lib.js" },
+    "./Data/Mid": { "ply": "./dist/Data/Mid.d.ply", "import": "./dist/Data/Mid.js" },
+    "./App": { "ply": "./dist/App.d.ply", "import": "./dist/App.js" }
+"#,
+            ),
+        );
+        temp.write("src/Data/Lib.ply", "@ kept\n\n: kept ( Int -- Int )\n  dup drop\n");
+        temp.write(
+            "src/Data/Mid.ply",
+            "@ kept\n~ \"Data/Lib\" kept\n\n: pass ( Int -- Int )\n  kept\n",
+        );
+        let app = "@ go\n~ \"Data/Lib\" kept\n\n: go ( Int -- Int )\n  kept\n";
+        temp.write("src/App.ply", app);
+        let app_path = temp.0.join("src/App.ply");
+        let lib_path = temp.0.join("src/Data/Lib.ply");
+        let mid_path = temp.0.join("src/Data/Mid.ply");
+        super::check_buffer(&app_path, app).unwrap_or_else(|error| {
+            panic!("{}", error.render("App.ply", app))
+        });
+        let hidden = "@\n\n: kept ( Int -- Int )\n  dup drop\n";
+        let notes = super::buffer_notes_open(&app_path, app, &[(&lib_path, hidden)]);
+        let error = notes.error.expect("missing export");
+        assert_eq!(error.code, "PL0091", "{}", error.message);
+        assert!(error.message.contains("kept"), "{}", error.message);
+        let lib = fs::canonicalize(&lib_path).unwrap();
+        assert!(notes.deps.contains(&lib), "{:?}", notes.deps);
+
+        let through = "@ go\n~ \"Data/Mid\" kept\n\n: go ( Int -- Int )\n  kept\n";
+        temp.write("src/App.ply", through);
+        let notes = super::buffer_notes_open(&app_path, through, &[(&lib_path, hidden)]);
+        let error = notes.error.expect("re-export lost kept");
+        assert_eq!(error.code, "PL0091", "{}", error.message);
+        let mid = fs::canonicalize(&mid_path).unwrap();
+        assert!(notes.deps.contains(&lib), "{:?}", notes.deps);
+        assert!(notes.deps.contains(&mid), "{:?}", notes.deps);
     }
 
     #[test]

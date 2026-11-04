@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
 use lsp_types::{
@@ -6,7 +7,8 @@ use lsp_types::{
     TextDocumentSyncCapability, TextDocumentSyncKind,
 };
 use plylang::{
-    buffer_notes, complete, definition, hover_with_sites, utf16_position, CompletionKind, StackAt,
+    buffer_notes_open, complete, definition, hover_with_sites, utf16_position, CompletionKind,
+    StackAt,
 };
 use serde::Deserialize;
 
@@ -35,6 +37,7 @@ fn serve(connection: Connection) -> Result<(), String> {
                 "(".to_string(),
                 ",".to_string(),
                 "=".to_string(),
+                ":".to_string(),
             ]),
             ..CompletionOptions::default()
         }),
@@ -90,24 +93,29 @@ fn serve(connection: Connection) -> Result<(), String> {
             }
             Message::Notification(notification) => {
                 if let Some(uri) = closed_uri(&notification) {
+                    let path = canonical_path(&uri);
                     docs.remove(&uri);
+                    let stale = importers_of(&docs, &path, &uri);
+                    for other in stale {
+                        refresh(&connection, &mut docs, &other)?;
+                    }
                     continue;
                 }
                 if let Some((uri, text)) = document_text(&notification) {
-                    let path = uri_path(&uri);
-                    let notes = buffer_notes(std::path::Path::new(&path), &text);
-                    let published = publish(&uri, &text, notes.error.as_ref());
                     docs.insert(
-                        uri,
+                        uri.clone(),
                         Opened {
                             text,
-                            sites: notes.sites,
+                            sites: Vec::new(),
+                            deps: Vec::new(),
                         },
                     );
-                    connection
-                        .sender
-                        .send(published.into())
-                        .map_err(|error| error.to_string())?;
+                    refresh(&connection, &mut docs, &uri)?;
+                    let path = canonical_path(&uri);
+                    let stale = importers_of(&docs, &path, &uri);
+                    for other in stale {
+                        refresh(&connection, &mut docs, &other)?;
+                    }
                 }
             }
             Message::Response(_) => {}
@@ -317,6 +325,59 @@ fn publish(uri: &str, text: &str, error: Option<&plylang::Diagnostic>) -> Notifi
     }
 }
 
+/// The changed buffer is published, then every open file that loaded it.
+/// The check reads those open buffers, so an unsaved export is already visible.
+fn refresh(
+    connection: &Connection,
+    docs: &mut HashMap<String, Opened>,
+    uri: &str,
+) -> Result<(), String> {
+    let notes = notes_of(docs, uri);
+    let notification = {
+        let text = &docs[uri].text;
+        publish(uri, text, notes.error.as_ref())
+    };
+    if let Some(opened) = docs.get_mut(uri) {
+        opened.sites = notes.sites;
+        opened.deps = notes.deps;
+    }
+    connection
+        .sender
+        .send(notification.into())
+        .map_err(|error| error.to_string())
+}
+
+fn notes_of(docs: &HashMap<String, Opened>, uri: &str) -> plylang::BufferNotes {
+    let path = uri_path(uri);
+    let mut files = Vec::new();
+    for (other, opened) in docs {
+        files.push((uri_path(other), opened.text.as_str()));
+    }
+    let open: Vec<(&Path, &str)> = files
+        .iter()
+        .map(|(file, text)| (Path::new(file.as_str()), *text))
+        .collect();
+    buffer_notes_open(Path::new(&path), &docs[uri].text, &open)
+}
+
+fn importers_of(docs: &HashMap<String, Opened>, path: &Path, skip: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for (uri, opened) in docs {
+        if uri == skip {
+            continue;
+        }
+        if opened.deps.iter().any(|dep| dep == path) {
+            found.push(uri.clone());
+        }
+    }
+    found
+}
+
+fn canonical_path(uri: &str) -> PathBuf {
+    let path = PathBuf::from(uri_path(uri));
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
 fn uri_path(uri: &str) -> String {
     let raw = uri.strip_prefix("file://").unwrap_or(uri);
     let mut bytes = Vec::new();
@@ -340,6 +401,8 @@ fn uri_path(uri: &str) -> String {
 struct Opened {
     text: String,
     sites: Vec<StackAt>,
+    /// Canonical paths loaded by the last check of this buffer.
+    deps: Vec<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -798,6 +861,7 @@ mod tests {
             .unwrap()
             .clone();
         assert!(triggers.iter().any(|item| item == "="));
+        assert!(triggers.iter().any(|item| item == ":"));
 
         client
             .sender
@@ -1010,5 +1074,184 @@ mod tests {
         let line_start = source[..offset].rfind('\n').map(|index| index + 1).unwrap_or(0);
         let character = source[line_start..offset].encode_utf16().count() as u32;
         (line, character)
+    }
+
+    #[test]
+    fn republishes_an_importer_when_an_export_disappears() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "plylang-ls-export-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("src/Data")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            "{\n  \"ply\": { \"language\": 1, \"source\": \"src\", \"out\": \"dist\" }\n}\n",
+        )
+        .unwrap();
+        let lib = "@ kept\n\n: kept ( Int -- Int )\n  dup drop\n";
+        let hidden = "@\n\n: kept ( Int -- Int )\n  dup drop\n";
+        let app = "@ go\n~ \"Data/Lib\" kept\n\n: go ( Int -- Int )\n  kept\n";
+        let other = "@ id\n\n: id ( Int -- Int )\n  dup drop\n";
+        std::fs::write(root.join("src/Data/Lib.ply"), lib).unwrap();
+        std::fs::write(root.join("src/App.ply"), app).unwrap();
+        std::fs::write(root.join("src/Other.ply"), other).unwrap();
+        let lib_uri = url::Url::from_file_path(root.join("src/Data/Lib.ply"))
+            .unwrap()
+            .to_string();
+        let app_uri = url::Url::from_file_path(root.join("src/App.ply"))
+            .unwrap()
+            .to_string();
+        let other_uri = url::Url::from_file_path(root.join("src/Other.ply"))
+            .unwrap()
+            .to_string();
+
+        let (server, client) = Connection::memory();
+        let server = thread::spawn(move || serve(server));
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(1),
+                method: "initialize".to_string(),
+                params: json!({ "processId": null, "capabilities": {} }),
+            }))
+            .unwrap();
+        client
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("initialize response");
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "initialized".to_string(),
+                params: json!({}),
+            }))
+            .unwrap();
+
+        for (uri, text) in [(&lib_uri, lib), (&app_uri, app), (&other_uri, other)] {
+            client
+                .sender
+                .send(Message::Notification(Notification {
+                    method: "textDocument/didOpen".to_string(),
+                    params: json!({
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": "ply",
+                            "version": 1,
+                            "text": text,
+                        }
+                    }),
+                }))
+                .unwrap();
+            let opened = drain_diagnostics(&client);
+            assert_eq!(opened.len(), 1, "{opened:?}");
+            assert_eq!(opened[0]["uri"], *uri);
+            assert!(opened[0]["diagnostics"].as_array().unwrap().is_empty(), "{opened:?}");
+        }
+
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "textDocument/didChange".to_string(),
+                params: json!({
+                    "textDocument": { "uri": lib_uri },
+                    "contentChanges": [{ "text": hidden }],
+                }),
+            }))
+            .unwrap();
+        let published = drain_diagnostics(&client);
+        assert_eq!(published.len(), 2, "{published:?}");
+        assert_eq!(published[0]["uri"], lib_uri);
+        assert!(published[0]["diagnostics"].as_array().unwrap().is_empty(), "{published:?}");
+        assert_eq!(published[1]["uri"], app_uri);
+        let message = published[1]["diagnostics"][0]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("PL0091:"),
+            "{message}"
+        );
+        assert!(message.contains("does not export kept"), "{message}");
+        assert!(!published.iter().any(|item| item["uri"] == other_uri));
+
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "textDocument/didChange".to_string(),
+                params: json!({
+                    "textDocument": { "uri": lib_uri },
+                    "contentChanges": [{ "text": lib }],
+                }),
+            }))
+            .unwrap();
+        let cleared = drain_diagnostics(&client);
+        assert_eq!(cleared.len(), 2, "{cleared:?}");
+        assert_eq!(cleared[0]["uri"], lib_uri);
+        assert_eq!(cleared[1]["uri"], app_uri);
+        assert!(cleared[1]["diagnostics"].as_array().unwrap().is_empty(), "{cleared:?}");
+
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "textDocument/didChange".to_string(),
+                params: json!({
+                    "textDocument": { "uri": lib_uri },
+                    "contentChanges": [{ "text": hidden }],
+                }),
+            }))
+            .unwrap();
+        let hidden_again = drain_diagnostics(&client);
+        assert_eq!(hidden_again.len(), 2, "{hidden_again:?}");
+        assert!(
+            hidden_again[1]["diagnostics"][0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("PL0091:"),
+            "{hidden_again:?}"
+        );
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "textDocument/didClose".to_string(),
+                params: json!({ "textDocument": { "uri": lib_uri } }),
+            }))
+            .unwrap();
+        let closed = drain_diagnostics(&client);
+        assert_eq!(closed.len(), 1, "{closed:?}");
+        assert_eq!(closed[0]["uri"], app_uri);
+        assert!(closed[0]["diagnostics"].as_array().unwrap().is_empty(), "{closed:?}");
+
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(2),
+                method: "shutdown".to_string(),
+                params: json!(null),
+            }))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "exit".to_string(),
+                params: json!(null),
+            }))
+            .unwrap();
+        server.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn drain_diagnostics(client: &Connection) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        let mut wait = Duration::from_secs(2);
+        while let Ok(message) = client.receiver.recv_timeout(wait) {
+            let Message::Notification(notification) = message else {
+                panic!("expected diagnostics, got {message:?}");
+            };
+            assert_eq!(notification.method, "textDocument/publishDiagnostics");
+            out.push(notification.params);
+            wait = Duration::from_millis(200);
+        }
+        out
     }
 }
