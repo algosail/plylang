@@ -881,6 +881,8 @@ fn resets(state: Place, token: &Token, _next: Option<&&Token>) -> bool {
             | Place::Signature
             | Place::ImportList
             | Place::ImportString
+            | Place::DataName
+            | Place::DataParams
             | Place::DataCtor
             | Place::DataFields
             | Place::DataGap
@@ -1758,6 +1760,15 @@ mod tests {
             .into_iter()
             .map(|item| item.label)
             .collect()
+    }
+
+    #[test]
+    fn completes_words_after_a_foreign_type() {
+        let source = "; foreign Promise a\n\n: fork ( a. (Promise a) -- a )\n  aw";
+        let items = labels(source, "aw");
+        assert!(items.iter().any(|label| label == "fork"), "{items:?}");
+        assert!(items.iter().any(|label| label == "dup"), "{items:?}");
+        assert!(!items.iter().any(|label| label == "Promise"), "{items:?}");
     }
 
     #[test]

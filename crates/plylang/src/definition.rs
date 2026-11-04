@@ -425,6 +425,25 @@ mod tests {
     }
 
     #[test]
+    fn a_word_after_a_foreign_type_is_still_a_value() {
+        let source = "\
+; foreign Promise a
+
+: await ( a. (Promise a) -- a )
+  drop
+
+: fork ( a. (Promise a) -- a )
+  await
+";
+        let declared = jump(source, at(source, "await"));
+        let used = jump(source, at_offset(source, source.rfind("await").unwrap()));
+        assert_eq!(declared.span, used.span);
+        assert_eq!(slice(source, used.span), "await");
+        let fork = jump(source, at(source, "fork"));
+        assert_eq!(slice(source, fork.span), "fork");
+    }
+
+    #[test]
     fn jumps_to_a_synonym() {
         let source = "; Person = Person name : Str, age : Num\n- Human Person\n\n: older ( Human -- Human )\n  dup name>>\n";
         let declared = jump(source, at(source, "Human"));
