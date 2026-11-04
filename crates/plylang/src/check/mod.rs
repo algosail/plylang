@@ -613,6 +613,11 @@ struct Checker {
     derived: Vec<Item>,
     /// Place names in this check. The reader scheme lives in `words`.
     places: HashSet<String>,
+    /// Modules whose instances are already in `instances`. The import graph
+    /// reaches one prelude module by many paths. Entering it again elaborates
+    /// the same instances onto the type buffer, and one editor check then
+    /// grows past a gigabyte.
+    seen_instances: HashSet<String>,
 }
 
 impl Checker {
@@ -668,6 +673,7 @@ impl Checker {
             renamed: HashMap::new(),
             derived: Vec::new(),
             places: HashSet::new(),
+            seen_instances: HashSet::new(),
         };
         checker.preload();
         checker
@@ -724,6 +730,7 @@ impl Checker {
         self.renamed.clear();
         self.derived.clear();
         self.places.clear();
+        self.seen_instances.clear();
         self.preload();
     }
 
@@ -1385,7 +1392,7 @@ impl Checker {
         for (remote, local) in import.bindings(&surface) {
             self.export_surface_name(origin, &remote, &local, &remote, import, known)?;
         }
-        self.import_instance_surface(origin, known, &mut HashSet::new())?;
+        self.import_instance_surface(origin, known)?;
         Ok(())
     }
 
@@ -4666,19 +4673,20 @@ impl Checker {
     }
 
     /// Instances written in `origin`, plus instances reached through its imports.
+    /// A module is entered once. Dropping it from the path afterwards walked
+    /// every path through the import graph and copied each instance again.
     fn import_instance_surface(
         &mut self,
         origin: &str,
         known: &[KnownModule],
-        stack: &mut HashSet<String>,
     ) -> Result<(), Diagnostic> {
-        if !stack.insert(origin.to_string()) {
+        if self.seen_instances.contains(origin) {
             return Ok(());
         }
         let Some(known_module) = known_at(known, origin) else {
-            stack.remove(origin);
             return Ok(());
         };
+        self.seen_instances.insert(origin.to_string());
         let key = instance_key(known_module);
         for item in &known_module.module.items {
             if let Item::Instance(instance) = item {
@@ -4689,9 +4697,8 @@ impl Checker {
             let Some(dep) = known_module.deps.get(index) else {
                 continue;
             };
-            self.import_instance_surface(dep, known, stack)?;
+            self.import_instance_surface(dep, known)?;
         }
-        stack.remove(origin);
         Ok(())
     }
 
