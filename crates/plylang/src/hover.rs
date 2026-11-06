@@ -653,19 +653,7 @@ mod tests {
 
     #[test]
     fn hovers_a_pattern_name_as_its_type() {
-        let source = "\
-; Maybe a = Nothing | Just a
-
-: fact ( Int -- Int )
-  n -> n dup drop
-
-: from ( (Maybe Int) -- Int )
-  (Just x) -> x
-  Nothing -> 0n
-
-: choose ( Int Str -- Str )
-  n text -> text
-";
+        let source = "; Maybe a = Nothing | Just a\n\n: fact ( Int -- Int )\n  n -> n dup drop\n\n: from ( (Maybe Int) -- Int )\n  (Just x) -> x\n  (Nothing ..) -> 0n\n\n: choose ( Int Str -- Str )\n  n text -> text\n";
         let pattern = source.find("n ->").unwrap();
         let (line, character) = at_offset(source, pattern);
         let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();

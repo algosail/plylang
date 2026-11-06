@@ -540,7 +540,7 @@ mod tests {
         temp.write("package.json", &package_json("shelf"));
         temp.write(
             "src/Age.ply",
-            ".. An age in years.\n\n@ Age, older, zero\n\n.. A wrapper.\n; Age == Age Num\n\n.. One year older.\n: older ( Age -- Age )\n  Age -> 1 add Age\n\n.. True when the number is zero.\n: foreign zero ( Num -- Bool )\n\n.. Hidden.\n: step ( Num -- Num )\n  1 add\n",
+            ".. An age in years.\n\n@ Age, older, zero\n\n.. A wrapper.\n; Age == Age Num\n\n.. One year older.\n: older ( Age -- Age )\n  (Age ..) -> 1 add Age\n\n.. True when the number is zero.\n: foreign zero ( Num -- Bool )\n\n.. Hidden.\n: step ( Num -- Num )\n  1 add\n",
         );
         temp.write(
             "src/Equal.ply",
@@ -552,7 +552,7 @@ mod tests {
         );
         temp.write(
             "src/Data/Maybe.ply",
-            "@ Maybe, Nothing, Just, fromMaybe\n\n.. Nothing is absence. Just carries one field.\n..\n.. The type name is not a constructor.\n; Maybe a = Nothing | Just a\n\n.. The spare value stays.\n: fromMaybe ( a (Maybe a) -- a )\n  Nothing ->\n  Just -> nip\n\n# Equal (Maybe a)\n  eq = eqMaybe\n",
+            "@ Maybe, Nothing, Just, fromMaybe\n\n.. Nothing is absence. Just carries one field.\n..\n.. The type name is not a constructor.\n; Maybe a = Nothing | Just a\n\n.. The spare value stays.\n: fromMaybe ( a (Maybe a) -- a )\n  (Nothing ..) ->\n  (Just ..) -> nip\n\n# Equal (Maybe a)\n  eq = eqMaybe\n",
         );
         temp.write(
             "src/Data/List/NonEmpty.ply",

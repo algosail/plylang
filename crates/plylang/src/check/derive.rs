@@ -611,8 +611,11 @@ fn shift_pattern(pattern: &mut crate::ast::Pattern, base: u32) {
                 shift_pattern(field, base);
             }
         }
-        crate::ast::Pattern::Wild | crate::ast::Pattern::Lit(_) | crate::ast::Pattern::Unpack(_) => {
-        }
+        crate::ast::Pattern::Wild
+        | crate::ast::Pattern::Spill
+        | crate::ast::Pattern::Lit(_)
+        | crate::ast::Pattern::Unpack(_)
+        | crate::ast::Pattern::Open(_) => {}
     }
 }
 

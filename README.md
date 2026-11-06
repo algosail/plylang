@@ -131,7 +131,7 @@ When the first line of a body is patterns and `->`, the whole body is equations.
 
 `true` together with `false` covers `Bool`. `Num`, `Int`, and `Str` need a final branch with a name or `_`.
 
-A bare constructor puts its fields on the stack from left to right, the last field on top. Parentheses hold one slot: `(Just x)` names the field and does not put it until the name is mentioned. `(Person n _)` names the first field of `Person` and discards the second.
+A bare constructor checks the tag and leaves the value. `(Ctor ..)` spills every field, last on top. `(Just x)` names the one field and does not put it until the name is mentioned. `(Person n _)` is positional: the first field is kept under `n` and the second is discarded. `(Person age name)` binds by name, in either order, when every name is a field. `(Person)` is an error. `(Some (Array Num) items)` checks that the field is an array of numbers and names that array. The check runs when the field's type is still open. `(Some (Array Num))` without a name is an error. `(Some (Num) ..)` checks and spills that number. `(Some (Num) _)` only checks.
 
 An array in a pattern has a fixed length. `<>` matches only the empty array. One length does not cover every `Array`.
 
@@ -149,21 +149,23 @@ An array in a pattern has a fixed length. `<>` matches only the empty array. One
 ; Maybe a = Nothing | Just a
 
 : fromMaybe ( a (Maybe a) -- a )
-  Nothing ->
-  Just -> nip
+  (Nothing ..) ->
+  (Just ..) -> nip
 
 : mapMaybe ( (Maybe a) (a -- b) -- (Maybe b) )
-  Nothing q -> q drop Nothing
+  (Nothing ..) q -> q drop Nothing
   (Just x) q -> x q call Just
 ```
 
-The empty body of the `Nothing` branch leaves the fallback value. For `Just` the field lands above it, and `nip` drops what is underneath. In `mapMaybe` the quotation is the top: `q` names it, and `(Just x)` names the field.
+The empty body of the `(Nothing ..)` branch leaves the fallback value. For `Just`, `(Just ..)` puts the field above it, and `nip` drops what is underneath. In `mapMaybe` the quotation is the top: `q` names it, and `(Just x)` names the field. A bare `Just` would leave the `Maybe` in place.
 
 A list with its own structure is a separate type. The head sits in the constructor, and the tail is another value of that type.
 
 ```ply
 ; List a = Nil | Cons head : a, tail : (List a)
 ```
+
+A `|` may stand before the first constructor, so every arm starts in the same column.
 
 Zero fields and one field have no names. `Nothing` stores nothing. `Just a` stores one value, and the equation names it. Two or more fields are `name : Type`, separated by commas. A second positional type is [PL0117](docs/Errors.md#pl0117). One named field is [PL0118](docs/Errors.md#pl0118).
 
@@ -177,7 +179,7 @@ Zero fields and one field have no names. `Nothing` stores nothing. `Just a` stor
   >>snd
 ```
 
-`Pair` the word takes the fields in that order, last on top. `frs>>` consumes the pair and leaves the field. When the pair is still needed, copy it first: `dup frs>>`. `>>snd` takes the new field above the pair and returns a new pair. The previous pair is a separate value. A sum has no reader: `->` picks the constructor. `name>>` on `Maybe` is [PL0119](docs/Errors.md#pl0119). `frs>>` on `Int`, on a type variable, or on a synonym of `Num` is [PL0063](docs/Errors.md#pl0063). A missing field is [PL0120](docs/Errors.md#pl0120).
+`Pair` the word takes the fields in that order, last on top. `frs>>` consumes the pair and leaves the field. When the pair is still needed, copy it first: `dup frs>>`. `>>snd` takes the new field above the pair and returns a new pair. The previous pair is a separate value. A field on every constructor, with the same type, is `name>>`. A field of one constructor is read after that constructor's check: `Sent -> body>>`. `name>>` on `Maybe` is [PL0119](docs/Errors.md#pl0119). `frs>>` on `Int`, on a type variable, or on a synonym of `Num` is [PL0063](docs/Errors.md#pl0063). A missing field is [PL0120](docs/Errors.md#pl0120). `(Page)` is [PL0136](docs/Errors.md#pl0136).
 
 In JavaScript a constructor with no fields is `{ tag: "Nothing" }`. One field is `(value) => ({ tag: "Just", value })`. Named fields are properties: `(v0, v1) => ({ tag: "Pair", frs: v0, snd: v1 })`.
 
@@ -224,7 +226,7 @@ Parameters are written as they are on a type: `- Twin a (Pair a a)`. In a slot a
 ; Age == Age Num
 
 : older ( Age -- Age )
-  Age -> 1 add Age
+  (Age ..) -> 1 add Age
 ```
 
 Zero fields, two fields, or two constructors do not fit `==`. A type with `=` is for those.

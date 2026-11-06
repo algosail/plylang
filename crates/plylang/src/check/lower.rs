@@ -22,6 +22,7 @@ use crate::diagnostic::Diagnostic;
 use crate::codes::Error;
 use crate::span::Span;
 
+use super::clauses::{group_type_tests, FieldMatch, SlotPat};
 use super::{Checker, Dict, EffectId, StackId, StackNode, TyId, TyNode};
 
 pub(crate) fn to_anf(module: &Module) -> Result<AnfModule, Diagnostic> {
@@ -1444,6 +1445,7 @@ impl Checker {
     ) -> Result<(), Diagnostic> {
         match pattern {
             Pattern::Wild => Ok(()),
+            Pattern::Spill => Err(self.error(span, Error::ExpectedPattern)),
             Pattern::Bind(_, name) => {
                 if binds.contains_key(name) {
                     return Err(self.error(span, Error::DuplicateDefinition(name.to_string())));
@@ -1464,58 +1466,71 @@ impl Checker {
             }
             Pattern::Unpack(name) => {
                 let shape = self.ctor_shape(name, ty, span)?;
-                let newtype = shape.newtype;
-                let tag = shape.tag.clone();
-                if !newtype {
+                if !shape.newtype {
                     conds.push(Cond {
                         root,
                         steps: steps.to_vec(),
-                        test: PatTest::Tag(tag),
+                        test: PatTest::Tag(shape.tag.clone()),
                     });
                 }
-                let width = shape.fields.len();
-                let names = shape.names;
-                for (index, field) in shape.fields.into_iter().enumerate() {
-                    let id = if newtype {
-                        self.materialize(arm, root, steps)
-                    } else {
-                        let mut child = steps.to_vec();
-                        child.push(Self::field_step(index, width, names.get(index)));
-                        self.materialize(arm, root, &child)
-                    };
-                    self.note_fn(id, field);
-                    *arm_stack = self.stack_cons(*arm_stack, field);
-                    arm.stack.push(Operand::Local(id));
-                }
+                let id = self.materialize(arm, root, steps);
+                self.note_fn(id, ty);
+                *arm_stack = self.stack_cons(*arm_stack, ty);
+                self.note_refine(*arm_stack, &shape.tag);
+                arm.stack.push(Operand::Local(id));
                 Ok(())
+            }
+            Pattern::Open(name) => {
+                self.spill_ctor(name, ty, root, steps, conds, arm_stack, arm, span)
             }
             Pattern::Ctor(name, patterns) => {
                 let shape = self.ctor_shape(name, ty, span)?;
-                let newtype = shape.newtype;
-                let tag = shape.tag.clone();
-                if patterns.len() != shape.fields.len() {
-                    let count = shape.fields.len();
-                    return Err(self.error(
-                        span,
-                        Error::PatternArity { name: name.to_string(), count },
-                    ));
+                if let Some(groups) = group_type_tests(patterns, shape.fields.len()) {
+                    if self.type_test_heads(&groups) {
+                        return self.lower_type_tests(
+                            &shape,
+                            &groups,
+                            root,
+                            steps,
+                            conds,
+                            binds,
+                            schemes,
+                            arm_stack,
+                            arm,
+                            span,
+                        );
+                    }
                 }
+                let mode = self.ctor_match(name, &shape, patterns, span)?;
+                let newtype = shape.newtype;
                 if !newtype {
                     conds.push(Cond {
                         root,
                         steps: steps.to_vec(),
-                        test: PatTest::Tag(tag),
+                        test: PatTest::Tag(shape.tag.clone()),
                     });
                 }
                 let width = shape.fields.len();
-                let names = shape.names;
-                for (index, field) in shape.fields.into_iter().enumerate() {
+                let names = shape.names.clone();
+                let paired: Vec<(usize, TyId)> = match mode {
+                    FieldMatch::Positional => shape
+                        .fields
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .collect(),
+                    FieldMatch::Named(indexes) => indexes
+                        .into_iter()
+                        .map(|index| (index, shape.fields[index]))
+                        .collect(),
+                };
+                for (pattern, (index, field)) in patterns.iter().zip(paired) {
                     let mut child = steps.to_vec();
                     if !newtype {
                         child.push(Self::field_step(index, width, names.get(index)));
                     }
                     self.lower_pattern(
-                        &patterns[index],
+                        pattern,
                         field,
                         root,
                         &child,
@@ -1575,6 +1590,123 @@ impl Checker {
                 Ok(())
             }
         }
+    }
+
+    /// Tag first, then a witness on each tested field. A name is the pattern type.
+    /// `..` pushes that value now.
+    fn lower_type_tests(
+        &mut self,
+        shape: &super::clauses::CtorShape,
+        groups: &[SlotPat],
+        root: LocalId,
+        steps: &[Access],
+        conds: &mut Vec<Cond>,
+        binds: &mut HashMap<String, LocalId>,
+        schemes: &mut HashMap<String, super::SemScheme>,
+        arm_stack: &mut StackId,
+        arm: &mut Frame,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        if !shape.newtype {
+            conds.push(Cond {
+                root,
+                steps: steps.to_vec(),
+                test: PatTest::Tag(shape.tag.clone()),
+            });
+        }
+        let width = shape.fields.len();
+        for (index, group) in groups.iter().enumerate() {
+            let mut child = steps.to_vec();
+            if !shape.newtype {
+                child.push(Self::field_step(index, width, shape.names.get(index)));
+            }
+            match group {
+                SlotPat::Plain(pattern) => {
+                    self.lower_pattern(
+                        pattern,
+                        shape.fields[index],
+                        root,
+                        &child,
+                        conds,
+                        binds,
+                        schemes,
+                        arm_stack,
+                        arm,
+                        span,
+                    )?;
+                }
+                SlotPat::Test { ty, bind } => {
+                    let witness = self.check_type_test(ty, shape.fields[index], span)?;
+                    if let Some(test) = witness.test {
+                        conds.push(Cond {
+                            root,
+                            steps: child.clone(),
+                            test: PatTest::Shape(test),
+                        });
+                    }
+                    match bind {
+                        Pattern::Bind(_, name) => {
+                            if binds.contains_key(name) {
+                                return Err(self.error(
+                                    span,
+                                    Error::DuplicateDefinition(name.clone()),
+                                ));
+                            }
+                            let id = self.materialize(arm, root, &child);
+                            self.note_fn(id, witness.ty);
+                            binds.insert(name.clone(), id);
+                            schemes.insert(name.clone(), self.binding_scheme(witness.ty));
+                        }
+                        Pattern::Spill => {
+                            let id = self.materialize(arm, root, &child);
+                            self.note_fn(id, witness.ty);
+                            *arm_stack = self.stack_cons(*arm_stack, witness.ty);
+                            arm.stack.push(Operand::Local(id));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `(Name ..)` puts every field on the stack. A newtype's one field is the value.
+    fn spill_ctor(
+        &mut self,
+        name: &str,
+        ty: TyId,
+        root: LocalId,
+        steps: &[Access],
+        conds: &mut Vec<Cond>,
+        arm_stack: &mut StackId,
+        arm: &mut Frame,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let shape = self.ctor_shape(name, ty, span)?;
+        let newtype = shape.newtype;
+        if !newtype {
+            conds.push(Cond {
+                root,
+                steps: steps.to_vec(),
+                test: PatTest::Tag(shape.tag),
+            });
+        }
+        let width = shape.fields.len();
+        let names = shape.names;
+        for (index, field) in shape.fields.into_iter().enumerate() {
+            let id = if newtype {
+                self.materialize(arm, root, steps)
+            } else {
+                let mut child = steps.to_vec();
+                child.push(Self::field_step(index, width, names.get(index)));
+                self.materialize(arm, root, &child)
+            };
+            self.note_fn(id, field);
+            *arm_stack = self.stack_cons(*arm_stack, field);
+            arm.stack.push(Operand::Local(id));
+        }
+        Ok(())
     }
 
     /// A named field is `obj.name`. A positional field is `obj.value` or `obj.valueN`.
@@ -2376,11 +2508,11 @@ mod tests {
   dup iadd
 
 : fromMaybe ( a. a (Maybe a) -- a )
-  Nothing ->
-  Just -> nip
+  (Nothing ..) ->
+  (Just ..) -> nip
 
 : mapMaybe ( a b. (Maybe a) (a -- b) -- (Maybe b) )
-  Nothing q -> q drop Nothing
+  (Nothing ..) q -> q drop Nothing
   (Just x) q -> x q call Just
 
 : bumpUnder ( (Int) (Int) -- (Int) (Int) )
@@ -2432,8 +2564,8 @@ mod tests {
   if
 
 : fromRight ( a b. b (Either a b) -- b )
-  Left -> drop
-  Right -> nip
+  (Left ..) -> drop
+  (Right ..) -> nip
 
 ; Either a b = Left a | Right b
 "#,
@@ -2614,17 +2746,7 @@ if (choose(1, 2, false) !== 2) throw new Error("choose false " + choose(1, 2, fa
 
     #[test]
     fn javascript_runs_the_maybe_example() {
-        let source = "\
-; Maybe a = Nothing | Just a
-
-: fromMaybe ( a (Maybe a) -- a )
-  Nothing ->
-  Just -> nip
-
-: mapMaybe ( (Maybe a) (a -- b) -- (Maybe b) )
-  Nothing q -> q drop Nothing
-  (Just x) q -> x q call Just
-";
+        let source = "; Maybe a = Nothing | Just a\n\n: fromMaybe ( a (Maybe a) -- a )\n  (Nothing ..) ->\n  (Just ..) -> nip\n\n: mapMaybe ( (Maybe a) (a -- b) -- (Maybe b) )\n  (Nothing ..) q -> q drop Nothing\n  (Just x) q -> x q call Just\n";
         let module = parse(source, ParseMode::Source).unwrap();
         let code = javascript(&module).unwrap_or_else(|error| panic!("{}", error.message));
         let dir = std::env::temp_dir().join(format!("plylang-maybe-{}", std::process::id()));
@@ -2654,15 +2776,157 @@ if (mapped.tag !== "Just" || mapped.value !== 42n) throw new Error("map just " +
     }
 
     #[test]
+    fn javascript_runs_a_type_test() {
+        let code = js(
+            r#"
+; Option a = None | Some a
+
+: take ( (Option (Array Num)) -- (Array Num) )
+  (Some (Array Num) items) -> items
+  (None ..) -> < >
+"#,
+        );
+        assert!(
+            !code.contains("Array.isArray") && !code.contains("typeof"),
+            "{code}"
+        );
+        let code = js(
+            r#"
+; Option a = None | Some a
+
+: normalized ( (Option a) -- (Array Num) )
+  (Some (Array Num) items) -> items
+  (Some (Array (Array Num)) _) -> < >
+  _ -> < >
+"#,
+        );
+        assert!(
+            code.contains("Array.isArray(v0.value)")
+                && code.contains("typeof e0 === \"number\"")
+                && code.contains("typeof e1 === \"number\""),
+            "{code}"
+        );
+        run(
+            r#"
+; Option a = None | Some a
+
+: normalized ( (Option a) -- (Array Num) )
+  (Some (Array Num) items) -> items
+  (Some (Array Str) _) -> < 1 >
+  _ -> < 2 >
+
+: kind ( (Option a) -- Num )
+  (Some (Bool) _) -> 1
+  (Some (Int) _) -> 2
+  (Some (Str) _) -> 3
+  (Some (Num) _) -> 4
+  (Some (Array (Array Num)) _) -> 5
+  _ -> 0
+"#,
+            r#"
+const nums = normalized(Some([1, 2]));
+if (nums.length !== 2 || nums[0] !== 1 || nums[1] !== 2) throw new Error("nums " + nums);
+if (normalized(Some([])).length !== 0) throw new Error("empty");
+const strs = normalized(Some(["a"]));
+if (strs.length !== 1 || strs[0] !== 1) throw new Error("strs " + strs);
+const mixed = normalized(Some([1, "a"]));
+if (mixed.length !== 1 || mixed[0] !== 2) throw new Error("mixed " + mixed);
+const none = normalized(None);
+if (none.length !== 1 || none[0] !== 2) throw new Error("none " + none);
+const other = normalized(Some(true));
+if (other.length !== 1 || other[0] !== 2) throw new Error("other " + other);
+const big = normalized(Some([1n]));
+if (big.length !== 1 || big[0] !== 2) throw new Error("bigint elem " + big);
+if (kind(Some(true)) !== 1) throw new Error("bool");
+if (kind(Some(false)) !== 1) throw new Error("bool false");
+if (kind(Some(1n)) !== 2) throw new Error("int");
+if (kind(Some("a")) !== 3) throw new Error("str");
+if (kind(Some(1)) !== 4) throw new Error("num");
+if (kind(Some(NaN)) !== 4) throw new Error("nan");
+if (kind(Some([[1, 2]])) !== 5) throw new Error("grid");
+if (kind(Some([["a"]])) !== 0) throw new Error("grid str");
+if (kind(Some([1, 2])) !== 0) throw new Error("flat");
+if (kind(None) !== 0) throw new Error("kind none");
+"#,
+        );
+    }
+
+    #[test]
+    fn javascript_runs_a_spilled_type_test() {
+        let concrete = js(
+            r#"
+; Option a = None | Some a
+; Age == Age Num
+
+: take ( (Option Num) -- Num )
+  (Some (Num) ..) ->
+  (None ..) -> 0
+
+: years ( Age -- Num )
+  (Age (Num) ..) ->
+"#,
+        );
+        assert!(!concrete.contains("typeof"), "{concrete}");
+        run(
+            r#"
+; Option a = None | Some a
+; Pair a b = Pair frs : a, snd : b
+; Age == Age Num
+
+: amount ( (Option a) -- Num )
+  (Some (Num) ..) ->
+  _ -> 0
+
+: items ( (Option a) -- (Array Num) )
+  (Some (Array Num) ..) ->
+  _ -> < 0 >
+
+: halves ( a b. (Pair a b) -- Num Str )
+  (Pair (Num) .. (Str) ..) ->
+  _ -> 0 ""
+
+: take ( (Option Num) -- Num )
+  (Some (Num) ..) ->
+  (None ..) -> 0
+
+: years ( Age -- Num )
+  (Age (Num) ..) ->
+"#,
+            r#"
+if (amount(Some(1)) !== 1) throw new Error("one");
+if (amount(Some("a")) !== 0) throw new Error("str");
+if (amount(None) !== 0) throw new Error("none");
+if (!Number.isNaN(amount(Some(NaN)))) throw new Error("nan");
+const empty = items(Some([]));
+if (empty.length !== 0) throw new Error("empty " + empty);
+const nums = items(Some([1, 2]));
+if (nums.length !== 2 || nums[0] !== 1 || nums[1] !== 2) throw new Error("nums " + nums);
+const other = items(Some(["a"]));
+if (other.length !== 1 || other[0] !== 0) throw new Error("other " + other);
+const mixed = items(Some([1, "a"]));
+if (mixed.length !== 1 || mixed[0] !== 0) throw new Error("mixed " + mixed);
+if (items(None).length !== 1 || items(None)[0] !== 0) throw new Error("items none");
+const both = halves(Pair(1, "a"));
+if (both[0] !== 1 || both[1] !== "a") throw new Error("both " + both);
+const bad = halves(Pair("a", 1));
+if (bad[0] !== 0 || bad[1] !== "") throw new Error("bad " + bad);
+if (take(Some(4)) !== 4) throw new Error("take");
+if (take(None) !== 0) throw new Error("take none");
+if (years(36) !== 36) throw new Error("years");
+"#,
+        );
+    }
+
+    #[test]
     fn javascript_runs_a_three_arm_match() {
         run(
             r#"
 ; Color = Red | Green | Blue
 
 : code ( Color -- Int )
-  Red -> 1n
-  Green -> 2n
-  Blue -> 3n
+  (Red ..) -> 1n
+  (Green ..) -> 2n
+  (Blue ..) -> 3n
 "#,
             r#"
 if (code(Red) !== 1n) throw new Error("red");
@@ -2703,7 +2967,7 @@ if (code(Blue) !== 3n) throw new Error("blue");
   map ( a b. (f a) (a -- b) -- (f b) )
 
 : mapMaybe ( a b. (Maybe a) (a -- b) -- (Maybe b) )
-  Nothing q -> q drop Nothing
+  (Nothing ..) q -> q drop Nothing
   (Just x) q -> x q call Just
 
 # Functor Maybe
@@ -2758,9 +3022,9 @@ if (divInt(1n, 0n).tag !== "Nothing") throw new Error("div0");
   eq = eqInt
 
 : eqMaybe ( a. Eq a => (Maybe a) (Maybe a) -- Bool )
-  Nothing Nothing -> true
-  (Just _) Nothing -> false
-  Nothing (Just _) -> false
+  (Nothing ..) (Nothing ..) -> true
+  (Just _) (Nothing ..) -> false
+  (Nothing ..) (Just _) -> false
   (Just x) (Just y) -> x y eq
 
 # Eq (Maybe a)
@@ -2970,7 +3234,7 @@ if (hashed(Pair(1n, 2n)) !== 33n) throw new Error("hash " + hashed(Pair(1n, 2n))
   Just
 
 : bindMaybe ( (Maybe a) (a -- (Maybe b)) -- (Maybe b) )
-  Nothing _ -> Nothing
+  (Nothing ..) _ -> Nothing
   (Just x) f -> x f call
 
 # Liftable Maybe
@@ -3037,7 +3301,7 @@ if (next.at !== 11 || next.id !== 1 || next.tag !== "Entry") throw new Error("ne
 "#,
         );
         let tagged = js(
-            "; Entry = Entry tag : Num, at : Num | Nope\n\n: read ( Entry -- Num )\n  (Entry n _) -> n\n  Nope -> 0\n",
+            "; Entry = Entry tag : Num, at : Num | Nope\n\n: read ( Entry -- Num )\n  (Entry n _) -> n\n  (Nope ..) -> 0\n",
         );
         assert!(tagged.contains("tag: \"Entry\""), "{tagged}");
         assert!(tagged.contains("$tag: v0"), "{tagged}");
@@ -3049,11 +3313,11 @@ if (next.at !== 11 || next.id !== 1 || next.tag !== "Entry") throw new Error("ne
 
 : kind ( Entry -- Int )
   (Entry _ _) -> 0n
-  Nope -> 1n
+  (Nope ..) -> 1n
 
 : read ( Entry -- Num )
   (Entry n _) -> n
-  Nope -> 0
+  (Nope ..) -> 0
 "#,
             r#"
 const row = Entry(7, 10);
@@ -3079,6 +3343,46 @@ if (row.tag !== "Row" || row.$tag !== 7 || row.at !== 10) throw new Error("store
 if (read(row) !== 7) throw new Error("read");
 const next = move(row, 8);
 if (row.$tag !== 7 || next.$tag !== 8 || next.tag !== "Row" || next.at !== 10) throw new Error("moved " + JSON.stringify(next));
+"#,
+        );
+    }
+
+    #[test]
+    fn a_bare_constructor_keeps_and_updates_its_value() {
+        let source = "\
+; Response = Sent status : Num, body : Str | Redirect status : Num, location : Str
+
+: emptied ( Response -- Response )
+  Sent -> \"\" >>body
+  Redirect ->
+
+: bodyOf ( Response -- Str )
+  Sent -> body>>
+  Redirect -> location>>
+
+: spill ( Response -- Num Str )
+  (Sent ..) ->
+  (Redirect ..) ->
+";
+        let code = js(source);
+        assert!(code.contains(".tag === \"Sent\""), "{code}");
+        assert!(code.contains("body:"), "{code}");
+        run(
+            source,
+            r#"
+const sent = Sent(200, "hello");
+const cleared = emptied(sent);
+if (sent.body !== "hello") throw new Error("old " + JSON.stringify(sent));
+if (cleared.tag !== "Sent" || cleared.body !== "" || cleared.status !== 200) {
+  throw new Error("cleared " + JSON.stringify(cleared));
+}
+if (bodyOf(sent) !== "hello") throw new Error("body");
+const redirect = Redirect(301, "/away");
+if (emptied(redirect) !== redirect && JSON.stringify(emptied(redirect)) !== JSON.stringify(redirect)) {
+  throw new Error("redirect " + JSON.stringify(emptied(redirect)));
+}
+const spilled = spill(sent);
+if (spilled[0] !== 200 || spilled[1] !== "hello") throw new Error("spill " + JSON.stringify(spilled));
 "#,
         );
     }
@@ -3416,7 +3720,7 @@ if (round(7) !== 7) throw new Error("round");
     #[test]
     fn javascript_erases_a_newtype_and_expands_a_synonym() {
         let code = js(
-            "; Age == Age Num\n\n: older ( Age -- Age )\n  Age -> Age\n",
+            "; Age == Age Num\n\n: older ( Age -- Age )\n  (Age ..) -> Age\n",
         );
         assert!(code.contains("export const Age = (value) => value;"));
         assert!(!code.contains("tag: \"Age\""));
@@ -3433,7 +3737,7 @@ if (round(7) !== 7) throw new Error("round");
 ; Age == Age Num
 
 : olderAge ( Age -- Age )
-  Age -> 1 nadd Age
+  (Age ..) -> 1 nadd Age
 "#,
             r#"
 function nadd(a, b) { return a + b; }
@@ -3449,7 +3753,7 @@ if (olderAge(36) !== 37) throw new Error("age");
     #[test]
     fn javascript_runs_clauses() {
         let code = js(
-            ": foreign at ( (Array a) Num -- a )\n\n; Maybe a = Nothing | Just a\n\n: second ( (Maybe (Array Num)) -- Num )\n  Nothing -> 0\n  (Just xs) -> xs 0 at\n",
+            ": foreign at ( (Array a) Num -- a )\n\n; Maybe a = Nothing | Just a\n\n: second ( (Maybe (Array Num)) -- Num )\n  (Nothing ..) -> 0\n  (Just xs) -> xs 0 at\n",
         );
         assert!(code.contains("at("), "{code}");
         assert!(!code.contains("function at"), "{code}");
@@ -3472,7 +3776,7 @@ if (olderAge(36) !== 37) throw new Error("age");
   n -> n dup 1n isub fact imul
 
 : mapMaybe ( a b. (Maybe a) (a -- b) -- (Maybe b) )
-  Nothing q -> q drop Nothing
+  (Nothing ..) q -> q drop Nothing
   (Just x) q -> x q call Just
 
 : divInt ( Int Int -- (Maybe Int) )
@@ -3480,20 +3784,20 @@ if (olderAge(36) !== 37) throw new Error("age");
   x y -> x y idiv Just
 
 : fromMaybe ( a. a (Maybe a) -- a )
-  x Nothing -> x
+  x (Nothing ..) -> x
   x (Just y) -> y
 
 : flatten ( a. (Maybe (Maybe a)) -- (Maybe a) )
-  Nothing -> Nothing
-  (Just Nothing) -> Nothing
+  (Nothing ..) -> Nothing
+  (Just (Nothing ..)) -> Nothing
   (Just (Just x)) -> x Just
 
 : fromJust ( (Maybe Int) -- Int )
-  Nothing -> 0n
-  Just ->
+  (Nothing ..) -> 0n
+  (Just ..) ->
 
 : isJust ( a. (Maybe a) -- Bool )
-  Nothing -> false
+  (Nothing ..) -> false
   (Just _) -> true
 
 : swapped ( a b. a b -- b a )
@@ -3509,7 +3813,7 @@ if (olderAge(36) !== 37) throw new Error("age");
   (Age n) -> n
 
 : second ( (Maybe (Array Num)) -- Num )
-  Nothing -> 0
+  (Nothing ..) -> 0
   (Just xs) -> xs 0 at
 
 : isEmpty ( (Array a) -- Bool )

@@ -405,6 +405,11 @@ impl Parser {
         let mut ctors = Vec::new();
         loop {
             self.skip_newlines();
+            // A leading `|` lines the constructors up. It is not a constructor.
+            if ctors.is_empty() {
+                let _ = self.eat(&TokenKind::Pipe);
+                self.skip_newlines();
+            }
             if self.is_eof() || self.is_item_start() {
                 break;
             }
@@ -955,8 +960,11 @@ impl Parser {
         Ok(Pattern::Array(elements))
     }
 
-    /// `(Just x)` is one slot. A bare name inside is a field pattern, so
-    /// `(Just Just)` unpacks the inner constructor and `(Just)` has no fields.
+    /// `(Just x)` is one slot. `(Just ..)` spills the fields.
+    /// `(Some (Num) ..)` is a type test that spills the witnessed value.
+    /// `..` after anything other than a parenthesized type is not a pattern.
+    /// A bare name inside is a field pattern, so `(Just Just)` checks the inner
+    /// constructor and `(Just)` has no fields.
     fn parse_paren_pattern(&mut self) -> Result<Pattern, Diagnostic> {
         self.bump();
         self.group_depth += 1;
@@ -966,6 +974,16 @@ impl Parser {
             return Err(self.error(Error::ExpectedConstructor));
         }
         let name = self.expect_qualified(Error::ExpectedConstructor)?;
+        self.skip_newlines();
+        if self.eat(&TokenKind::All) {
+            self.skip_newlines();
+            if !self.eat(&TokenKind::RParen) {
+                self.group_depth -= 1;
+                return Err(self.error(Error::ExpectedRParen));
+            }
+            self.group_depth -= 1;
+            return Ok(Pattern::Open(name));
+        }
         let mut fields = Vec::new();
         loop {
             self.skip_newlines();
@@ -975,6 +993,16 @@ impl Parser {
             }
             if self.is_eof() {
                 return Err(self.error(Error::ExpectedRParen));
+            }
+            // `..` spills only the type just written. `(Some ..)` was already
+            // taken as `Open`. `(Pair x ..)` stays `expected pattern`.
+            if self.is(TokenKind::All) {
+                if !matches!(fields.last(), Some(Pattern::Ctor(_, _))) {
+                    return Err(self.error(Error::ExpectedPattern));
+                }
+                self.bump();
+                fields.push(Pattern::Spill);
+                continue;
             }
             if !self.starts_pattern() {
                 return Err(self.error(Error::ExpectedPattern));
@@ -2001,6 +2029,39 @@ mod tests {
         assert_eq!(
             err("; Option a = None | Some value : a\n", ParseMode::Source),
             "a single field has no name"
+        );
+    }
+
+    #[test]
+    fn a_leading_bar_lines_up_constructors() {
+        let flat = ok("; Response = Sent status : Num, headers : (StrMap Str), cookies : (Array Cookie), type : Str, body : Str | Redirect status : Num, location : Str, headers : (StrMap Str), cookies : (Array Cookie) | Failure status : Num, message : Str, headers : (StrMap Str), cookies : (Array Cookie)\n");
+        let lined = ok("\
+; Response =
+  | Sent
+      status : Num,
+      headers : (StrMap Str),
+      cookies : (Array Cookie),
+      type : Str,
+      body : Str
+  | Redirect
+      status : Num,
+      location : Str,
+      headers : (StrMap Str),
+      cookies : (Array Cookie)
+  | Failure
+      status : Num,
+      message : Str,
+      headers : (StrMap Str),
+      cookies : (Array Cookie)
+");
+        assert_eq!(lined, flat);
+        assert_eq!(
+            ok("; Maybe a = | Nothing | Just a\n"),
+            ok("; Maybe a = Nothing | Just a\n")
+        );
+        assert_eq!(
+            err("; Response = |\n", ParseMode::Source),
+            "expected constructor"
         );
     }
 

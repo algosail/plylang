@@ -202,8 +202,11 @@ pub struct Clause {
     pub body: Vec<Term>,
 }
 
-/// One stack slot. A bare constructor unpacks its fields onto the stack.
-/// Parentheses keep the constructor in that one slot.
+/// One stack slot. A bare constructor checks the tag and leaves the value.
+/// `(Name ..)` spills every field. `(Name a b)` names those fields.
+/// `(Some (Array Num) items)` is still `Ctor`: the checker reads the extra
+/// pattern as a type test when the count is not the field count.
+/// `(Some (Num) ..)` is that test with `Spill`: the value is pushed at once.
 /// An array matches one fixed length. Index 0 is the left element.
 /// A record reads the fields it names. The row tail stays in the type.
 #[derive(Debug, Clone, PartialEq)]
@@ -212,7 +215,12 @@ pub enum Pattern {
     /// A name for this slot. The span is the name, so a hover can show its type.
     Bind(Span, String),
     Lit(Lit),
+    /// Check the constructor and leave the value, narrowed to it.
     Unpack(String),
+    /// `(Name ..)`. Check the constructor and spill every field. Last is on top.
+    Open(String),
+    /// `..` after a type test. The witnessed value is pushed when the arm matches.
+    Spill,
     Ctor(String, Vec<Pattern>),
     Array(Vec<Pattern>),
     /// `{ name : n, age : a }`. Empty `{}` binds nothing.
@@ -760,7 +768,9 @@ fn clause_string(clause: &Clause) -> String {
 fn pattern_string(pattern: &Pattern) -> String {
     match pattern {
         Pattern::Wild => "_".to_string(),
+        Pattern::Spill => "..".to_string(),
         Pattern::Bind(_, name) | Pattern::Unpack(name) => name.clone(),
+        Pattern::Open(name) => format!("({name} ..)"),
         Pattern::Lit(lit) => lit_string(lit),
         Pattern::Ctor(name, fields) => {
             let mut out = format!("({name}");

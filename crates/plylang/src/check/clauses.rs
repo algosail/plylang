@@ -2,19 +2,29 @@
 //! the leftmost pattern is the deepest of the matched slots, the rightmost is the top.
 //! A name is a local. It is not on the stack until the body mentions it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::anf::ShapeTest;
 use crate::ast::{Clause, Def, Lit, Pattern};
 use crate::diagnostic::Diagnostic;
 use crate::codes::Error;
 use crate::span::Span;
 
-use super::{Checker, StackId, TyId, TyNode};
+use super::{Checker, RowId, StackId, StackNode, TyId, TyNode};
 
 pub(super) struct ClauseInfo {
     pub binds: Vec<(String, TyId)>,
-    pub pushes: Vec<TyId>,
+    /// Values the pattern puts back, and the constructor a kept value is narrowed to.
+    pub pushes: Vec<(TyId, Option<String>)>,
+}
+
+/// How `(Name …)` lines up with the constructor's fields.
+pub(super) enum FieldMatch {
+    /// Zip patterns with fields in declaration order. A nullary `(None)` is this.
+    Positional,
+    /// Each pattern is a bind. The index is that pattern's field.
+    Named(Vec<usize>),
 }
 
 pub(super) struct PreparedClauses {
@@ -29,6 +39,20 @@ pub(super) struct CtorShape {
     pub newtype: bool,
     /// Tag stored on the value. A renamed pattern still matches the defining name.
     pub tag: String,
+}
+
+/// One field of a grouped constructor pattern.
+pub(super) enum SlotPat<'a> {
+    Plain(&'a Pattern),
+    /// A parenthesized type, then a name, `_`, or `..`.
+    Test { ty: &'a Pattern, bind: &'a Pattern },
+}
+
+/// The type the binder has, and the witness to emit. `test` is absent when the
+/// field is already that type.
+pub(super) struct TypeWitness {
+    pub ty: TyId,
+    pub test: Option<ShapeTest>,
 }
 
 /// What a slot can still be. `Open` is an infinite scalar with some literals removed.
@@ -110,8 +134,11 @@ impl Checker {
         let mut outputs = Vec::new();
         for (clause, info) in def.clauses.iter().zip(&prepared.infos) {
             let mut arm = prepared.rest;
-            for ty in &info.pushes {
+            for (ty, ctor) in &info.pushes {
                 arm = self.stack_cons(arm, *ty);
+                if let Some(ctor) = ctor {
+                    self.note_refine(arm, ctor);
+                }
             }
             let mut frame = HashMap::new();
             for (name, ty) in &info.binds {
@@ -198,10 +225,11 @@ impl Checker {
         ty: TyId,
         span: Span,
         binds: &mut Vec<(String, TyId)>,
-        pushes: &mut Vec<TyId>,
+        pushes: &mut Vec<(TyId, Option<String>)>,
     ) -> Result<(), Diagnostic> {
         match pattern {
             Pattern::Wild => Ok(()),
+            Pattern::Spill => Err(self.error(span, Error::ExpectedPattern)),
             Pattern::Bind(name_span, name) => {
                 if binds.iter().any(|(bound, _)| bound == name) {
                     return Err(self.error(span, Error::DuplicateDefinition(name.to_string())));
@@ -218,18 +246,34 @@ impl Checker {
             }
             Pattern::Unpack(name) => {
                 let shape = self.ctor_shape(name, ty, span)?;
-                pushes.extend(shape.fields);
+                pushes.push((ty, Some(shape.tag)));
+                Ok(())
+            }
+            Pattern::Open(name) => {
+                let shape = self.ctor_shape(name, ty, span)?;
+                for field in shape.fields {
+                    pushes.push((field, None));
+                }
                 Ok(())
             }
             Pattern::Ctor(name, patterns) => {
                 let shape = self.ctor_shape(name, ty, span)?;
-                let fields = shape.fields;
-                if patterns.len() != fields.len() {
-                    let count = fields.len();
-                    return Err(self.error(span, Error::PatternArity { name: name.to_string(), count }));
+                if let Some(groups) = group_type_tests(patterns, shape.fields.len()) {
+                    if self.type_test_heads(&groups) {
+                        return self.effect_type_tests(&shape, &groups, span, binds, pushes);
+                    }
                 }
-                for (pattern, field) in patterns.iter().zip(&fields) {
-                    self.pattern_effect(pattern, *field, span, binds, pushes)?;
+                match self.ctor_match(name, &shape, patterns, span)? {
+                    FieldMatch::Positional => {
+                        for (pattern, field) in patterns.iter().zip(&shape.fields) {
+                            self.pattern_effect(pattern, *field, span, binds, pushes)?;
+                        }
+                    }
+                    FieldMatch::Named(indexes) => {
+                        for (pattern, index) in patterns.iter().zip(&indexes) {
+                            self.pattern_effect(pattern, shape.fields[*index], span, binds, pushes)?;
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -338,6 +382,286 @@ impl Checker {
         })
     }
 
+    /// `(Name)` with fields is an error. A full list of patterns is positional,
+    /// including derive's `(Person l0 l1)` and `(Sent _ headers _ _ _)`.
+    /// A full list of distinct field names, and any shorter list of names, binds
+    /// those fields. Order does not matter. An unknown name is `no field`.
+    pub(super) fn ctor_match(
+        &self,
+        name: &str,
+        shape: &CtorShape,
+        patterns: &[Pattern],
+        span: Span,
+    ) -> Result<FieldMatch, Diagnostic> {
+        if patterns.is_empty() {
+            if shape.fields.is_empty() {
+                return Ok(FieldMatch::Positional);
+            }
+            return Err(self.error(span, Error::PatternForm(name.to_string())));
+        }
+        // `..` here was not the binder of a type test. `(Pair (Num) ..)` is this.
+        if patterns.iter().any(|pattern| matches!(pattern, Pattern::Spill)) {
+            return Err(self.error(span, Error::PatternForm(name.to_string())));
+        }
+        let all_binds = patterns.iter().all(|pattern| matches!(pattern, Pattern::Bind(..)));
+        let all_named = shape.names.iter().all(|field| field.is_some());
+        let by_name = all_binds
+            && all_named
+            && (patterns.len() != shape.fields.len() || binds_name_fields(patterns, &shape.names));
+        if by_name {
+            let mut indexes = Vec::with_capacity(patterns.len());
+            for pattern in patterns {
+                let Pattern::Bind(_, field) = pattern else {
+                    return Err(self.error(span, Error::PatternForm(name.to_string())));
+                };
+                let Some(index) = shape
+                    .names
+                    .iter()
+                    .position(|have| have.as_deref() == Some(field.as_str()))
+                else {
+                    return Err(self.error(
+                        span,
+                        Error::NoSuchField {
+                            type_name: name.to_string(),
+                            name: field.clone(),
+                        },
+                    ));
+                };
+                indexes.push(index);
+            }
+            return Ok(FieldMatch::Named(indexes));
+        }
+        if patterns.len() == shape.fields.len() {
+            return Ok(FieldMatch::Positional);
+        }
+        if all_binds {
+            let count = shape.fields.len();
+            return Err(self.error(
+                span,
+                Error::PatternArity { name: name.to_string(), count },
+            ));
+        }
+        Err(self.error(span, Error::PatternForm(name.to_string())))
+    }
+
+    /// `(Some (Array Num) items)` binds `items` at `(Array Num)`. The field type
+    /// stays as it was: a variable is not unified with the pattern.
+    fn effect_type_tests(
+        &mut self,
+        shape: &CtorShape,
+        groups: &[SlotPat],
+        span: Span,
+        binds: &mut Vec<(String, TyId)>,
+        pushes: &mut Vec<(TyId, Option<String>)>,
+    ) -> Result<(), Diagnostic> {
+        for (index, group) in groups.iter().enumerate() {
+            match group {
+                SlotPat::Plain(pattern) => {
+                    self.pattern_effect(pattern, shape.fields[index], span, binds, pushes)?;
+                }
+                SlotPat::Test { ty, bind } => {
+                    let witness = self.check_type_test(ty, shape.fields[index], span)?;
+                    self.bind_type_test(bind, witness.ty, span, binds, pushes)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A parenthesized type, then the name of that value. `None` when the field
+    /// is already that type and no runtime test is needed.
+    pub(super) fn check_type_test(
+        &mut self,
+        pattern: &Pattern,
+        field: TyId,
+        span: Span,
+    ) -> Result<TypeWitness, Diagnostic> {
+        let ty = self.pattern_type(pattern, span)?;
+        if !self.types_overlap(field, ty) {
+            return Err(self.error(span, self.ty_mismatch(ty, field)));
+        }
+        if self.same_ground(field, ty) {
+            return Ok(TypeWitness { ty, test: None });
+        }
+        match self.shape_of_ty(ty) {
+            Some(test) => Ok(TypeWitness { ty, test: Some(test) }),
+            None => Err(self.error(span, Error::PatternCannotTest(self.show_ty(ty)))),
+        }
+    }
+
+    fn bind_type_test(
+        &mut self,
+        bind: &Pattern,
+        ty: TyId,
+        span: Span,
+        binds: &mut Vec<(String, TyId)>,
+        pushes: &mut Vec<(TyId, Option<String>)>,
+    ) -> Result<(), Diagnostic> {
+        match bind {
+            Pattern::Wild => Ok(()),
+            Pattern::Spill => {
+                pushes.push((ty, None));
+                Ok(())
+            }
+            Pattern::Bind(name_span, name) => {
+                if binds.iter().any(|(bound, _)| bound == name) {
+                    return Err(self.error(span, Error::DuplicateDefinition(name.to_string())));
+                }
+                binds.push((name.clone(), ty));
+                self.note_pattern_bind(*name_span, ty);
+                Ok(())
+            }
+            _ => unreachable!("a type test binder is a name, _, or .."),
+        }
+    }
+
+    /// The head of every type test is a type. A value constructor falls through
+    /// to the ordinary pattern, so `(Some (Right text) extra)` stays an error.
+    pub(super) fn type_test_heads(&self, groups: &[SlotPat]) -> bool {
+        groups.iter().all(|group| match group {
+            SlotPat::Plain(_) => true,
+            SlotPat::Test { ty, .. } => match ty {
+                Pattern::Ctor(name, _) | Pattern::Unpack(name) => self.type_known(name),
+                _ => false,
+            },
+        })
+    }
+
+    fn type_known(&self, name: &str) -> bool {
+        self.type_arity.contains_key(name)
+            || self.extra_arity.contains_key(name)
+            || (self.hidden_type_visible()
+                && (self.datas.contains_key(name) || self.synonyms.contains_key(name)))
+    }
+
+    fn pattern_type(&mut self, pattern: &Pattern, span: Span) -> Result<TyId, Diagnostic> {
+        match pattern {
+            Pattern::Bind(..) | Pattern::Wild => Ok(self.ty_var()),
+            Pattern::Unpack(name) => self.pattern_ctor(name, Vec::new(), span),
+            Pattern::Ctor(name, args) => {
+                let mut ids = Vec::with_capacity(args.len());
+                for arg in args {
+                    ids.push(self.pattern_type(arg, span)?);
+                }
+                self.pattern_ctor(name, ids, span)
+            }
+            _ => Err(self.error(span, Error::PatternCannotTest("that pattern".into()))),
+        }
+    }
+
+    fn pattern_ctor(
+        &mut self,
+        name: &str,
+        args: Vec<TyId>,
+        span: Span,
+    ) -> Result<TyId, Diagnostic> {
+        let arity = self.arity_of(name, span)?;
+        if args.len() != arity {
+            return Err(self.arity_error(span, name, arity));
+        }
+        if self.syn_in_scope(name) {
+            let (id, kind) = self.expand_synonym(name, &args, span)?;
+            self.demand_type(id, kind, span)?;
+            return Ok(id);
+        }
+        let canon = self.canonical(name).to_string();
+        Ok(self.ty_ctor(&canon, args))
+    }
+
+    /// A variable on either side still overlaps. This does not bind it.
+    fn types_overlap(&self, left: TyId, right: TyId) -> bool {
+        self.overlap_ty(left, right, &mut HashSet::new())
+    }
+
+    fn overlap_ty(&self, left: TyId, right: TyId, seen: &mut HashSet<(u32, u32)>) -> bool {
+        let left = self.expose(left);
+        let right = self.expose(right);
+        if left == right {
+            return true;
+        }
+        let key = if left.0 < right.0 {
+            (left.0, right.0)
+        } else {
+            (right.0, left.0)
+        };
+        if !seen.insert(key) {
+            return true;
+        }
+        match (&self.tys[left.0 as usize], &self.tys[right.0 as usize]) {
+            (TyNode::Var | TyNode::Rigid(_) | TyNode::Template, _)
+            | (_, TyNode::Var | TyNode::Rigid(_) | TyNode::Template) => true,
+            (TyNode::Ctor(left_name, left_args), TyNode::Ctor(right_name, right_args)) => {
+                left_name == right_name
+                    && left_args.len() == right_args.len()
+                    && left_args
+                        .iter()
+                        .zip(right_args)
+                        .all(|(left, right)| self.overlap_ty(*left, *right, seen))
+            }
+            _ => false,
+        }
+    }
+
+    fn same_ground(&self, left: TyId, right: TyId) -> bool {
+        self.type_is_ground(left) && self.type_is_ground(right) && self.congruent_ty(left, right)
+    }
+
+    fn type_is_ground(&self, ty: TyId) -> bool {
+        self.ground_ty(ty, &mut HashSet::new())
+    }
+
+    fn ground_ty(&self, ty: TyId, seen: &mut HashSet<u32>) -> bool {
+        let ty = self.expose(ty);
+        if !seen.insert(ty.0) {
+            return true;
+        }
+        match &self.tys[ty.0 as usize] {
+            TyNode::Var | TyNode::Rigid(_) | TyNode::Template => false,
+            TyNode::Ctor(_, args) => args.iter().all(|arg| self.ground_ty(*arg, seen)),
+            TyNode::App(head, args) => {
+                self.ground_ty(*head, seen) && args.iter().all(|arg| self.ground_ty(*arg, seen))
+            }
+            TyNode::Fun(input, output, _) => {
+                self.ground_stack(*input, seen) && self.ground_stack(*output, seen)
+            }
+            TyNode::Record(row) => self.ground_row(*row, seen),
+            TyNode::Link(_) | TyNode::Alias { .. } => true,
+        }
+    }
+
+    fn ground_stack(&self, stack: StackId, seen: &mut HashSet<u32>) -> bool {
+        match &self.stacks[self.find_stack(stack).0 as usize] {
+            StackNode::Cons(rest, ty) => self.ground_ty(*ty, seen) && self.ground_stack(*rest, seen),
+            StackNode::Empty => true,
+            StackNode::Var | StackNode::Rigid { .. } | StackNode::Template | StackNode::Link(_) => {
+                false
+            }
+        }
+    }
+
+    fn ground_row(&self, row: RowId, seen: &mut HashSet<u32>) -> bool {
+        match self.peel_row(row) {
+            Ok((fields, None)) => fields.iter().all(|(_, field)| self.ground_ty(*field, seen)),
+            _ => false,
+        }
+    }
+
+    /// `Num`, `Int`, `Str`, `Bool`, and arrays of those. A variable element is any array.
+    fn shape_of_ty(&self, ty: TyId) -> Option<ShapeTest> {
+        let ty = self.expose(ty);
+        match &self.tys[ty.0 as usize] {
+            TyNode::Ctor(name, args) if args.is_empty() => scalar_shape(name),
+            TyNode::Ctor(name, args) if name == "Array" && args.len() == 1 => {
+                let elem = self.expose(args[0]);
+                match &self.tys[elem.0 as usize] {
+                    TyNode::Var | TyNode::Rigid(_) => Some(ShapeTest::Array(None)),
+                    _ => Some(ShapeTest::Array(Some(Box::new(self.shape_of_ty(elem)?)))),
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn exhaust(
         &mut self,
         clauses: &[Clause],
@@ -396,7 +720,9 @@ impl Checker {
 
     fn canonical_pattern(&self, pattern: &mut Pattern) {
         match pattern {
-            Pattern::Unpack(name) => *name = self.canonical(name).to_string(),
+            Pattern::Unpack(name) | Pattern::Open(name) => {
+                *name = self.canonical(name).to_string();
+            }
             Pattern::Ctor(name, fields) => {
                 *name = self.canonical(name).to_string();
                 for field in fields {
@@ -413,7 +739,7 @@ impl Checker {
                     self.canonical_pattern(field);
                 }
             }
-            Pattern::Wild | Pattern::Bind(_, _) | Pattern::Lit(_) => {}
+            Pattern::Wild | Pattern::Spill | Pattern::Bind(_, _) | Pattern::Lit(_) => {}
         }
     }
 
@@ -539,6 +865,71 @@ impl Checker {
     }
 }
 
+/// `(Some (Array Num) items)` is two patterns for one field: a parenthesized
+/// type, then a name, `_`, or `..`. Grouping runs only when the counts differ, so
+/// `(Person (Some name) age)` stays two positional fields.
+pub(super) fn group_type_tests<'a>(patterns: &'a [Pattern], slots: usize) -> Option<Vec<SlotPat<'a>>> {
+    if patterns.len() == slots {
+        return None;
+    }
+    let grouped = partition_slots(patterns, slots)?;
+    if grouped.iter().any(|slot| matches!(slot, SlotPat::Test { .. })) {
+        Some(grouped)
+    } else {
+        None
+    }
+}
+
+fn partition_slots<'a>(patterns: &'a [Pattern], slots: usize) -> Option<Vec<SlotPat<'a>>> {
+    if slots == 0 {
+        return if patterns.is_empty() { Some(Vec::new()) } else { None };
+    }
+    if patterns.len() < slots {
+        return None;
+    }
+    if patterns.len() > slots {
+        if let Some(head) = type_test_at(patterns) {
+            if let Some(mut rest) = partition_slots(&patterns[2..], slots - 1) {
+                rest.insert(0, head);
+                return Some(rest);
+            }
+        }
+    }
+    let mut rest = partition_slots(&patterns[1..], slots - 1)?;
+    rest.insert(0, SlotPat::Plain(&patterns[0]));
+    Some(rest)
+}
+
+fn type_test_at<'a>(patterns: &'a [Pattern]) -> Option<SlotPat<'a>> {
+    let (head, tail) = patterns.split_first()?;
+    let Pattern::Ctor(_, _) = head else {
+        return None;
+    };
+    let (bind, _) = tail.split_first()?;
+    if matches!(bind, Pattern::Bind(..) | Pattern::Wild | Pattern::Spill) {
+        Some(SlotPat::Test { ty: head, bind })
+    } else {
+        None
+    }
+}
+
+/// Every bind is a different field of this constructor.
+fn binds_name_fields(patterns: &[Pattern], names: &[Option<String>]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    for pattern in patterns {
+        let Pattern::Bind(_, name) = pattern else {
+            return false;
+        };
+        if !names.iter().any(|field| field.as_deref() == Some(name.as_str())) {
+            return false;
+        }
+        if !seen.insert(name.as_str()) {
+            return false;
+        }
+    }
+    true
+}
+
 fn row_hit(row: &[Need], patterns: &[Pattern]) -> bool {
     patterns
         .iter()
@@ -552,6 +943,7 @@ fn overlaps(pattern: &Pattern, need: &Need) -> bool {
     }
     match pattern {
         Pattern::Wild | Pattern::Bind(..) => true,
+        Pattern::Spill => false,
         Pattern::Lit(Lit::Bool(true)) => match need {
             Need::Bool { yes, .. } => *yes,
             Need::Exact(Lit::Bool(true)) => true,
@@ -569,16 +961,25 @@ fn overlaps(pattern: &Pattern, need: &Need) -> bool {
             Need::Exact(other) => other == lit,
             _ => false,
         },
-        Pattern::Unpack(name) => live_ctor(need, name).is_some(),
+        Pattern::Unpack(name) | Pattern::Open(name) => live_ctor(need, name).is_some(),
         Pattern::Ctor(name, patterns) => {
             let Some(fields) = live_ctor(need, name) else {
                 return false;
             };
-            patterns.len() == fields.len()
-                && patterns
+            if let Some(groups) = group_type_tests(patterns, fields.len()) {
+                return groups
                     .iter()
                     .zip(fields)
-                    .all(|(pattern, field)| overlaps(pattern, field))
+                    .all(|(group, field)| group_overlaps(group, field));
+            }
+            // A named subset covers the constructor. Its binds are irrefutable.
+            if patterns.len() != fields.len() {
+                return true;
+            }
+            patterns
+                .iter()
+                .zip(fields)
+                .all(|(pattern, field)| overlaps(pattern, field))
         }
         Pattern::Array(patterns) => match need {
             Need::Array { elem, open, apart } => match part_of(apart, patterns.len()) {
@@ -642,6 +1043,7 @@ fn subtract_slot(need: &Need, pattern: &Pattern) -> Vec<Need> {
     }
     match pattern {
         Pattern::Wild | Pattern::Bind(..) => Vec::new(),
+        Pattern::Spill => vec![need.clone()],
         _ if matches!(need, Need::Any) => vec![Need::Any],
         Pattern::Lit(Lit::Bool(true)) => match need {
             Need::Bool { no: true, .. } => vec![Need::Bool { yes: false, no: true }],
@@ -663,21 +1065,7 @@ fn subtract_slot(need: &Need, pattern: &Pattern) -> Vec<Need> {
             Need::Exact(_) => Vec::new(),
             _ => vec![need.clone()],
         },
-        Pattern::Unpack(name) => match need {
-            Need::Data { ctors } => {
-                let left: Vec<_> = ctors
-                    .iter()
-                    .filter(|ctor| ctor.name != *name && ctor.fields.is_some())
-                    .cloned()
-                    .collect();
-                if left.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![Need::Data { ctors: left }]
-                }
-            }
-            _ => vec![need.clone()],
-        },
+        Pattern::Unpack(name) | Pattern::Open(name) => without_ctor(need, name),
         Pattern::Ctor(name, patterns) => match need {
             Need::Data { ctors } => {
                 let mut others = Vec::new();
@@ -695,30 +1083,187 @@ fn subtract_slot(need: &Need, pattern: &Pattern) -> Vec<Need> {
                 let Some(fields) = target.fields else {
                     return vec![need.clone()];
                 };
+                if let Some(groups) = group_type_tests(patterns, fields.len()) {
+                    return subtract_grouped(need, name, &fields, &groups, others);
+                }
                 if patterns.len() != fields.len() {
-                    return vec![need.clone()];
+                    return without_ctor(need, name);
                 }
-                let owned: Vec<Need> = fields.iter().map(|field| (**field).clone()).collect();
-                let remainders = subtract_row(&owned, patterns);
-                let mut out = Vec::new();
-                if !others.is_empty() {
-                    out.push(Need::Data { ctors: others });
-                }
-                for remainder in remainders {
-                    out.push(Need::Data {
-                        ctors: vec![CtorNeed {
-                            name: name.clone(),
-                            fields: Some(remainder.into_iter().map(Rc::new).collect()),
-                        }],
-                    });
-                }
-                out
+                assemble(name, others, subtract_fields(&fields, patterns))
             }
             _ => vec![need.clone()],
         },
         Pattern::Array(patterns) => subtract_array(need, patterns),
         Pattern::Record(fields) => subtract_record(need, fields),
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rel {
+    Miss,
+    Partial,
+    Hit,
+}
+
+fn scalar_shape(name: &str) -> Option<ShapeTest> {
+    match name {
+        "Num" => Some(ShapeTest::Num),
+        "Int" => Some(ShapeTest::Int),
+        "Str" => Some(ShapeTest::Str),
+        "Bool" => Some(ShapeTest::Bool),
+        _ => None,
+    }
+}
+
+fn shape_of_pattern(pattern: &Pattern) -> Option<ShapeTest> {
+    match pattern {
+        Pattern::Ctor(name, args) if name == "Array" && args.len() == 1 => {
+            if matches!(args[0], Pattern::Bind(..) | Pattern::Wild) {
+                Some(ShapeTest::Array(None))
+            } else {
+                Some(ShapeTest::Array(Some(Box::new(shape_of_pattern(&args[0])?))))
+            }
+        }
+        Pattern::Ctor(name, args) if args.is_empty() => scalar_shape(name),
+        Pattern::Unpack(name) => scalar_shape(name),
+        _ => None,
+    }
+}
+
+fn type_rel(pattern: &Pattern, need: &Need) -> Rel {
+    match shape_of_pattern(pattern) {
+        Some(shape) => shape_rel(&shape, need),
+        // A data type is accepted only when the field is already that type.
+        None => match need {
+            Need::Any | Need::Deep => Rel::Partial,
+            _ => Rel::Hit,
+        },
+    }
+}
+
+fn shape_rel(shape: &ShapeTest, need: &Need) -> Rel {
+    match (shape, need) {
+        (_, Need::Any | Need::Deep) => Rel::Partial,
+        (ShapeTest::Num, Need::Open { name, .. }) if name == "Num" => Rel::Hit,
+        (ShapeTest::Num, Need::Exact(Lit::Number(_))) => Rel::Hit,
+        (ShapeTest::Int, Need::Open { name, .. }) if name == "Int" => Rel::Hit,
+        (ShapeTest::Int, Need::Exact(Lit::Int(_))) => Rel::Hit,
+        (ShapeTest::Str, Need::Open { name, .. }) if name == "Str" => Rel::Hit,
+        (ShapeTest::Str, Need::Exact(Lit::String(_))) => Rel::Hit,
+        (ShapeTest::Bool, Need::Bool { .. } | Need::Exact(Lit::Bool(_))) => Rel::Hit,
+        (ShapeTest::Array(None), Need::Array { .. }) => Rel::Hit,
+        (ShapeTest::Array(Some(elem)), Need::Array { elem: need_elem, .. }) => {
+            shape_rel(elem, need_elem)
+        }
+        _ => Rel::Miss,
+    }
+}
+
+fn group_overlaps(group: &SlotPat, field: &Need) -> bool {
+    match group {
+        SlotPat::Plain(pattern) => overlaps(pattern, field),
+        SlotPat::Test { ty, .. } => type_rel(ty, field) != Rel::Miss,
+    }
+}
+
+/// The test can fail, so the constructor stays in the uncovered set.
+fn group_partial_test(group: &SlotPat, field: &Need) -> bool {
+    match group {
+        SlotPat::Test { ty, .. } => type_rel(ty, field) == Rel::Partial,
+        SlotPat::Plain(_) => false,
+    }
+}
+
+fn slot_as_cover(group: &SlotPat) -> Pattern {
+    match group {
+        SlotPat::Plain(pattern) => (*pattern).clone(),
+        SlotPat::Test { .. } => Pattern::Wild,
+    }
+}
+
+fn subtract_grouped(
+    need: &Need,
+    name: &str,
+    fields: &[Rc<Need>],
+    groups: &[SlotPat],
+    others: Vec<CtorNeed>,
+) -> Vec<Need> {
+    if groups
+        .iter()
+        .zip(fields)
+        .any(|(group, field)| !group_overlaps(group, field))
+    {
+        return vec![need.clone()];
+    }
+    if groups
+        .iter()
+        .zip(fields)
+        .any(|(group, field)| group_partial_test(group, field))
+    {
+        return vec![need.clone()];
+    }
+    let flat: Vec<Pattern> = groups.iter().map(slot_as_cover).collect();
+    assemble(name, others, subtract_fields(fields, &flat))
+}
+
+fn subtract_fields(fields: &[Rc<Need>], patterns: &[Pattern]) -> Vec<Vec<Need>> {
+    let owned: Vec<Need> = fields.iter().map(|field| (**field).clone()).collect();
+    subtract_row(&owned, patterns)
+}
+
+fn assemble(name: &str, others: Vec<CtorNeed>, remainders: Vec<Vec<Need>>) -> Vec<Need> {
+    let mut out = Vec::new();
+    if !others.is_empty() {
+        out.push(Need::Data { ctors: others });
+    }
+    for remainder in remainders {
+        out.push(Need::Data {
+            ctors: vec![CtorNeed {
+                name: name.to_string(),
+                fields: Some(remainder.into_iter().map(Rc::new).collect()),
+            }],
+        });
+    }
+    out
+}
+
+fn covered_fields(name: &str, fields: &[Rc<Need>], patterns: &[Pattern]) -> Option<Need> {
+    let mut covered = Vec::new();
+    for (pattern, field) in patterns.iter().zip(fields) {
+        covered.push(Rc::new(covered_slot(pattern, field)?));
+    }
+    Some(Need::Data {
+        ctors: vec![CtorNeed {
+            name: name.to_string(),
+            fields: Some(covered),
+        }],
+    })
+}
+
+fn without_ctor(need: &Need, name: &str) -> Vec<Need> {
+    let Need::Data { ctors } = need else {
+        return vec![need.clone()];
+    };
+    let left: Vec<_> = ctors
+        .iter()
+        .filter(|ctor| ctor.name != name && ctor.fields.is_some())
+        .cloned()
+        .collect();
+    if left.is_empty() {
+        Vec::new()
+    } else {
+        vec![Need::Data { ctors: left }]
+    }
+}
+
+fn covered_ctor(need: &Need, name: &str) -> Option<Need> {
+    let Need::Data { ctors } = need else {
+        return None;
+    };
+    let ctor = ctors.iter().find(|ctor| ctor.name == name && ctor.fields.is_some())?;
+    Some(Need::Data {
+        ctors: vec![ctor.clone()],
+    })
 }
 
 fn part_of(apart: &[Apart], len: usize) -> Option<&Apart> {
@@ -771,6 +1316,7 @@ fn subtract_array(need: &Need, patterns: &[Pattern]) -> Vec<Need> {
 fn covered_slot(pattern: &Pattern, need: &Need) -> Option<Need> {
     match pattern {
         Pattern::Wild | Pattern::Bind(..) => Some(need.clone()),
+        Pattern::Spill => None,
         _ if matches!(need, Need::Any) => None,
         Pattern::Lit(Lit::Bool(true)) => match need {
             Need::Bool { yes: true, .. } => Some(Need::Bool { yes: true, no: false }),
@@ -791,34 +1337,35 @@ fn covered_slot(pattern: &Pattern, need: &Need) -> Option<Need> {
             Need::Exact(other) if other == lit => Some(Need::Exact(lit.clone())),
             _ => None,
         },
-        Pattern::Unpack(name) => {
-            let Need::Data { ctors } = need else {
-                return None;
-            };
-            let ctor = ctors.iter().find(|ctor| ctor.name == *name && ctor.fields.is_some())?;
-            Some(Need::Data {
-                ctors: vec![ctor.clone()],
-            })
-        }
+        Pattern::Unpack(name) | Pattern::Open(name) => covered_ctor(need, name),
         Pattern::Ctor(name, patterns) => {
             let Need::Data { ctors } = need else {
                 return None;
             };
             let ctor = ctors.iter().find(|ctor| ctor.name == *name && ctor.fields.is_some())?;
             let fields = ctor.fields.as_ref()?;
+            if let Some(groups) = group_type_tests(patterns, fields.len()) {
+                if groups
+                    .iter()
+                    .zip(fields.iter())
+                    .any(|(group, field)| group_partial_test(group, field))
+                {
+                    return None;
+                }
+                if !groups
+                    .iter()
+                    .zip(fields.iter())
+                    .all(|(group, field)| group_overlaps(group, field))
+                {
+                    return None;
+                }
+                let flat: Vec<Pattern> = groups.iter().map(slot_as_cover).collect();
+                return covered_fields(name, fields, &flat);
+            }
             if patterns.len() != fields.len() {
-                return None;
+                return covered_ctor(need, name);
             }
-            let mut covered = Vec::new();
-            for (pattern, field) in patterns.iter().zip(fields) {
-                covered.push(Rc::new(covered_slot(pattern, field)?));
-            }
-            Some(Need::Data {
-                ctors: vec![CtorNeed {
-                    name: name.clone(),
-                    fields: Some(covered),
-                }],
-            })
+            covered_fields(name, fields, patterns)
         }
         Pattern::Array(patterns) => {
             let Need::Array { elem, open, apart } = need else {

@@ -105,6 +105,18 @@ pub enum PatTest {
     Tag(String),
     /// `path.length === n`. The path is the array, not an element.
     Length(usize),
+    /// The value has this runtime shape. A ground type emits no test.
+    Shape(ShapeTest),
+}
+
+/// A shape JavaScript can see. `Array(None)` is any array.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShapeTest {
+    Num,
+    Int,
+    Str,
+    Bool,
+    Array(Option<Box<ShapeTest>>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -526,6 +538,23 @@ fn render_cond(cond: &Cond) -> String {
         PatTest::String(value) => format!("{path} === {}", js_string(value)),
         PatTest::Tag(tag) => format!("{path}.tag === \"{tag}\""),
         PatTest::Length(len) => format!("{path}.length === {len}"),
+        PatTest::Shape(shape) => render_shape(&path, shape, 0),
+    }
+}
+
+/// `e0`, `e1`, … are the element names. Each array gets the next one.
+fn render_shape(path: &str, shape: &ShapeTest, depth: usize) -> String {
+    match shape {
+        ShapeTest::Num => format!("typeof {path} === \"number\""),
+        ShapeTest::Int => format!("typeof {path} === \"bigint\""),
+        ShapeTest::Str => format!("typeof {path} === \"string\""),
+        ShapeTest::Bool => format!("typeof {path} === \"boolean\""),
+        ShapeTest::Array(None) => format!("Array.isArray({path})"),
+        ShapeTest::Array(Some(elem)) => {
+            let name = format!("e{depth}");
+            let inner = render_shape(&name, elem, depth + 1);
+            format!("(Array.isArray({path}) && {path}.every(({name}) => {inner}))")
+        }
     }
 }
 

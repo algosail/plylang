@@ -86,6 +86,9 @@ pub struct StackAt {
     pub span: Span,
     /// Concrete stack before the term. A hidden signature tail is `.` when nothing sits above it.
     pub before: String,
+    /// Constructor narrowing of each value in `before`, left to right. The top is last.
+    /// `None` means the value is the whole type.
+    pub ctors: Vec<Option<String>>,
     /// Stack after the term. Absent when checking stopped on this term.
     pub after: Option<String>,
     /// Instantiated `input -- output` of a word at this use.
@@ -628,6 +631,9 @@ struct Checker {
     /// the same instances onto the type buffer, and one editor check then
     /// grows past a gigabyte.
     seen_instances: HashSet<String>,
+    /// Constructor a cons cell is narrowed to. The key is the cons id.
+    /// A scheme does not carry this. `dup` copies it. A quotation does not.
+    refinements: HashMap<u32, String>,
 }
 
 impl Checker {
@@ -687,6 +693,7 @@ impl Checker {
             inline_hash_mix: false,
             places: HashSet::new(),
             seen_instances: HashSet::new(),
+            refinements: HashMap::new(),
         };
         checker.preload();
         checker
@@ -747,6 +754,7 @@ impl Checker {
         self.inline_hash_mix = false;
         self.places.clear();
         self.seen_instances.clear();
+        self.refinements.clear();
         self.preload();
     }
 
@@ -2001,8 +2009,10 @@ impl Checker {
             return Err(self.error(span, Error::UndefinedWord(name.to_string())));
         };
         let (input, output, effect, constraints) = self.instantiate_scheme(&scheme, false);
+        let aligned = self.align_refine(input, stack);
         self.unify_stack(stack, input)
             .map_err(|message| self.error(span, message))?;
+        self.paint_refine(output, &aligned);
         self.join_effect(effect, span)?;
         self.solve_or_defer(&constraints, span)?;
         if name == "call" && !self.arity_ready(input) {
@@ -2014,6 +2024,71 @@ impl Checker {
         self.settle_ascribed(stack)?;
         self.pending_here = Some((input, output, effect));
         Ok(output)
+    }
+
+    /// Scheme input variables that are one narrowed value. Two slots that share
+    /// a variable and disagree are not narrowed on the output.
+    fn align_refine(&self, scheme: StackId, actual: StackId) -> HashMap<u32, Option<String>> {
+        let mut map = HashMap::new();
+        let mut scheme = self.find_stack(scheme);
+        let mut actual = self.find_stack(actual);
+        loop {
+            let (scheme_rest, scheme_ty, actual_rest, actual_id) = match (
+                self.stacks[scheme.0 as usize].clone(),
+                self.stacks[actual.0 as usize].clone(),
+            ) {
+                (StackNode::Cons(scheme_rest, scheme_ty), StackNode::Cons(actual_rest, _)) => {
+                    (scheme_rest, scheme_ty, actual_rest, actual)
+                }
+                _ => break,
+            };
+            let found = self.find_ty(scheme_ty);
+            if matches!(self.tys[found.0 as usize], TyNode::Var) {
+                let ctor = self.refinements.get(&actual_id.0).cloned();
+                match map.get(&scheme_ty.0) {
+                    None => {
+                        map.insert(scheme_ty.0, ctor);
+                    }
+                    Some(have) => {
+                        if have.as_deref() != ctor.as_deref() || have.is_none() {
+                            map.insert(scheme_ty.0, None);
+                        }
+                    }
+                }
+            }
+            scheme = self.find_stack(scheme_rest);
+            actual = self.find_stack(actual_rest);
+        }
+        map
+    }
+
+    /// Stamp output cons cells whose type variable was narrowed on the input.
+    /// A missing entry leaves the cell alone, including a tail linked to the caller.
+    fn paint_refine(&mut self, stack: StackId, aligned: &HashMap<u32, Option<String>>) {
+        let mut current = self.find_stack(stack);
+        for _ in 0..64 {
+            match self.stacks[current.0 as usize].clone() {
+                StackNode::Cons(rest, ty) => {
+                    if let Some(Some(ctor)) = aligned.get(&ty.0) {
+                        self.refinements.insert(current.0, ctor.clone());
+                    }
+                    current = self.find_stack(rest);
+                }
+                _ => break,
+            }
+        }
+    }
+
+    fn note_refine(&mut self, stack: StackId, ctor: &str) {
+        let id = self.find_stack(stack);
+        if matches!(self.stacks[id.0 as usize], StackNode::Cons(_, _)) {
+            self.refinements.insert(id.0, ctor.to_string());
+        }
+    }
+
+    fn refinement_of(&self, stack: StackId) -> Option<String> {
+        let id = self.find_stack(stack);
+        self.refinements.get(&id.0).cloned()
     }
 
     /// Quotations this word just ascribed. An input that is still a naked
@@ -2206,15 +2281,17 @@ impl Checker {
             .map_err(|message| self.error(span, message))
     }
 
-    /// `name>>` reads one field of a type with one constructor.
+    /// `name>>` reads one field. A narrowed value reads that constructor.
+    /// A field on every constructor, with one type, needs no match.
     fn project_field(
         &mut self,
         span: Span,
         name: &str,
         stack: StackId,
     ) -> Result<StackId, Diagnostic> {
+        let ctor = self.refinement_of(stack);
         let (rest, base_ty) = self.pop_slot(stack, span)?;
-        let Some(field_ty) = self.product_field(base_ty, name, span)? else {
+        let Some(field_ty) = self.product_field(base_ty, name, span, ctor.as_deref())? else {
             return Err(self.error(span, Error::ExpectedDataType(self.show_ty(base_ty))));
         };
         let output = self.stack_cons(rest, field_ty);
@@ -2226,12 +2303,15 @@ impl Checker {
         Ok(output)
     }
 
-    /// Field `name` of a single-constructor type, or `None` when `ty` is not that type.
+    /// Field `name`, or `None` when `ty` is not a data type.
+    /// `ctor` reads that constructor only. Without it, the field must be on
+    /// every constructor with one type.
     fn product_field(
         &mut self,
         ty: TyId,
         name: &str,
         span: Span,
+        ctor: Option<&str>,
     ) -> Result<Option<TyId>, Diagnostic> {
         let ty = self.expose(ty);
         let TyNode::Ctor(data_name, args) = self.tys[ty.0 as usize].clone() else {
@@ -2240,24 +2320,69 @@ impl Checker {
         let Some(data) = self.datas.get(&data_name).cloned() else {
             return Ok(None);
         };
-        if data.ctors.len() != 1 {
-            return Err(self.error(span, Error::FieldOfSeveralConstructors(name.to_string())));
-        }
         if args.len() != data.params.len() {
             return Err(self.error(span, Error::ExpectedDataType(self.show_ty(ty))));
         }
-        let ctor = &data.ctors[0];
-        if self.constructor_open(&data_name, &ctor.name).is_err() {
-            return Err(self.error(span, Error::FieldsPrivate(data_name)));
+        if let Some(ctor_name) = ctor {
+            if let Some(ctor) = data.ctors.iter().find(|item| item.name == ctor_name) {
+                if self.constructor_open(&data_name, &ctor.name).is_err() {
+                    return Err(self.error(span, Error::FieldsPrivate(data_name)));
+                }
+                let Some(index) = ctor.names.iter().position(|field| field.as_deref() == Some(name))
+                else {
+                    return Err(self.error(
+                        span,
+                        Error::NoSuchField {
+                            type_name: ctor.name.clone(),
+                            name: name.to_string(),
+                        },
+                    ));
+                };
+                let fields = self.instantiate_fields(&data.params, &args, &ctor.fields);
+                return Ok(Some(fields[index]));
+            }
         }
-        let Some(index) = ctor.names.iter().position(|field| field.as_deref() == Some(name)) else {
-            return Err(self.error(
-                span,
-                Error::NoSuchField { type_name: data_name, name: name.to_string() },
-            ));
-        };
-        let fields = self.instantiate_fields(&data.params, &args, &ctor.fields);
-        Ok(Some(fields[index]))
+        if data.ctors.len() == 1 {
+            let ctor = &data.ctors[0];
+            if self.constructor_open(&data_name, &ctor.name).is_err() {
+                return Err(self.error(span, Error::FieldsPrivate(data_name)));
+            }
+            let Some(index) = ctor.names.iter().position(|field| field.as_deref() == Some(name))
+            else {
+                return Err(self.error(
+                    span,
+                    Error::NoSuchField { type_name: data_name, name: name.to_string() },
+                ));
+            };
+            let fields = self.instantiate_fields(&data.params, &args, &ctor.fields);
+            return Ok(Some(fields[index]));
+        }
+        if data.ctors.is_empty() {
+            return Err(self.error(span, Error::FieldOfSeveralConstructors(name.to_string())));
+        }
+        let mut shared = None;
+        for ctor in &data.ctors {
+            if self.constructor_open(&data_name, &ctor.name).is_err() {
+                return Err(self.error(span, Error::FieldsPrivate(data_name)));
+            }
+            let Some(index) = ctor.names.iter().position(|field| field.as_deref() == Some(name))
+            else {
+                return Err(self.error(span, Error::FieldOfSeveralConstructors(name.to_string())));
+            };
+            let fields = self.instantiate_fields(&data.params, &args, &ctor.fields);
+            let field = fields[index];
+            if let Some(previous) = shared {
+                if !self.congruent_ty(previous, field) {
+                    return Err(self.error(
+                        span,
+                        Error::FieldOfSeveralConstructors(name.to_string()),
+                    ));
+                }
+            } else {
+                shared = Some(field);
+            }
+        }
+        Ok(shared)
     }
 
     /// `>>name` replaces one field. The value is above the base. The result is a new value.
@@ -2268,13 +2393,17 @@ impl Checker {
         stack: StackId,
     ) -> Result<StackId, Diagnostic> {
         let (under, value_ty) = self.pop_slot(stack, span)?;
+        let ctor = self.refinement_of(under);
         let (rest, base_ty) = self.pop_slot(under, span)?;
-        let Some(field_ty) = self.product_field(base_ty, name, span)? else {
+        let Some(field_ty) = self.product_field(base_ty, name, span, ctor.as_deref())? else {
             return Err(self.error(span, Error::ExpectedDataType(self.show_ty(base_ty))));
         };
         self.unify_ty(value_ty, field_ty)
             .map_err(|message| self.error(span, message))?;
         let output = self.stack_cons(rest, base_ty);
+        if let Some(ctor) = ctor {
+            self.note_refine(output, &ctor);
+        }
         let effect = match self.ambient {
             Some(effect) => effect,
             None => self.effect_var(),
@@ -3116,6 +3245,163 @@ impl Checker {
         Ok(())
     }
 
+    /// Same type after links and synonyms. This does not unify, so it does not commit.
+    fn congruent_ty(&self, left: TyId, right: TyId) -> bool {
+        self.congruent_ty_seen(left, right, &mut HashSet::new(), &mut HashSet::new(), &mut HashSet::new())
+    }
+
+    fn congruent_ty_seen(
+        &self,
+        left: TyId,
+        right: TyId,
+        types: &mut HashSet<(u32, u32)>,
+        stacks: &mut HashSet<(u32, u32)>,
+        rows: &mut HashSet<(u32, u32)>,
+    ) -> bool {
+        let left = self.expose(left);
+        let right = self.expose(right);
+        if left == right {
+            return true;
+        }
+        let key = if left.0 < right.0 {
+            (left.0, right.0)
+        } else {
+            (right.0, left.0)
+        };
+        if !types.insert(key) {
+            return true;
+        }
+        match (&self.tys[left.0 as usize], &self.tys[right.0 as usize]) {
+            (TyNode::Ctor(left_name, left_args), TyNode::Ctor(right_name, right_args)) => {
+                left_name == right_name
+                    && left_args.len() == right_args.len()
+                    && left_args.iter().zip(right_args).all(|(left, right)| {
+                        self.congruent_ty_seen(*left, *right, types, stacks, rows)
+                    })
+            }
+            (TyNode::App(left_head, left_args), TyNode::App(right_head, right_args)) => {
+                left_args.len() == right_args.len()
+                    && self.congruent_ty_seen(*left_head, *right_head, types, stacks, rows)
+                    && left_args.iter().zip(right_args).all(|(left, right)| {
+                        self.congruent_ty_seen(*left, *right, types, stacks, rows)
+                    })
+            }
+            (
+                TyNode::Fun(left_in, left_out, left_effect),
+                TyNode::Fun(right_in, right_out, right_effect),
+            ) => {
+                self.congruent_stack(*left_in, *right_in, types, stacks, rows)
+                    && self.congruent_stack(*left_out, *right_out, types, stacks, rows)
+                    && self.congruent_effect(*left_effect, *right_effect)
+            }
+            (TyNode::Record(left_row), TyNode::Record(right_row)) => {
+                self.congruent_row(*left_row, *right_row, types, stacks, rows)
+            }
+            (TyNode::Rigid(left_name), TyNode::Rigid(right_name)) => left_name == right_name,
+            _ => false,
+        }
+    }
+
+    fn congruent_stack(
+        &self,
+        left: StackId,
+        right: StackId,
+        types: &mut HashSet<(u32, u32)>,
+        stacks: &mut HashSet<(u32, u32)>,
+        rows: &mut HashSet<(u32, u32)>,
+    ) -> bool {
+        let left = self.find_stack(left);
+        let right = self.find_stack(right);
+        if left == right {
+            return true;
+        }
+        let key = if left.0 < right.0 {
+            (left.0, right.0)
+        } else {
+            (right.0, left.0)
+        };
+        if !stacks.insert(key) {
+            return true;
+        }
+        match (
+            &self.stacks[left.0 as usize],
+            &self.stacks[right.0 as usize],
+        ) {
+            (StackNode::Cons(left_rest, left_ty), StackNode::Cons(right_rest, right_ty)) => {
+                self.congruent_ty_seen(*left_ty, *right_ty, types, stacks, rows)
+                    && self.congruent_stack(*left_rest, *right_rest, types, stacks, rows)
+            }
+            (StackNode::Empty, StackNode::Empty) => true,
+            (
+                StackNode::Rigid { name: left_name, .. },
+                StackNode::Rigid { name: right_name, .. },
+            ) => left_name == right_name,
+            _ => false,
+        }
+    }
+
+    fn congruent_row(
+        &self,
+        left: RowId,
+        right: RowId,
+        types: &mut HashSet<(u32, u32)>,
+        stacks: &mut HashSet<(u32, u32)>,
+        rows: &mut HashSet<(u32, u32)>,
+    ) -> bool {
+        let left_id = self.find_row(left);
+        let right_id = self.find_row(right);
+        if left_id == right_id {
+            return true;
+        }
+        let key = if left_id.0 < right_id.0 {
+            (left_id.0, right_id.0)
+        } else {
+            (right_id.0, left_id.0)
+        };
+        if !rows.insert(key) {
+            return true;
+        }
+        match (self.peel_row(left), self.peel_row(right)) {
+            (Ok((left_fields, left_tail)), Ok((right_fields, right_tail))) => {
+                if left_fields.len() != right_fields.len() {
+                    return false;
+                }
+                for (name, left_ty) in &left_fields {
+                    let Some(right_ty) = right_fields.get(name) else {
+                        return false;
+                    };
+                    if !self.congruent_ty_seen(*left_ty, *right_ty, types, stacks, rows) {
+                        return false;
+                    }
+                }
+                match (left_tail, right_tail) {
+                    (None, None) => true,
+                    (Some(left_tail), Some(right_tail)) => {
+                        self.congruent_row(left_tail, right_tail, types, stacks, rows)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn congruent_effect(&self, left: EffectId, right: EffectId) -> bool {
+        match (self.peel_effect(left), self.peel_effect(right)) {
+            (Ok((left_labels, left_tail)), Ok((right_labels, right_tail))) => {
+                left_labels == right_labels
+                    && match (left_tail, right_tail) {
+                        (None, None) => true,
+                        (Some(left_tail), Some(right_tail)) => {
+                            self.find_effect(left_tail) == self.find_effect(right_tail)
+                        }
+                        _ => false,
+                    }
+            }
+            _ => false,
+        }
+    }
+
     fn ty_mismatch(&self, have: TyId, need: TyId) -> Error {
         Error::TypeMismatch {
             expected: self.show_ty(need),
@@ -3867,6 +4153,23 @@ impl Checker {
         self.show_stack_at(id, 0, false, false)
     }
 
+    /// Narrowing of each value, left to right. The top value is last.
+    fn stack_ctors(&self, id: StackId) -> Vec<Option<String>> {
+        let mut items = Vec::new();
+        let mut current = self.find_stack(id);
+        for _ in 0..64 {
+            match self.stacks[current.0 as usize].clone() {
+                StackNode::Cons(rest, _) => {
+                    items.push(self.refinements.get(&current.0).cloned());
+                    current = self.find_stack(rest);
+                }
+                _ => break,
+            }
+        }
+        items.reverse();
+        items
+    }
+
     /// Like [`show_stack`], but a lone hidden signature tail is `.`
     /// and a `-` synonym prints by name.
     fn show_note(&self, id: StackId) -> String {
@@ -3929,6 +4232,7 @@ impl Checker {
             .map(|site| StackAt {
                 span: site.span,
                 before: self.show_note(site.before),
+                ctors: self.stack_ctors(site.before),
                 after: site.after.map(|id| self.show_note(id)),
                 here: site
                     .here
@@ -5073,17 +5377,7 @@ mod tests {
 
     #[test]
     fn checks_the_maybe_example() {
-        let source = "\
-; Maybe a = Nothing | Just a
-
-: fromMaybe ( a (Maybe a) -- a )
-  Nothing ->
-  Just -> nip
-
-: mapMaybe ( (Maybe a) (a -- b) -- (Maybe b) )
-  Nothing q -> q drop Nothing
-  (Just x) q -> x q call Just
-";
+        let source = "; Maybe a = Nothing | Just a\n\n: fromMaybe ( a (Maybe a) -- a )\n  (Nothing ..) ->\n  (Just ..) -> nip\n\n: mapMaybe ( (Maybe a) (a -- b) -- (Maybe b) )\n  (Nothing ..) q -> q drop Nothing\n  (Just x) q -> x q call Just\n";
         check_source(source, ParseMode::Source).unwrap_or_else(|error| panic!("{error}\n{source}"));
     }
 
@@ -5096,7 +5390,7 @@ mod tests {
         ok("; Entry = Entry id : Num, at : Num\n\n: taken ( Entry Bool -- Num )\n  [ at>> ] [ id>> ] if\n");
         err(
             "; Shape = Circle Num | Rect w : Num, h : Num\n\n: width ( Shape -- Num )\n  w>>\n",
-            "field w needs a type with one constructor",
+            "field w is not the same on every constructor",
         );
         err(
             "; Effect a = Effect ( -- a )\n\n: act ( a. (Effect a) -- ( -- a ) )\n  act>>\n",
@@ -5119,15 +5413,15 @@ mod tests {
         ok(": held2 ( a b. a b -- a b )\n  [ ] dip");
         ok(": chosen ( a. a a Bool -- a )\n  [ nip ] [ nip ] if");
         ok(": either ( a. a a Bool -- a )\n  [ drop ] [ nip ] if");
-        ok(": from_just ( a. a (Maybe a) -- a )\n  Nothing ->\n  (Just x) -> drop x\n\n; Maybe a = Nothing | Just a");
+        ok(": from_just ( a. a (Maybe a) -- a )\n  (Nothing ..) ->\n  (Just x) -> drop x\n\n; Maybe a = Nothing | Just a");
         ok(": fact ( Int -- Int )\n  fact");
         ok(": even ( Int -- Bool )\n  odd\n\n: odd ( Int -- Bool )\n  even");
         ok(": flag ( -- Bool )\n  true");
         ok(": label ( -- Str )\n  \"hi\"");
         ok(": half ( (Num) (Num) -- Num )\n  drop");
         ok(": unit_value ( -- Unit )\n  Unit");
-        ok(": match_unit ( Unit -- Int )\n  Unit -> 1n");
-        ok(": maybe_int ( (Maybe Int) -- Int )\n  Nothing -> 0n\n  Just ->\n\n; Maybe a = Nothing | Just a");
+        ok(": match_unit ( Unit -- Int )\n  (Unit ..) -> 1n");
+        ok(": maybe_int ( (Maybe Int) -- Int )\n  (Nothing ..) -> 0n\n  (Just ..) ->\n\n; Maybe a = Nothing | Just a");
         ok(": foreign add ( (Int) (Int) -- Int )\n\n: use ( (Int) (Int) -- Int )\n  add");
         ok(": ignore_quote ( a. a -- a )\n  [ drop ] drop");
         ok(": run_dup ( a. a -- a a )\n  [ dup ] call");
@@ -5188,7 +5482,7 @@ mod tests {
             "type mismatch: expected Int, found Str",
         );
         err(
-            "; Maybe a = Nothing | Just a\n\n: bad ( a. a (Maybe a) -- a )\n  Nothing ->",
+            "; Maybe a = Nothing | Just a\n\n: bad ( a. a (Maybe a) -- a )\n  (Nothing ..) ->",
             "non-exhaustive match: Just",
         );
         err(
@@ -5246,24 +5540,291 @@ mod tests {
             "stack underflow",
         );
         err(
-            ": bad ( Int -- Int )\n  Nothing ->",
+            ": bad ( Int -- Int )\n  (Nothing ..) ->",
             "type mismatch: expected a data type, found Int",
         );
         err(
-            "; Maybe a = Nothing | Just a\n\n; Either a b = Left a | Right b\n\n: bad ( a. (Maybe a) -- a )\n  Left ->\n  Nothing ->\n  Just ->",
+            "; Maybe a = Nothing | Just a\n\n; Either a b = Left a | Right b\n\n: bad ( a. (Maybe a) -- a )\n  (Left ..) ->\n  (Nothing ..) ->\n  (Just ..) ->",
             "constructor Left is not a constructor of Maybe",
         );
         err(
-            "; Maybe a = Nothing | Just a\n\n: bad ( a. (Maybe a) -- a )\n  Nothing ->\n  Nothing ->\n  Just ->",
+            "; Maybe a = Nothing | Just a\n\n: bad ( a. (Maybe a) -- a )\n  (Nothing ..) ->\n  (Nothing ..) ->\n  (Just ..) ->",
             "redundant pattern",
         );
         err(
-            "; Maybe a = Nothing | Just a\n\n: bad ( a. (Maybe a) -- a )\n  (Nothing x) ->\n  Just ->",
-            "pattern Nothing expects 0 fields",
+            "; Maybe a = Nothing | Just a\n\n: bad ( a. (Maybe a) -- a )\n  (Nothing x) ->\n  (Just ..) ->",
+            "Nothing has no field x",
         );
         err(
-            "; Maybe a = Nothing | Just a\n\n: bad ( a. (Maybe a) -- a )\n  Nothing ->\n  (Just x y) -> drop",
+            "; Maybe a = Nothing | Just a\n\n: bad ( a. (Maybe a) -- a )\n  (Nothing ..) ->\n  (Just x y) -> drop",
             "pattern Just expects 1 field",
+        );
+    }
+
+    #[test]
+    fn a_constructor_check_keeps_the_value() {
+        ok("\
+; Response = Sent status : Num, headers : Str, body : Str | Redirect status : Num, headers : Str, location : Str | Failure status : Num, headers : Str, message : Str
+; Option a = None | Some a
+; Entry = Entry id : Num, at : Num
+; Effect a = Effect ( -- a )
+; Cancel == Cancel (Effect Unit)
+; Side = Left Str | Right Str
+
+: emptied ( Response -- Response )
+  Sent -> \"\" >>body
+  Redirect ->
+  Failure ->
+
+: bodyOf ( Response -- Str )
+  Sent -> body>>
+  Redirect -> location>>
+  Failure -> message>>
+
+: headersOf ( Response -- Str )
+  headers>>
+
+: setStatus ( Response Num -- Response )
+  >>status
+
+: atOf ( (Option Entry) -- (Option Num) )
+  (None ..) -> None
+  (Some ..) -> at>> Some
+
+: stop ( Cancel -- (Effect Unit) )
+  (Cancel ..) ->
+
+: again ( Response -- Response )
+  (Sent ..) -> Sent
+  (Redirect ..) -> Redirect
+  (Failure ..) -> Failure
+
+: named ( Response -- Str )
+  (Sent headers) -> headers
+  (Redirect location) -> location
+  (Failure message) -> message
+
+: one ( a. a (Option a) -- a )
+  spare (Some text) -> text
+  spare (None ..) -> spare
+
+: nested ( (Option Side) -- Str )
+  (Some (Right text)) -> text
+  (Some (Left text)) -> text
+  (None ..) -> \"\"
+
+: kept ( Str Response -- Response )
+  code reply -> reply
+
+: copied ( Response -- Str Str )
+  Sent -> dup body>> swap body>>
+  Redirect -> location>> dup
+  Failure -> message>> dup
+");
+        ok("\
+; Person = Person name : Str, age : Num
+
+: swapped ( Person -- Num Str )
+  (Person age name) -> age name
+");
+        ok("\
+; Age == Age Num
+
+: kept ( Age -- Age )
+  Age ->
+
+: years ( Age -- Num )
+  (Age ..) ->
+");
+        err(
+            "; Page = Page id : Num, paths : Str\n\n: bad ( Page -- Num )\n  (Page a) -> a\n",
+            "Page has no field a",
+        );
+        err(
+            "; Page = Page id : Num, paths : Str\n\n: bad ( Page -- Page )\n  (Page) ->\n",
+            "pattern Page needs a field name or ..",
+        );
+        err(
+            "; Option a = None | Some a\n\n: bad ( a. (Option a) -- a )\n  (None a) -> a\n",
+            "None has no field a",
+        );
+        err(
+            "; Option a = None | Some a\n\n: bad ( a. (Option a) -- a )\n  (Some (Array Num)) ->\n",
+            "type mismatch: expected a data type, found a",
+        );
+        err(
+            "; Option a = None | Some a\n\n: bad ( a. (Option a) -- a )\n  (Some Array) ->\n",
+            "type mismatch: expected a data type, found a",
+        );
+        err(
+            "; Response = Sent status : Num, body : Str | Failure code : Num, message : Str\n\n: bad ( Response -- Str )\n  [ body>> ] call\n",
+            "field body is not the same on every constructor",
+        );
+        err(
+            "; Response = Sent status : Num, body : Str | Failure code : Num, message : Str\n\n: bad ( Response -- Str )\n  Sent -> [ body>> ] call\n  (Failure ..) -> \"\"\n",
+            "field body is not the same on every constructor",
+        );
+        err(
+            "; Response = Sent status : Num, body : Str | Failure code : Num, body : Num\n\n: bad ( Response -- Str )\n  body>>\n",
+            "field body is not the same on every constructor",
+        );
+    }
+
+    #[test]
+    fn a_type_test_names_the_array() {
+        ok("\
+; Option a = None | Some a
+
+: normalizedItems ( (Option a) -- (Array Num) )
+  (Some (Array Num) items) -> items
+  (Some (Array Str) _) -> < 0 >
+  _ -> < >
+
+: strings ( (Option a) -- (Array Str) )
+  (Some (Array Str) text) -> text
+  _ -> < >
+
+: amount ( (Option a) -- Num )
+  (Some (Num) n) -> n
+  _ -> 0
+
+: code ( (Option a) -- Int )
+  (Some (Int) n) -> n
+  _ -> 0n
+
+: anyArray ( (Option a) -- Bool )
+  (Some (Array _) _) -> true
+  _ -> false
+
+: take ( (Option (Array Num)) -- (Array Num) )
+  (Some (Array Num) items) -> items
+  (None ..) -> < >
+
+: both ( (Option a) -- (Array Num) )
+  (Some (Array Num) items) -> items
+  (Some (Array Num) _) -> < >
+  _ -> < >
+");
+        ok("\
+; Option a = None | Some a
+; Pair a b = Pair frs : a, snd : b
+- Time Num
+
+: saved ( (Option (Pair Num Str)) -- (Option (Pair Num Str)) )
+  (Some (Pair Num Str) p) -> p Some
+  (None ..) -> None
+
+: time ( (Option a) -- Num )
+  (Some (Time) n) -> n
+  _ -> 0
+");
+        ok("\
+; Option a = None | Some a
+; Person = Person who : (Option Str), age : Num
+
+: years ( Person -- Num )
+  (Person (Some _) (Num) n) -> n
+  (Person (None ..) _) -> 0
+
+: nested ( Person -- Str )
+  (Person (Some name) age) -> age drop name
+  (Person (None ..) _) -> \"\"
+");
+        err(
+            "; Option a = None | Some a\n\n: bad ( (Option a) -- (Array Num) )\n  (Some (Array Num) items) -> items\n",
+            "non-exhaustive match: None, Some",
+        );
+        err(
+            "; Option a = None | Some a\n\n: bad ( (Option (Array Str)) -- (Array Num) )\n  (Some (Array Num) items) -> items\n  (None ..) -> < >\n",
+            "type mismatch: expected (Array Str), found (Array Num)",
+        );
+        err(
+            "; Option a = None | Some a\n\n: bad ( (Option a) -- (Option Num) )\n  (Some (Option Num) value) -> value\n  _ -> None\n",
+            "pattern cannot test (Option Num)",
+        );
+        err(
+            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (StrMap Num) value) -> 0\n  _ -> 0\n",
+            "pattern cannot test (StrMap Num)",
+        );
+        err(
+            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Unit) value) -> 0\n  _ -> 0\n",
+            "pattern cannot test Unit",
+        );
+        err(
+            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Array) value) -> 0\n  _ -> 0\n",
+            "type constructor Array expects 1 argument",
+        );
+        err(
+            "; Option a = None | Some a\n; Side = Left Str | Right Str\n\n: bad ( (Option Side) -- Str )\n  (Some (Right text) extra) -> text\n",
+            "pattern Some needs a field name or ..",
+        );
+        err(
+            "; Option a = None | Some a\n\n: bad ( (Option (Array Num)) -- (Array Num) )\n  (Some (Array Num) items) -> items\n  (Some (Array Num) items) -> items\n  (None ..) -> < >\n",
+            "redundant pattern",
+        );
+    }
+
+    #[test]
+    fn a_type_test_spills_the_value() {
+        ok("\
+; Option a = None | Some a
+; Pair a b = Pair frs : a, snd : b
+; Age == Age Num
+
+: amount ( (Option a) -- Num )
+  (Some (Num) ..) ->
+  _ -> 0
+
+: items ( (Option a) -- (Array Num) )
+  (Some (Array Num) ..) ->
+  _ -> < >
+
+: halves ( a b. (Pair a b) -- Num Str )
+  (Pair (Num) .. (Str) ..) ->
+  _ -> 0 \"\"
+
+: take ( (Option Num) -- Num )
+  (Some (Num) ..) ->
+  (None ..) -> 0
+
+: years ( Age -- Num )
+  (Age (Num) ..) ->
+
+: checked ( (Option a) -- Num )
+  (Some (Num) _) -> 1
+  _ -> 0
+
+: plain ( a. a (Option a) -- a )
+  spare (Some ..) -> spare drop
+  spare (None ..) -> spare
+");
+        err(
+            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Num) ..) ->\n",
+            "non-exhaustive match: None, Some",
+        );
+        err(
+            "; Pair a b = Pair frs : a, snd : b\n\n: bad ( a b. (Pair a b) -- Num )\n  (Pair (Num) ..) -> 0\n",
+            "pattern Pair needs a field name or ..",
+        );
+        err(
+            "; Option a = None | Some a\n; Side = Left Str | Right Str\n\n: bad ( (Option Side) -- Str )\n  (Some (Right text) ..) -> text\n",
+            "pattern Some needs a field name or ..",
+        );
+        err(
+            "; Pair a b = Pair frs : a, snd : b\n\n: bad ( a b. (Pair a b) -- a )\n  (Pair x ..) -> x\n",
+            "expected pattern",
+        );
+        err(
+            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Num) n ..) -> n\n  _ -> 0\n",
+            "expected pattern",
+        );
+        err(
+            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Num) .. ..) ->\n  _ -> 0\n",
+            "expected pattern",
+        );
+        err(
+            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Array (Num) ..) xs) -> 0\n  _ -> 0\n",
+            "pattern cannot test that pattern",
         );
     }
 
@@ -5295,7 +5856,7 @@ mod tests {
     fn checks_classes() {
         ok("& Show a\n  show ( a -- Str )\n");
         ok("& Eq a\n  eq ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  drop drop true\n\n# Eq Int\n  eq = eqInt\n\n: use ( Int Int -- Bool )\n  eq\n\n: same ( a. Eq a => a a -- Bool )\n  eq\n\n: useSame ( Int Int -- Bool )\n  same\n\n: eqBool ( Bool Bool -- Bool )\n  drop drop true\n\n# Eq Bool\n  eq = eqBool\n");
-        ok("; Maybe a = Nothing | Just a\n\n& Functor f\n  map ( a b. (f a) (a -- b) -- (f b) )\n\n: mapMaybe ( a b. (Maybe a) (a -- b) -- (Maybe b) )\n  Nothing q -> q drop Nothing\n  (Just x) q -> x q call Just\n\n# Functor Maybe\n  map = mapMaybe\n\n: use ( (Maybe Int) -- (Maybe Int) )\n  [ dup drop ] map\n");
+        ok("; Maybe a = Nothing | Just a\n\n& Functor f\n  map ( a b. (f a) (a -- b) -- (f b) )\n\n: mapMaybe ( a b. (Maybe a) (a -- b) -- (Maybe b) )\n  (Nothing ..) q -> q drop Nothing\n  (Just x) q -> x q call Just\n\n# Functor Maybe\n  map = mapMaybe\n\n: use ( (Maybe Int) -- (Maybe Int) )\n  [ dup drop ] map\n");
         ok(": idf ( f a. (f a) -- (f a) )\n  dup drop");
         err(
             "# Show Int\n  show = showInt",
@@ -5581,7 +6142,7 @@ mod tests {
     #[test]
     fn imports_are_selective() {
         let provider = parse(
-            "@ Maybe, Nothing, Just, fromMaybe\n\n; Maybe a = Nothing | Just a\n\n: fromMaybe ( a. a (Maybe a) -- a )\n  Nothing ->\n  Just -> nip\n\n: hidden ( Int -- Int )\n  dup drop\n",
+            "@ Maybe, Nothing, Just, fromMaybe\n\n; Maybe a = Nothing | Just a\n\n: fromMaybe ( a. a (Maybe a) -- a )\n  (Nothing ..) ->\n  (Just ..) -> nip\n\n: hidden ( Int -- Int )\n  dup drop\n",
             ParseMode::Source,
         )
         .unwrap();
@@ -5621,7 +6182,7 @@ mod tests {
     #[test]
     fn a_renamed_import_keeps_the_canonical_name() {
         let provider = parse(
-            "@ Maybe, Nothing, Just, fromMaybe\n\n; Maybe a = Nothing | Just a\n\n: fromMaybe ( a. a (Maybe a) -- a )\n  Nothing ->\n  Just -> nip\n",
+            "@ Maybe, Nothing, Just, fromMaybe\n\n; Maybe a = Nothing | Just a\n\n: fromMaybe ( a. a (Maybe a) -- a )\n  (Nothing ..) ->\n  (Just ..) -> nip\n",
             ParseMode::Source,
         )
         .unwrap();
@@ -5638,7 +6199,7 @@ mod tests {
             )
         };
         let alias = check_import(
-            "~ \"Data/Maybe\" : Bus\n\n: open ( (Bus:Maybe Int) -- Int )\n  (Bus:Just x) -> x\n  Bus:Nothing -> 0n\n\n: use ( Int -- Int )\n  Bus:Nothing Bus:fromMaybe\n",
+            "~ \"Data/Maybe\" : Bus\n\n: open ( (Bus:Maybe Int) -- Int )\n  (Bus:Just x) -> x\n  (Bus:Nothing ..) -> 0n\n\n: use ( Int -- Int )\n  Bus:Nothing Bus:fromMaybe\n",
         )
         .unwrap();
         let js = alias.anf.javascript();
@@ -5662,7 +6223,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(hidden_word.message, "undefined word Nothing");
         let renamed = check_import(
-            "~ \"Data/Maybe\" Maybe : Option, Just : Yes, Nothing : No, fromMaybe\n\n: open ( (Option Int) -- Int )\n  No -> 0n\n  (Yes x) -> x\n\n: make ( Int -- (Option Int) )\n  Yes\n",
+            "~ \"Data/Maybe\" Maybe : Option, Just : Yes, Nothing : No, fromMaybe\n\n: open ( (Option Int) -- Int )\n  (No ..) -> 0n\n  (Yes x) -> x\n\n: make ( Int -- (Option Int) )\n  Yes\n",
         )
         .unwrap();
         let renamed_js = renamed.anf.javascript();
@@ -5675,7 +6236,7 @@ mod tests {
         )
         .unwrap();
         let module = parse(
-            "~ \"Data/Maybe\" : Bus\n~ \"Data/Maybe\" : Bus\n\n: open ( (Bus:Maybe Int) -- Int )\n  Bus:Nothing -> 0n\n  (Bus:Just x) -> x\n",
+            "~ \"Data/Maybe\" : Bus\n~ \"Data/Maybe\" : Bus\n\n: open ( (Bus:Maybe Int) -- Int )\n  (Bus:Nothing ..) -> 0n\n  (Bus:Just x) -> x\n",
             ParseMode::Source,
         )
         .unwrap();
@@ -6219,10 +6780,10 @@ mod tests {
         ok("; Person = Person name : Str, age : Num\n- Human Person\n\n: older ( Human -- Human )\n  37 >>age\n");
         ok("; Pair a b = Pair left : a, right : b\n- Twin a (Pair a a)\n\n: id ( (Twin Int) -- (Pair Int Int) )\n  dup drop\n");
         ok("- Alias Int\n\n: use ( Alias -- Int )\n  dup drop\n");
-        ok("; Maybe a = Nothing | Just a\n- Answer (Maybe Int)\n\n: get ( Answer -- Int )\n  Nothing -> 0n\n  Just ->\n");
+        ok("; Maybe a = Nothing | Just a\n- Answer (Maybe Int)\n\n: get ( Answer -- Int )\n  (Nothing ..) -> 0n\n  (Just ..) ->\n");
         ok("& Eq a\n  eq ( a a -- Bool )\n\n; Person = Person name : Str, age : Num\n- Human Person\n\n: eqHuman ( Human Human -- Bool )\n  drop drop true\n\n# Eq Human\n  eq = eqHuman\n\n: same ( Human Human -- Bool )\n  eq\n");
         ok("; Person = Person Str\n- Alias Person\n\n& Eq a\n  eq ( a a -- Bool )\n\n: eqPerson ( Person Person -- Bool )\n  drop drop true\n\n# Eq Alias\n  eq = eqPerson\n");
-        ok("; Age == Age Num\n\n: older ( Age -- Age )\n  Age -> Age\n");
+        ok("; Age == Age Num\n\n: older ( Age -- Age )\n  (Age ..) -> Age\n");
         ok("; Age == Age Num\n\n& Eq a\n  eq ( a a -- Bool )\n\n: eqAge ( Age Age -- Bool )\n  drop drop true\n\n# Eq Age\n  eq = eqAge\n");
         err("- A A", "cyclic type A");
         err(
@@ -6273,12 +6834,7 @@ mod tests {
   tag = tagHub
 ");
         err(
-            "\
-; foreign Hub a
-
-: bad ( (Hub a) -- (Hub a) )
-  Listeners -> Listeners
-",
+            "; foreign Hub a\n\n: bad ( (Hub a) -- (Hub a) )\n  (Listeners ..) -> Listeners\n",
             "constructor Listeners is not a constructor of Hub",
         );
         err(
@@ -6358,7 +6914,7 @@ mod tests {
             ": fact ( Int -- Int )\n  0n -> 1n\n  n -> n\n",
         );
         ok(
-            "; Maybe a = Nothing | Just a\n\n: mapMaybe ( a b. (Maybe a) (a -- b) -- (Maybe b) )\n  Nothing q -> q drop Nothing\n  (Just x) q -> x q call Just\n\n: divInt ( Int Int -- (Maybe Int) )\n  x 0n -> Nothing\n  x y -> Nothing\n\n: fromMaybe ( a. a (Maybe a) -- a )\n  x Nothing -> x\n  x (Just y) -> y\n\n: flatten ( a. (Maybe (Maybe a)) -- (Maybe a) )\n  Nothing -> Nothing\n  (Just Nothing) -> Nothing\n  (Just (Just x)) -> x Just\n\n: fromJust ( (Maybe Int) -- Int )\n  Nothing -> 0n\n  Just ->\n\n: isJust ( a. (Maybe a) -- Bool )\n  Nothing -> false\n  (Just _) -> true\n",
+            "; Maybe a = Nothing | Just a\n\n: mapMaybe ( a b. (Maybe a) (a -- b) -- (Maybe b) )\n  (Nothing ..) q -> q drop Nothing\n  (Just x) q -> x q call Just\n\n: divInt ( Int Int -- (Maybe Int) )\n  x 0n -> Nothing\n  x y -> Nothing\n\n: fromMaybe ( a. a (Maybe a) -- a )\n  x (Nothing ..) -> x\n  x (Just y) -> y\n\n: flatten ( a. (Maybe (Maybe a)) -- (Maybe a) )\n  (Nothing ..) -> Nothing\n  (Just (Nothing ..)) -> Nothing\n  (Just (Just x)) -> x Just\n\n: fromJust ( (Maybe Int) -- Int )\n  (Nothing ..) -> 0n\n  (Just ..) ->\n\n: isJust ( a. (Maybe a) -- Bool )\n  (Nothing ..) -> false\n  (Just _) -> true\n",
         );
         ok(
             ": addToAll ( Num (Array Num) -- (Array Num) )\n  n xs ->\n    xs [ n ] drop\n",
@@ -6376,7 +6932,7 @@ mod tests {
             "; Pair a b = Pair frs : a, snd : b\n\n: snd ( a b. (Pair a b) -- b )\n  (Pair _ y) -> y\n\n: both ( (Pair Bool Bool) -- Int )\n  (Pair true true) -> 1n\n  (Pair true false) -> 2n\n  (Pair false true) -> 3n\n  (Pair false false) -> 4n\n",
         );
         ok(
-            "; Age == Age Num\n\n: years ( Age -- Num )\n  (Age n) -> n\n\n: bare ( Age -- Num )\n  Age ->\n",
+            "; Age == Age Num\n\n: years ( Age -- Num )\n  (Age n) -> n\n\n: bare ( Age -- Num )\n  (Age ..) ->\n",
         );
         ok(
             ": bump ( Int -- Int )\n  0n -> 1n\n  n -> [ n ] call\n",
@@ -6394,7 +6950,7 @@ mod tests {
             "non-exhaustive match: Nothing",
         );
         err(
-            "; Maybe a = Nothing | Just a\n\n: bad ( a. (Maybe (Maybe a)) -- Int )\n  Nothing -> 0n\n  (Just Nothing) -> 0n\n",
+            "; Maybe a = Nothing | Just a\n\n: bad ( a. (Maybe (Maybe a)) -- Int )\n  (Nothing ..) -> 0n\n  (Just (Nothing ..)) -> 0n\n",
             "non-exhaustive match: Just Just",
         );
         err(
@@ -6430,15 +6986,15 @@ mod tests {
             "type mismatch: expected Int, found a",
         );
         err(
-            "; Maybe a = Nothing | Just a\n\n: bad ( (Maybe Int) -- Int )\n  (Just) -> 0n\n  Nothing -> 0n\n",
-            "pattern Just expects 1 field",
+            "; Maybe a = Nothing | Just a\n\n: bad ( (Maybe Int) -- Int )\n  (Just) -> 0n\n  (Nothing ..) -> 0n\n",
+            "pattern Just needs a field name or ..",
         );
         err(
-            "; Maybe a = Nothing | Just a\n\n: bad ( (Maybe Int) -- Int )\n  Foo -> 0n\n",
+            "; Maybe a = Nothing | Just a\n\n: bad ( (Maybe Int) -- Int )\n  (Foo ..) -> 0n\n",
             "constructor Foo is not a constructor of Maybe",
         );
         err(
-            ": bad ( Int -- Int )\n  Foo -> 0n\n  n -> n\n",
+            ": bad ( Int -- Int )\n  (Foo ..) -> 0n\n  n -> n\n",
             "type mismatch: expected a data type, found Int",
         );
         err(
@@ -6483,15 +7039,9 @@ mod tests {
             &format!("; Box a = Mk a\n\n: unwrap ( {deep_ty} -- Int )\n  {deep_pat} -> n\n"),
             "redundant pattern",
         );
-        ok("\
-; Rec = More Rec | Stop
-
-: kind ( Rec -- Int )
-  Stop -> 0n
-  (More _) -> 0n
-");
-        let mut chain = String::from("Stop -> 0n\n");
-        let mut nested = "Stop".to_string();
+        ok("; Rec = More Rec | Stop\n\n: kind ( Rec -- Int )\n  (Stop ..) -> 0n\n  (More _) -> 0n\n");
+        let mut chain = String::from("(Stop ..) -> 0n\n");
+        let mut nested = "(Stop ..)".to_string();
         for _ in 0..16 {
             nested = format!("(More {nested})");
             chain.push_str(&format!("  {nested} -> 0n\n"));

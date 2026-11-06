@@ -521,9 +521,9 @@ Fix: change the value or the signature so both sides print as the same type.
 
 `type mismatch: expected a record, found TYPE`
 
-Source does not produce this message. `name>>` and `>>name` on a type that is not a data type with one constructor are `PL0063`. `{`, `}`, and `+` are an unexpected character (`PL0001`).
+Source does not produce this message. `name>>` and `>>name` on a type that is not a data type are `PL0063`. `{`, `}`, and `+` are an unexpected character (`PL0001`).
 
-Fix: read a field of a type declared with one constructor.
+Fix: read a field of a data type.
 
 ## PL0063
 
@@ -531,7 +531,7 @@ Fix: read a field of a type declared with one constructor.
 
 A constructor pattern, `name>>`, or `>>name` was checked against a type that has no constructors. The type may be `Int`, a type variable, a synonym of a non-data type, or another non-data type.
 
-Fix: use a data type with one constructor, or match with `->`. A sum is `PL0119`. A missing field is `PL0120`.
+Fix: use a data type, or match with `->`. A field that is not the same on every constructor is `PL0119`. A missing field is `PL0120`.
 
 ## PL0064
 
@@ -635,9 +635,9 @@ Fix: add an equation for each example.
 
 `pattern NAME expects N field` or `pattern NAME expects N fields`
 
-The constructor pattern has the wrong number of fields. One field uses `field`; any other count uses `fields`.
+The constructor pattern has the wrong number of fields. One field uses `field`; any other count uses `fields`. `(Name ..)` spills the fields. A short list of field names binds those fields. This error is a wrong count of other patterns.
 
-Fix: pass that many fields. `Just` takes one: `Just x`. Parentheses keep one slot when the field is itself a pattern.
+Fix: pass that many fields. `Just` takes one: `(Just x)`. Parentheses keep one slot when the field is itself a pattern. `(Just ..)` spills that field.
 
 ## PL0077
 
@@ -983,19 +983,19 @@ Fix: write `Some a` or `Effect ( -- a )`.
 
 ## PL0119
 
-`field NAME needs a type with one constructor`
+`field NAME is not the same on every constructor`
 
-`name>>` or `>>name` was used on a sum. `None` has no fields, so the reader cannot pick a field of `Option`.
+`name>>` or `>>name` needs that field on every constructor, with the same type. `None` has no `text`. A field that one constructor has and another lacks is the same error. Two constructors that both have the name, with different types, are the same error.
 
-Fix: match with `->` and read the field in the branch that has it.
+Fix: read it after that constructor's check, `Sent -> body>>`. A field every constructor has is `name>>` with no match. A quotation does not see the check.
 
 ## PL0120
 
 `TYPE has no field NAME`
 
-The type has one constructor, and that constructor has no field of this name. A one-field constructor such as `Effect` has no `name>>`.
+The type or the narrowed constructor has no field of this name. A one-field constructor such as `Effect` has no `name>>`. `None` has no field `a`.
 
-Fix: use the field's name, or match the one field with `->`.
+Fix: use the field's name. Name the one field in the equation, `(Just x)`, or spill it with `(Just ..)`.
 
 ## PL0121
 
@@ -1114,3 +1114,19 @@ Fix: fill the place from a value that does not use it. A word below the declarat
 `=NAME` or `=>NAME` names a place, and `NAME` is not one. A place is `= NAME Type` in this file, or a place whose reader this file imports. Importing the reader also opens `=NAME` and `=>NAME`.
 
 Fix: declare the place, or import its reader. `NAME` alone reads it. The glued word writes or binds.
+
+## PL0136
+
+`pattern NAME needs a field name or ..`
+
+`(Page)` names no field. A short pattern that is not a list of field names, such as `(Page id _)` or `(Page (Some x))`, is the same error. `(None)` and `(LT)` stay legal: a constructor with no fields leaves nothing.
+
+Fix: keep the value with `Page`, spill every field with `(Page ..)`, or name the fields, `(Page id paths)`. Do not mix `..` with field names.
+
+## PL0137
+
+`pattern cannot test TYPE`
+
+`(Some (Option Num) value)` asks whether the field is `(Option Num)`. A number, an integer, a string, a boolean, or an array of those is a check the runtime can make. `TYPE` is not one of those, and the field is not already `TYPE`.
+
+Fix: test a shape the runtime can see, `(Some (Array Num) items)`. When the field is already `TYPE`, the name is that value and there is nothing to test.

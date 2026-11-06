@@ -136,7 +136,7 @@ pub enum Error {
     SeveralFieldsNeedNames,
     /// `name : Type` on a constructor that has only one field.
     SingleFieldUnnamed,
-    /// `name>>` or `>>name` on a type with several constructors.
+    /// `name>>` or `>>name` when the field is not the same on every constructor.
     FieldOfSeveralConstructors(String),
     /// The single constructor does not have this field.
     NoSuchField { type_name: String, name: String },
@@ -169,6 +169,10 @@ pub enum Error {
     PlaceNotReady(String),
     /// `=name` or `=>name` and `name` is not a place in scope.
     UndefinedPlace(String),
+    /// `(Page)` names no field, or a short pattern is not a list of field names.
+    PatternForm(String),
+    /// The pattern names a type the runtime cannot distinguish, and the field is not already that type.
+    PatternCannotTest(String),
 }
 
 impl Error {
@@ -393,7 +397,7 @@ impl Error {
             SingleFieldUnnamed => static_text("PL0118", "a single field has no name"),
             FieldOfSeveralConstructors(name) => (
                 "PL0119",
-                format!("field {name} needs a type with one constructor"),
+                format!("field {name} is not the same on every constructor"),
             ),
             NoSuchField { type_name, name } => {
                 ("PL0120", format!("{type_name} has no field {name}"))
@@ -429,6 +433,11 @@ impl Error {
             ImportClosed => static_text("PL0133", "import is already complete"),
             PlaceNotReady(name) => ("PL0134", format!("place {name} is not ready")),
             UndefinedPlace(name) => ("PL0135", format!("no place {name}")),
+            PatternForm(name) => (
+                "PL0136",
+                format!("pattern {name} needs a field name or .."),
+            ),
+            PatternCannotTest(ty) => ("PL0137", format!("pattern cannot test {ty}")),
         }
     }
 }
@@ -693,7 +702,7 @@ mod tests {
             (Error::SingleFieldUnnamed, "a single field has no name", "PL0118"),
             (
                 Error::FieldOfSeveralConstructors("at".into()),
-                "field at needs a type with one constructor",
+                "field at is not the same on every constructor",
                 "PL0119",
             ),
             (
@@ -776,8 +785,18 @@ mod tests {
                 "no place base",
                 "PL0135",
             ),
+            (
+                Error::PatternForm("Page".into()),
+                "pattern Page needs a field name or ..",
+                "PL0136",
+            ),
+            (
+                Error::PatternCannotTest("(Option Num)".into()),
+                "pattern cannot test (Option Num)",
+                "PL0137",
+            ),
         ];
-        assert_eq!(samples.len(), 135);
+        assert_eq!(samples.len(), 137);
         for (error, message, code) in samples {
             assert_eq!(error.code(), code, "{message}");
             assert_eq!(error.message(), message);

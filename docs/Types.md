@@ -40,7 +40,7 @@ JavaScript emits a boolean.
 
 No parameters. The only value is the word [`Unit`](Words.md#unit). JavaScript emits `undefined`.
 
-That word is also the constructor, so `Unit ->` matches the value.
+That word is also the constructor. `Unit ->` checks the value and leaves it. `(Unit ..)` checks it and leaves nothing.
 
 ## Array
 

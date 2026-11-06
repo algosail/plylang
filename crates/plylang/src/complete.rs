@@ -9,6 +9,7 @@ use crate::ast::{
     Scheme, Stack, StackEffect, StackTail, Type,
 };
 use crate::build::{available_import_paths, load_provider, load_surface, provider_file, read_module, stack_sites};
+use crate::check::StackAt;
 use crate::surface::{self, Found};
 use crate::builtin::{self, Lowering};
 use crate::lexer::tokenize;
@@ -1244,11 +1245,13 @@ fn fields_at(path: &Path, source: &str, edit: &FieldEdit) -> Vec<(String, String
     probe.push_str("dup");
     probe.push(' ');
     probe.push_str(&source[edit.name_end..]);
-    if let Some(before) = stack_before(path, &probe, marker as u32) {
+    if let Some(site) = marked_site(path, &probe, marker as u32) {
         // The new value is on top. The product is under it, or on top when the value is not written yet.
-        let slot = under_top(&before).or_else(|| top_slot(&before));
+        let under = under_top(&site.before).filter(|slot| !is_bottom(slot));
+        let slot = under.or_else(|| top_slot(&site.before));
+        let ctor = ctor_at(&site, under.is_some());
         if let Some(top) = slot {
-            if let Some(fields) = fields_of_printed(top, &env, 0) {
+            if let Some(fields) = fields_for(top, ctor, &env) {
                 return fields;
             }
             if !is_open_stack(top) {
@@ -1293,21 +1296,57 @@ fn reader_fields(path: &Path, source: &str, offset: usize) -> Vec<(String, Strin
     let marker = probe.len();
     probe.push_str("dup ");
     probe.push_str(&source[name_end..]);
-    let Some(before) = stack_before(path, &probe, marker as u32) else {
+    let Some(site) = marked_site(path, &probe, marker as u32) else {
         return Vec::new();
     };
-    let Some(top) = top_slot(&before) else {
+    let Some(top) = top_slot(&site.before) else {
         return Vec::new();
     };
     let env = field_env(path, source, name_start);
-    fields_of_printed(top, &env, 0).unwrap_or_default()
+    let ctor = ctor_at(&site, false);
+    fields_for(top, ctor, &env).unwrap_or_default()
 }
 
-fn stack_before(path: &Path, source: &str, marker: u32) -> Option<String> {
+fn marked_site(path: &Path, source: &str, marker: u32) -> Option<StackAt> {
     stack_sites(path, source)
         .into_iter()
         .find(|site| site.span.start == marker)
-        .map(|site| site.before)
+}
+
+/// `under` is the product beneath a value already written for `>>name`.
+fn ctor_at(site: &StackAt, under: bool) -> Option<&str> {
+    let index = if under {
+        site.ctors.len().checked_sub(2)?
+    } else {
+        site.ctors.len().checked_sub(1)?
+    };
+    site.ctors.get(index)?.as_deref()
+}
+
+fn fields_for(top: &str, ctor: Option<&str>, env: &FieldEnv) -> Option<Vec<(String, String)>> {
+    if let Some(ctor) = ctor {
+        if let Some(fields) = fields_of_printed_ctor(top, ctor, env, 0) {
+            return Some(fields);
+        }
+    }
+    fields_of_printed(top, env, 0)
+}
+
+fn common_fields(ctors: &[(String, Vec<(String, Type)>)]) -> Vec<(String, Type)> {
+    let Some((_, first)) = ctors.first() else {
+        return Vec::new();
+    };
+    first
+        .iter()
+        .filter(|(name, ty)| {
+            ctors.iter().skip(1).all(|(_, fields)| {
+                fields
+                    .iter()
+                    .any(|(other, other_ty)| other == name && other_ty == ty)
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 fn signature_fields(
@@ -1391,7 +1430,10 @@ fn collect_type(ty: &Type, env: &FieldEnv, out: &mut Vec<(String, String)>) {
 struct ProductDecl {
     name: String,
     params: Vec<String>,
+    /// Fields offered when the value is not narrowed. A sum contributes the
+    /// names that every constructor has, with the same type.
     fields: Vec<(String, Type)>,
+    ctors: Vec<(String, Vec<(String, Type)>)>,
 }
 
 struct SynonymDecl {
@@ -1427,23 +1469,37 @@ fn add_fields(env: &mut FieldEnv, module: &Module) {
                 if env.products.iter().any(|have| have.name == data.name) {
                     continue;
                 }
-                if data.foreign || data.ctors.len() != 1 {
+                if data.foreign || data.ctors.is_empty() {
                     continue;
                 }
-                let ctor = &data.ctors[0];
-                if ctor.fields.len() < 2 || ctor.fields.iter().any(|field| field.name.is_none()) {
+                let ctors: Vec<(String, Vec<(String, Type)>)> = data
+                    .ctors
+                    .iter()
+                    .map(|ctor| {
+                        (
+                            ctor.name.clone(),
+                            ctor.fields
+                                .iter()
+                                .filter_map(|field| {
+                                    field.name.clone().map(|name| (name, field.ty.clone()))
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                if ctors.iter().all(|(_, fields)| fields.is_empty()) {
                     continue;
                 }
+                let fields = if ctors.len() == 1 {
+                    ctors[0].1.clone()
+                } else {
+                    common_fields(&ctors)
+                };
                 env.products.push(ProductDecl {
                     name: data.name.clone(),
                     params: data.params.clone(),
-                    fields: ctor
-                        .fields
-                        .iter()
-                        .filter_map(|field| {
-                            field.name.clone().map(|name| (name, field.ty.clone()))
-                        })
-                        .collect(),
+                    fields,
+                    ctors,
                 });
             }
             Item::Synonym(synonym) => {
@@ -1702,6 +1758,86 @@ fn is_open_stack(top: &str) -> bool {
     top == "_" || top == ".._"
 }
 
+fn is_bottom(slot: &str) -> bool {
+    slot == "." || slot == ".." || slot.starts_with("..")
+}
+
+fn fields_of_printed_ctor(
+    ty: &str,
+    ctor: &str,
+    env: &FieldEnv,
+    depth: usize,
+) -> Option<Vec<(String, String)>> {
+    let (head, args) = split_printed(ty)?;
+    if head.is_empty() {
+        return Some(Vec::new());
+    }
+    fields_of_ctor(&head, &args, ctor, env, depth)
+}
+
+fn fields_of_ctor(
+    head: &str,
+    args: &[String],
+    ctor: &str,
+    env: &FieldEnv,
+    depth: usize,
+) -> Option<Vec<(String, String)>> {
+    if depth > 8 {
+        return Some(Vec::new());
+    }
+    if let Some(product) = env.products.iter().find(|item| item.name == head) {
+        if args.len() != product.params.len() {
+            return Some(Vec::new());
+        }
+        let mut map = HashMap::new();
+        for (param, arg) in product.params.iter().zip(args.iter()) {
+            map.insert(param.clone(), arg.clone());
+        }
+        let (_, fields) = product.ctors.iter().find(|(name, _)| name == ctor)?;
+        return Some(
+            fields
+                .iter()
+                .map(|(name, ty)| (name.clone(), show_subst(ty, &map)))
+                .collect(),
+        );
+    }
+    if let Some(synonym) = env.synonyms.iter().find(|item| item.name == head) {
+        if args.len() != synonym.params.len() {
+            return Some(Vec::new());
+        }
+        let mut map = HashMap::new();
+        for (param, arg) in synonym.params.iter().zip(args.iter()) {
+            map.insert(param.clone(), arg.clone());
+        }
+        return fields_of_type_ctor(&synonym.rhs, &map, ctor, env, depth + 1);
+    }
+    None
+}
+
+fn fields_of_type_ctor(
+    ty: &Type,
+    map: &HashMap<String, String>,
+    ctor: &str,
+    env: &FieldEnv,
+    depth: usize,
+) -> Option<Vec<(String, String)>> {
+    match ty {
+        Type::Var(name) | Type::Ctor(name) => {
+            let shown = map.get(name).cloned().unwrap_or_else(|| name.clone());
+            fields_of_printed_ctor(&shown, ctor, env, depth)
+        }
+        Type::App(head, args) => {
+            let head = show_subst(head, map);
+            if head.contains('(') || head.contains(' ') {
+                return Some(Vec::new());
+            }
+            let args: Vec<String> = args.iter().map(|arg| show_subst(arg, map)).collect();
+            fields_of_ctor(&head, &args, ctor, env, depth)
+        }
+        Type::Fun(_) | Type::Record(_) => Some(Vec::new()),
+    }
+}
+
 fn is_ident_start_byte(byte: u8) -> bool {
     byte.is_ascii_alphabetic() || byte == b'_'
 }
@@ -1872,19 +2008,7 @@ mod tests {
         .unwrap();
         fs::write(
             root.join("src/Data/Maybe.ply"),
-            "\
-@ Maybe, Nothing, Just, fromMaybe, mapMaybe
-
-; Maybe a = Nothing | Just a
-
-: fromMaybe ( a (Maybe a) -- a )
-  Nothing ->
-  Just -> nip
-
-: mapMaybe ( (Maybe a) (a -- b) -- (Maybe b) )
-  Nothing q -> q drop Nothing
-  (Just x) q -> x q call Just
-",
+            "@ Maybe, Nothing, Just, fromMaybe, mapMaybe\n\n; Maybe a = Nothing | Just a\n\n: fromMaybe ( a (Maybe a) -- a )\n  (Nothing ..) ->\n  (Just ..) -> nip\n\n: mapMaybe ( (Maybe a) (a -- b) -- (Maybe b) )\n  (Nothing ..) q -> q drop Nothing\n  (Just x) q -> x q call Just\n",
         )
         .unwrap();
         fs::write(root.join("src/Data/Extra.ply"), ": pass ( Int -- Int )\n  dup drop\n").unwrap();
@@ -1935,21 +2059,7 @@ mod tests {
         .unwrap();
         fs::write(
             root.join("src/Data/Maybe.ply"),
-            "\
-@ Maybe, Nothing, Just, fromMaybe, Box, wrap
-
-.. A choice.
-; Maybe a = Nothing | Just a
-
-.. The other value.
-: fromMaybe ( a (Maybe a) -- a )
-  Nothing ->
-  Just -> nip
-
-.. A box.
-& Box a
-  wrap ( a -- a )
-",
+            "@ Maybe, Nothing, Just, fromMaybe, Box, wrap\n\n.. A choice.\n; Maybe a = Nothing | Just a\n\n.. The other value.\n: fromMaybe ( a (Maybe a) -- a )\n  (Nothing ..) ->\n  (Just ..) -> nip\n\n.. A box.\n& Box a\n  wrap ( a -- a )\n",
         )
         .unwrap();
         let path = root.join("src/Use.ply");
