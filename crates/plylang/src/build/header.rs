@@ -118,7 +118,7 @@ impl Session {
         for (import, dep) in imports.iter().zip(deps) {
             let surface = self.value_surface(*dep);
             if import
-                .bindings(&surface)
+                .bindings(surface)
                 .iter()
                 .any(|(_, local_name)| local_name == name)
             {
@@ -244,55 +244,53 @@ impl Session {
         }
     }
 
+    /// Published JavaScript values of every unit.
+    ///
+    /// `visit` has already rejected an import cycle, so a module's list does not
+    /// depend on the caller. One pass, dependencies first, keeps a facade from
+    /// walking the same module on every import path.
+    pub(super) fn fill_surfaces(&mut self) {
+        self.surfaces = vec![Vec::new(); self.units.len()];
+        for index in 0..self.topo.len() {
+            let id = self.topo[index];
+            let surface = self.surface_of(id);
+            self.surfaces[id] = surface;
+        }
+    }
+
     /// Values this module publishes: its own, and imported values named again
-    /// in the `@` list.
-    fn value_surface(&self, id: usize) -> Vec<String> {
+    /// in the `@` list. [`Session::fill_surfaces`] runs before any header.
+    fn value_surface(&self, id: usize) -> &[String] {
+        &self.surfaces[id]
+    }
+
+    fn surface_of(&self, id: usize) -> Vec<String> {
+        let Exports::List(list) = &self.units[id].module.exports else {
+            return Vec::new();
+        };
         let mut names = Vec::new();
         let mut seen = HashSet::new();
-        let mut stack = HashSet::new();
-        self.collect_values(id, &mut names, &mut seen, &mut stack);
+        let listed: HashSet<&str> = list.names.iter().map(|item| item.name.as_str()).collect();
+        for name in crate::surface::own_public_values(&self.units[id].module) {
+            push_unique(&mut names, &mut seen, name);
+        }
+        for (import, dep) in self.units[id]
+            .module
+            .imports
+            .iter()
+            .zip(&self.units[id].deps)
+        {
+            for (_, local_name) in import.bindings(&self.surfaces[*dep]) {
+                if listed.contains(local_name.as_str()) {
+                    push_unique(&mut names, &mut seen, local_name);
+                }
+            }
+        }
         names
     }
 
-    fn collect_values(
-        &self,
-        id: usize,
-        names: &mut Vec<String>,
-        seen: &mut HashSet<String>,
-        stack: &mut HashSet<usize>,
-    ) {
-        if !stack.insert(id) {
-            return;
-        }
-        let exports = self.units[id].module.exports.clone();
-        let imports = self.units[id].module.imports.clone();
-        let deps = self.units[id].deps.clone();
-        let own = crate::surface::own_public_values(&self.units[id].module);
-        match &exports {
-            Exports::List(list) => {
-                let listed: HashSet<String> =
-                    list.names.iter().map(|item| item.name.clone()).collect();
-                for name in own {
-                    push_unique(names, seen, name);
-                }
-                for (import, dep) in imports.iter().zip(&deps) {
-                    let mut child = Vec::new();
-                    let mut child_seen = HashSet::new();
-                    self.collect_values(*dep, &mut child, &mut child_seen, stack);
-                    for (_, local_name) in import.bindings(&child) {
-                        if listed.contains(&local_name) {
-                            push_unique(names, seen, local_name);
-                        }
-                    }
-                }
-            }
-            Exports::Closed => {}
-        }
-        stack.remove(&id);
-    }
-
     fn imported_values(&self, dep: usize, import: &Import) -> Vec<(String, String)> {
-        import.bindings(&self.value_surface(dep))
+        import.bindings(self.value_surface(dep))
     }
 
     /// `ply_set_` and `ply_bind_` come from the module that declares the place.
@@ -356,7 +354,7 @@ impl Session {
         }
         for (import, dep) in imports.iter().zip(deps) {
             if let Some((remote, _)) = import
-                .bindings(&self.value_surface(*dep))
+                .bindings(self.value_surface(*dep))
                 .into_iter()
                 .find(|(_, local_name)| local_name == name)
             {

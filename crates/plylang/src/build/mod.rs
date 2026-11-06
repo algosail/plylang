@@ -142,6 +142,8 @@ struct Session {
     by_test: HashMap<String, usize>,
     exports_cache: HashMap<PathBuf, HashMap<String, String>>,
     topo: Vec<usize>,
+    /// Published JavaScript values of each unit. Empty until `fill_surfaces`.
+    surfaces: Vec<Vec<String>>,
     outputs: Vec<Output>,
 }
 
@@ -223,6 +225,7 @@ fn open_session(dir: &Path) -> Result<Session, BuildError> {
         by_test: HashMap::new(),
         exports_cache: HashMap::new(),
         topo: Vec::new(),
+        surfaces: Vec::new(),
         outputs: Vec::new(),
     };
     session.collect_sources()?;
@@ -645,6 +648,7 @@ impl Session {
         for id in ids {
             self.visit(id, &mut Vec::new())?;
         }
+        self.fill_surfaces();
         let order = self.topo.clone();
         for id in order {
             self.check_unit(id)?;
@@ -688,6 +692,7 @@ impl Session {
     /// Check one local module and the imports it reaches, then return its JavaScript.
     fn emit_one(&mut self, id: usize) -> Result<String, BuildError> {
         self.visit(id, &mut Vec::new())?;
+        self.fill_surfaces();
         let order = self.topo.clone();
         for unit in order {
             self.check_unit(unit)?;
