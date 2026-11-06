@@ -165,7 +165,7 @@ pub enum Error {
     FieldsPrivate(String),
     /// `: Alias` already closed this import.
     ImportClosed,
-    /// The initial program of a place reads or writes that place, or a place declared later.
+    /// The initial program of a place reads or writes that place, or a place declared later, directly or through a word it calls.
     PlaceNotReady(String),
     /// `=name` or `=>name` and `name` is not a place in scope.
     UndefinedPlace(String),

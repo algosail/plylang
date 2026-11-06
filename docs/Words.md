@@ -4,6 +4,8 @@ These words are in every module. They do not need an import. Operations on value
 
 The top of the stack is the rightmost name. On `x y`, `y` is the top. `..s` is the stack under the named values, and a word that writes `..s` on both sides puts that part back unchanged. `..t` is the stack a quotation left. A quotation is a value of a stack type, written `(in -- out)`.
 
+[Algebra](Algebra.md) lists the equations these words obey. The compiler lowers both sides to the same JavaScript.
+
 ## Stack
 
 ### dup

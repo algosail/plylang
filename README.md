@@ -6,14 +6,15 @@ The compiler translates a module into JavaScript. There is no separate virtual m
 
 This text walks through the language once, with a short example of each feature.
 
-The repository contains the `plylang` compiler and the `plylang-ls` server. Words that work on ready-made values are not built into the compiler: they are imported. The neighboring package `@algosail/ply-prelude` is one such place, and it has its own documentation. The imports in the examples below illustrate the notation.
+The repository contains the `plylang` compiler and the `plylang-ls` server. Words that work on ready-made values are not built into the compiler: they are imported. The neighboring package `@plylang/prelude` is one such place, and it has its own documentation. The import lines below name that package. They check in a package that depends on it.
 
 ## Stack
 
 A signature says what a word takes and what it puts. The tail under that prefix stays in place.
 
 ```ply
-~ "Num" add
+~ "@plylang/prelude/Classes/Arithmetic" add
+~ "@plylang/prelude/Data/Num"
 
 : double ( Num -- Num )
   dup add
@@ -95,15 +96,18 @@ The same permutations as in Factor follow, with names made of letters: `dupd`, `
 `cons` pushes a value and then runs a quotation. The value sits under the quotation, so `5 [ 1 add ] cons` is a quotation of type `(-- Num)` that pushes five and then adds one. The call site does not name that value.
 
 ```ply
-~ "Num" eq, sub, mul
+~ "@plylang/prelude/Classes/Comparable" equal
+~ "@plylang/prelude/Classes/Subtractable" subtract
+~ "@plylang/prelude/Classes/Arithmetic" multiply
+~ "@plylang/prelude/Data/Num"
 
 : fact ( Num -- Num )
-  dup 0 eq [ drop 1 ] [ dup 1 sub fact mul ] if
+  dup 0 equal [ drop 1 ] [ dup 1 subtract fact multiply ] if
 ```
 
-Zero is replaced by one. Otherwise `n` and `n - 1` remain on the stack, the recursive `fact` computes the second, and `mul` multiplies.
+Zero is replaced by one. Otherwise `n` and `n - 1` remain on the stack, the recursive `fact` computes the second, and `multiply` multiplies.
 
-Names before `->` name stack values. The left name is the deeper value, the right name is the top. A quotation sees these names, and they are not part of the input.
+Names before `->` name stack values. The left name is the deeper value, the right name is the top. A quotation sees these names, and they are not part of the input. A clause that only renames the stack, and whose names do not appear in a quotation, is ordinary stack code written without `->`.
 
 ```ply
 : curry ( a (a b -- c) -- (b -- c) )
@@ -184,15 +188,16 @@ In JavaScript a constructor with no fields is `{ tag: "Nothing" }`. One field is
 A word that walks an array is imported. In the example the quotation sits on top. The name comes from one module, and the instance for the array comes from another.
 
 ```ply
-~ "Map" map
-~ "Num" add
-~ "Arr"
+~ "@plylang/prelude/Classes/Mappable" map
+~ "@plylang/prelude/Classes/Arithmetic" add
+~ "@plylang/prelude/Data/Num"
+~ "@plylang/prelude/Data/Array"
 
 : shifted ( -- (Array Num) )
   < 1 2 3 > [ 1 add ] map
 ```
 
-The bare import of `Arr` brings the instances of that module and brings no names. The result is `2`, `3`, `4`.
+The bare import of `Data/Array` brings the instances of that module and brings no names. The result is `2`, `3`, `4`. `dup` of an array shares the JavaScript reference. A word that writes returns a new array, and the input stays.
 
 ## A name for a type
 
@@ -213,7 +218,8 @@ Parameters are written as they are on a type: `- Twin a (Pair a a)`. In a slot a
 `;` with `==` is a distinct type with one constructor and one field. It does not unify with the field. In JavaScript the constructor returns its argument as it is.
 
 ```ply
-~ "Num" add
+~ "@plylang/prelude/Classes/Arithmetic" add
+~ "@plylang/prelude/Data/Num"
 
 ; Age == Age Num
 
@@ -228,10 +234,10 @@ Zero fields, two fields, or two constructors do not fit `==`. A type with `=` is
 `(StrMap a)` is a dictionary with key `Str`. The key becomes known at run time and is not named in the type ahead of time. There is no literal. An empty dictionary in JavaScript is `Object.create(null)`.
 
 ```ply
-~ "Dict" empty, put
+~ "@plylang/prelude/Data/StrMap" emptyStrMap, insertStrMap
 
 : ages ( -- (StrMap Num) )
-  empty "Ada" 36 put
+  emptyStrMap "Ada" 36 insertStrMap
 ```
 
 The order in the example is the dictionary, the key, and the value on top.
@@ -242,35 +248,35 @@ The order in the example is the dictionary, the key, and the value on top.
 
 ```ply
 & Equal a
-  eq ( a a -- Bool )
+  equal ( a a -- Bool )
 
 & Equal a => Ordered a
   before ( a a -- Bool )
 ```
 
 ```ply
-~ "Equal" Equal, eq
-~ "Num"
+~ "@plylang/prelude/Classes/Comparable" Comparable, equal
+~ "@plylang/prelude/Data/Num"
 
-: same ( Equal a => a a -- Bool )
-  eq
+: same ( Comparable a => a a -- Bool )
+  equal
 ```
 
-The instance for numbers is declared in the `Num` module. The bare import of `Num` brings the instances of that module and brings no names. That import gives `same` that instance.
+The instance for numbers is declared in `@plylang/prelude/Data/Num`. The bare import brings the instances of that module and brings no names. That import gives `same` that instance.
 
 A hand-written instance is a word for each method. A module may write one when it defines the class, the type, or the wrapper in the head, or when the head contains a built-in constructor `Int`, `Num`, `Bool`, `Str`, `Unit`, `Array`, or `StrMap`.
 
 ```ply
 & Equal a
-  eq ( a a -- Bool )
+  equal ( a a -- Bool )
 
 ; Box a = Mk a
 
 : eqBox ( Equal a => (Box a) (Box a) -- Bool )
-  (Mk x) (Mk y) -> x y eq
+  (Mk x) (Mk y) -> x y equal
 
 # Equal (Box a)
-  eq = eqBox
+  equal = eqBox
 ```
 
 A parameter of kind `Type -> Type` writes the constructor in the head.
@@ -325,7 +331,7 @@ A package is described by `package.json`.
 }
 ```
 
-A `foreign` word has no body. Its implementation lives in the foreign directory, and the number of JavaScript parameters matches the input length. Leave it out of the `@` list when it stays in this file.
+A `foreign` word has no body. Its implementation lives in the foreign directory, and the number of JavaScript parameters matches the input length. Leave it out of the `@` list when it stays in this file. A foreign word that receives an array or a `StrMap` does not change that value. It copies, then writes. `dup` shares the reference. `Cell` is the type of a shared cell.
 
 ```ply
 : foreign length ( (Array a) -- Num )
@@ -349,7 +355,7 @@ plylang check --js <file>
 
 A word named `main` whose scheme is `( -- Unit )` is the program of that module. It may stay off the `@` list. `build` calls it at the bottom of that module's `.js`, and only when Node started that file. `node dist/App.js` runs the program. An import of the module does not. A `package.json` script can name that file. Several modules may each have a `main`. A module without one is a library. Any other scheme on the name `main` is an error. `plylang compile` also writes those modules, then `script.js` beside them. The file is the program of `ply.entry`. A binding is inlined when `main` can call it. The modules themselves still carry the Node guard. `compile` does not rewrite `exports`.
 
-`plylang docs` writes `DOCS.md` at the package root. `--out` names another file. A module heading is the string used to import it: the package name and the path, or only the path when there is no name. The prose comes from `..`. Inside a module the sections are `Types`, `Classes`, `Instances`, and `Words`. An empty section is left out. The name of a type, a class, or a word is a heading under its section. `Instances` is a list of `#` heads, with no comment and no method bindings.
+`plylang docs` writes `DOCS.md` at the package root. `--out` names another file. A module heading is the string used to import it: the package name and the path, or only the path when there is no name. The prose comes from `..`. Inside a module the sections are `Types`, `Classes`, `Instances`, and `Words`. An empty section is left out. The name of a type, a class, or a word is a heading under its section. `Instances` is a list of `#` heads, with no comment and no method bindings. A head whose type is defined in another module of this package is listed there too.
 
 `plylang check --parse` prints how one file was parsed, and it does not check types. `plylang check --js` prints the JavaScript that `build` would write for that file. Outside a package that is the JavaScript of the one file, and imports are not resolved.
 

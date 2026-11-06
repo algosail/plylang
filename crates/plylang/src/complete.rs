@@ -12,7 +12,7 @@ use crate::build::{available_import_paths, load_provider, load_surface, provider
 use crate::surface::{self, Found};
 use crate::builtin::{self, Lowering};
 use crate::lexer::tokenize;
-use crate::parser::parse;
+use crate::parser::{is_lower, is_upper, parse};
 use crate::paths::mode_from_path;
 use crate::span::{byte_offset, Span};
 use crate::token::{Token, TokenKind};
@@ -854,7 +854,7 @@ fn walk(tokens: &[&Token]) -> Walk {
     while index < tokens.len() {
         let token = tokens[index];
         let next = tokens.get(index + 1);
-        if resets(walked.state, token, next) {
+        if resets(walked.state, token) {
             walked.state = Place::Top;
             walked.depth = 0;
             walked.saw_foreign = false;
@@ -870,7 +870,7 @@ fn followed_by_colon(next: Option<&&Token>) -> bool {
     next.is_some_and(|token| matches!(token.kind, TokenKind::Colon))
 }
 
-fn resets(state: Place, token: &Token, _next: Option<&&Token>) -> bool {
+fn resets(state: Place, token: &Token) -> bool {
     let declaration = is_item(token);
     if !declaration {
         return false;
@@ -978,7 +978,7 @@ fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
                 walked.depth = walked.depth.saturating_sub(1);
             }
             TokenKind::Dot | TokenKind::StackArrow if walked.depth == 0 => walked.binders = false,
-            TokenKind::Ident(name) if is_var(name) => {
+            TokenKind::Ident(name) if is_lower(name) => {
                 let field = followed_by_colon(next);
                 if !field && !walked.vars.iter().any(|var| var == name) {
                     walked.vars.push(name.clone());
@@ -997,7 +997,7 @@ fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
             _ => {}
         },
         Place::DataParams => match &token.kind {
-            TokenKind::Ident(name) if is_var(name) && !token.line_start => {
+            TokenKind::Ident(name) if is_lower(name) && !token.line_start => {
                 if !walked.params.iter().any(|param| param == name) {
                     walked.params.push(name.clone());
                 }
@@ -1720,14 +1720,6 @@ fn unclosed_import(source: &str, offset: usize) -> Option<Span> {
     }
     let quote_at = head.len() - trimmed.len();
     Some(Span::new(quote_at + 1, offset))
-}
-
-fn is_var(name: &str) -> bool {
-    name.chars().next().is_some_and(|ch| ch.is_ascii_lowercase())
-}
-
-fn is_upper(name: &str) -> bool {
-    name.chars().next().is_some_and(|ch| ch.is_ascii_uppercase())
 }
 
 #[cfg(test)]

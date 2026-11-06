@@ -194,7 +194,7 @@ impl<'a> Lexer<'a> {
             '.' => return self.dot(start),
             '"' => return self.string(start),
             '-' => return self.dash(start),
-            ch if ch.is_ascii_digit() => return self.number(start, false),
+            ch if ch.is_ascii_digit() => return self.number(start),
             ch if is_ident_start(ch) => {
                 while self.peek().is_some_and(is_ident_continue) {
                     self.bump();
@@ -326,7 +326,7 @@ impl<'a> Lexer<'a> {
             return Ok(self.make(TokenKind::Arrow, start, self.index));
         }
         if self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
-            return self.number(start, true);
+            return self.number(start);
         }
         // `- Age` at column 0 is a synonym. `a - b` stays a stray dash.
         if start == self.line_start_at {
@@ -335,7 +335,7 @@ impl<'a> Lexer<'a> {
         Err(self.error(start, Error::StrayDash))
     }
 
-    fn number(&mut self, start: usize, _negative: bool) -> Result<Token, Diagnostic> {
+    fn number(&mut self, start: usize) -> Result<Token, Diagnostic> {
         while self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
             self.bump();
         }

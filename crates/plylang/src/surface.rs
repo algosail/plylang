@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::ast::{Class, Data, Def, Exports, Import, Instance, Item, Module, Place, Synonym};
+use crate::ast::{Class, Data, Def, Exports, Instance, Item, Module, Place, Synonym};
 
 pub(crate) enum Found {
     Data(Data),
@@ -214,9 +214,6 @@ fn lookup_in(
         return None;
     }
     for import in &module.imports {
-        if !follows_reexport(module, import) {
-            continue;
-        }
         let Some((file, provider)) = load(from, &import.path) else {
             continue;
         };
@@ -237,10 +234,6 @@ fn may_reexport(module: &Module, name: &str) -> bool {
         Exports::List(list) => list.has(name),
         Exports::Closed => false,
     }
-}
-
-fn follows_reexport(module: &Module, _import: &Import) -> bool {
-    matches!(module.exports, Exports::List(_))
 }
 
 fn own_found(module: &Module, name: &str) -> Option<Found> {

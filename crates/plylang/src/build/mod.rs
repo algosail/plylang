@@ -15,15 +15,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::anf::{js_ident, referenced_words, AnfModule};
-use crate::ast::{
-    push_doc, scheme_string, type_string, Data, Def, Exports, Import, Instance, Item, Module,
-    StackTail, Type,
-};
+use crate::ast::{Def, Exports, Item, Module, StackTail, Type};
 use crate::check::{
     check_and_note, check_with_imports_key, collect_sites, collect_sites_with_imports_key,
     module_notes, KnownModule, ResolvedImport, StackAt,
@@ -34,6 +30,21 @@ use crate::parser::parse;
 use crate::paths::{mode_from_path, module_name_from_path, ParseMode};
 use crate::span::{line_col, Span};
 use crate::LANGUAGE_VERSION;
+
+mod exports;
+mod header;
+mod interface;
+mod js_arity;
+
+use header::{accepts_entry, apply_entry, combine, entry_def, reject_bad_entry, with_entry_guard};
+
+#[cfg(test)]
+use header::relative_specifier;
+
+use exports::{write_package_exports, ExportEntry};
+use interface::interface_text;
+use js_arity::{exported_arity, JsExport};
+
 
 #[derive(Debug)]
 pub struct BuildError {
@@ -139,11 +150,6 @@ enum Spec {
     Package { name: String, subpath: String },
 }
 
-enum JsExport {
-    Missing,
-    Unknown,
-    Arity(usize),
-}
 
 pub fn build(dir: &Path) -> Result<(), BuildError> {
     run_build(dir, false)
@@ -438,12 +444,12 @@ pub fn buffer_notes_open(path: &Path, source: &str, open: &[(&Path, &str)]) -> B
             deps: doc.dependency_paths(),
         };
     }
-    let mut notes = doc.noted();
-    if let Some(error) = entry_error {
-        notes.error = Some(error);
+    let (error, sites) = doc.noted();
+    BufferNotes {
+        error: entry_error.or(error),
+        sites,
+        deps: doc.dependency_paths(),
     }
-    notes.deps = doc.dependency_paths();
-    notes
 }
 
 /// Import paths the package of `from_file` can name: files under the source
@@ -1117,370 +1123,6 @@ impl Session {
         importer_in_test(&self.package, path) && !is_test_entry(&self.units[id].module)
     }
 
-    fn js_header(&self, id: usize, from_js: &Path, anf: &AnfModule) -> String {
-        if matches!(self.units[id].module.exports, Exports::List(_)) {
-            return self.list_js_header(id, from_js, anf);
-        }
-        self.closed_js_header(id, from_js, anf)
-    }
-
-    /// A `@` list. A name from an import is re-exported when the body does
-    /// not mention it. A mentioned name is imported and exported as a binding.
-    /// An instance word is imported from the module that defines it.
-    fn list_js_header(&self, id: usize, from_js: &Path, anf: &AnfModule) -> String {
-        let listed: HashSet<String> = self.units[id]
-            .module
-            .exports
-            .list()
-            .expect("name list")
-            .names
-            .iter()
-            .map(|item| item.name.clone())
-            .collect();
-        let imports = self.units[id].module.imports.clone();
-        let deps = self.units[id].deps.clone();
-        let local = local_runtime_names(&self.units[id].module);
-        let referenced: HashSet<String> = referenced_words(anf).into_iter().collect();
-        let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
-        let mut reexports: Vec<(String, Vec<(String, String)>)> = Vec::new();
-        let mut local_exports: Vec<String> = Vec::new();
-        for (import, dep) in imports.iter().zip(&deps) {
-            let brought = self.imported_values(*dep, import);
-            if brought.is_empty() {
-                continue;
-            }
-            let Some(spec) = self.import_spec(import, *dep, from_js) else {
-                continue;
-            };
-            let mut local_names = Vec::new();
-            let mut reexport_names = Vec::new();
-            for (remote, local_name) in brought {
-                if listed.contains(&local_name) && !referenced.contains(&local_name) {
-                    reexport_names.push((remote, local_name));
-                } else {
-                    if listed.contains(&local_name) && !local_exports.contains(&local_name) {
-                        local_exports.push(local_name.clone());
-                    }
-                    local_names.push((remote, local_name));
-                }
-            }
-            if !local_names.is_empty() {
-                push_group(&mut groups, spec.clone(), local_names);
-            }
-            if !reexport_names.is_empty() {
-                push_group(&mut reexports, spec, reexport_names);
-            }
-        }
-        let mut extra: Vec<String> = referenced
-            .iter()
-            .filter(|name| !local.contains(*name))
-            .cloned()
-            .collect();
-        extra.sort();
-        extra.dedup();
-        for name in extra {
-            if groups
-                .iter()
-                .any(|(_, names)| names.iter().any(|(_, local_name)| local_name == &name))
-            {
-                continue;
-            }
-            let Some(spec) = self.spec_for_extra(id, &name, from_js, &imports, &deps) else {
-                continue;
-            };
-            let pair = self.extra_pair(id, &name, &imports, &deps);
-            push_group(&mut groups, spec, vec![pair]);
-            if listed.contains(&name) && !local_exports.contains(&name) {
-                local_exports.push(name);
-            }
-        }
-        let mut header = String::new();
-        for (spec, names) in &groups {
-            header.push_str(&import_line(spec, names));
-            header.push('\n');
-        }
-        let sibling = self.foreign_js(id);
-        header.push_str(&foreign_header(&self.units[id].module, sibling, from_js));
-        if !local_exports.is_empty() {
-            let exported = local_exports
-                .iter()
-                .map(|name| export_binding(name))
-                .collect::<Vec<_>>()
-                .join(", ");
-            header.push_str(&format!("export {{ {exported} }};\n"));
-        }
-        for (spec, names) in &reexports {
-            header.push_str(&reexport_line(spec, names));
-            header.push('\n');
-        }
-        header
-    }
-
-    fn spec_for_extra(
-        &self,
-        id: usize,
-        name: &str,
-        from_js: &Path,
-        imports: &[Import],
-        deps: &[usize],
-    ) -> Option<String> {
-        if let Some((home, _)) = self.place_helper(id, name) {
-            if home == id {
-                return None;
-            }
-            return self.unit_js_spec(home, from_js);
-        }
-        for (import, dep) in imports.iter().zip(deps) {
-            let surface = self.value_surface(*dep);
-            if import
-                .bindings(&surface)
-                .iter()
-                .any(|(_, local_name)| local_name == name)
-            {
-                return self.import_spec(import, *dep, from_js);
-            }
-        }
-        let home = self.instance_home(name)?;
-        if home == id {
-            return None;
-        }
-        self.unit_js_spec(home, from_js)
-    }
-
-    /// The module that defines `name` and binds it in `#`.
-    fn instance_home(&self, name: &str) -> Option<usize> {
-        self.units.iter().position(|unit| {
-            let defines = unit.module.items.iter().any(|item| {
-                matches!(item, Item::Def(def) if def.name == name)
-            });
-            defines
-                && crate::surface::own_method_words(&unit.module)
-                    .iter()
-                    .any(|word| word == name)
-        })
-    }
-
-    fn unit_js_spec(&self, id: usize, from_js: &Path) -> Option<String> {
-        let unit = &self.units[id];
-        let module_path = unit.module_path.as_deref().unwrap_or("");
-        if unit.package_root == self.package.root {
-            if module_path.is_empty() {
-                return None;
-            }
-            let to_js = self.package.out.join(module_path).with_extension("js");
-            return Some(relative_specifier(from_js, &to_js));
-        }
-        let name = npm_name(&unit.package_root)?;
-        if module_path.is_empty() {
-            Some(name)
-        } else {
-            Some(format!("{name}/{module_path}"))
-        }
-    }
-
-    /// A file with no name list. Test entries are this. Imports are used here
-    /// and are not re-exported. Every local word is a JavaScript export, so the
-    /// runner can call it.
-    fn closed_js_header(&self, id: usize, from_js: &Path, anf: &AnfModule) -> String {
-        let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
-        let imports = self.units[id].module.imports.clone();
-        let deps = self.units[id].deps.clone();
-        for (import, dep) in imports.iter().zip(&deps) {
-            let names = self.imported_values(*dep, import);
-            if names.is_empty() {
-                continue;
-            }
-            let Some(spec) = self.import_spec(import, *dep, from_js) else {
-                continue;
-            };
-            push_group(&mut groups, spec, names);
-        }
-        let local = local_runtime_names(&self.units[id].module);
-        let mut extra: Vec<String> = referenced_words(anf)
-            .into_iter()
-            .filter(|name| !local.contains(name))
-            .collect();
-        extra.sort();
-        extra.dedup();
-        for name in extra {
-            if groups
-                .iter()
-                .any(|(_, names)| names.iter().any(|(_, local_name)| local_name == &name))
-            {
-                continue;
-            }
-            let Some(spec) = self.spec_for_extra(id, &name, from_js, &imports, &deps) else {
-                continue;
-            };
-            push_group(&mut groups, spec, vec![self.extra_pair(id, &name, &imports, &deps)]);
-        }
-        let mut header = String::new();
-        for (spec, names) in &groups {
-            header.push_str(&import_line(spec, names));
-            header.push('\n');
-        }
-        let foreign = foreign_names(&self.units[id].module);
-        if !foreign.is_empty() {
-            let sibling = self.foreign_js(id).expect("foreign directory");
-            let spec = relative_specifier(from_js, &sibling);
-            let names: Vec<(String, String)> =
-                foreign.iter().map(|(name, _)| (name.clone(), name.clone())).collect();
-            header.push_str(&import_line(&spec, &names));
-            header.push('\n');
-            let exported = foreign
-                .iter()
-                .filter(|(_, private)| !private)
-                .map(|(name, _)| export_binding(name))
-                .collect::<Vec<_>>()
-                .join(", ");
-            if !exported.is_empty() {
-                header.push_str(&format!("export {{ {exported} }};\n"));
-            }
-        }
-        header
-    }
-
-    /// Values this module publishes: its own, and imported values named again
-    /// in the `@` list.
-    fn value_surface(&self, id: usize) -> Vec<String> {
-        let mut names = Vec::new();
-        let mut seen = HashSet::new();
-        let mut stack = HashSet::new();
-        self.collect_values(id, &mut names, &mut seen, &mut stack);
-        names
-    }
-
-    fn collect_values(
-        &self,
-        id: usize,
-        names: &mut Vec<String>,
-        seen: &mut HashSet<String>,
-        stack: &mut HashSet<usize>,
-    ) {
-        if !stack.insert(id) {
-            return;
-        }
-        let exports = self.units[id].module.exports.clone();
-        let imports = self.units[id].module.imports.clone();
-        let deps = self.units[id].deps.clone();
-        let own = crate::surface::own_public_values(&self.units[id].module);
-        match &exports {
-            Exports::List(list) => {
-                let listed: HashSet<String> =
-                    list.names.iter().map(|item| item.name.clone()).collect();
-                for name in own {
-                    push_unique(names, seen, name);
-                }
-                for (import, dep) in imports.iter().zip(&deps) {
-                    let mut child = Vec::new();
-                    let mut child_seen = HashSet::new();
-                    self.collect_values(*dep, &mut child, &mut child_seen, stack);
-                    for (_, local_name) in import.bindings(&child) {
-                        if listed.contains(&local_name) {
-                            push_unique(names, seen, local_name);
-                        }
-                    }
-                }
-            }
-            Exports::Closed => {}
-        }
-        stack.remove(&id);
-    }
-
-    fn imported_values(&self, dep: usize, import: &Import) -> Vec<(String, String)> {
-        import.bindings(&self.value_surface(dep))
-    }
-
-    /// `ply_set_` and `ply_bind_` come from the module that declares the place.
-    /// A facade that only reexports the reader is not that module.
-    fn place_helper(&self, id: usize, name: &str) -> Option<(usize, String)> {
-        let local = name
-            .strip_prefix("ply_set_")
-            .or_else(|| name.strip_prefix("ply_bind_"))?;
-        let mut seen = HashSet::new();
-        self.place_defining(id, local, &mut seen)
-    }
-
-    fn place_defining(
-        &self,
-        id: usize,
-        local: &str,
-        seen: &mut HashSet<usize>,
-    ) -> Option<(usize, String)> {
-        if !seen.insert(id) {
-            return None;
-        }
-        if self.units[id].module.items.iter().any(|item| {
-            matches!(item, Item::Place(place) if place.name == local)
-        }) {
-            return Some((id, local.to_string()));
-        }
-        let imports = self.units[id].module.imports.clone();
-        let deps = self.units[id].deps.clone();
-        for (import, dep) in imports.iter().zip(deps) {
-            let Some(remote) = import.remote_of(local) else {
-                continue;
-            };
-            if let Some(found) = self.place_defining(dep, remote, seen) {
-                return Some(found);
-            }
-        }
-        None
-    }
-
-    /// A referenced name that was not already grouped. An import binds
-    /// `(remote, local)`. An instance word keeps its own name.
-    /// A place helper's remote name is the defining module's `ply_set_` or `ply_bind_`.
-    fn extra_pair(
-        &self,
-        _id: usize,
-        name: &str,
-        imports: &[Import],
-        deps: &[usize],
-    ) -> (String, String) {
-        if let Some((_, canon)) = self.place_helper(_id, name) {
-            let prefix = if name.starts_with("ply_bind_") {
-                "ply_bind_"
-            } else {
-                "ply_set_"
-            };
-            return (format!("{prefix}{canon}"), name.to_string());
-        }
-        for (import, dep) in imports.iter().zip(deps) {
-            if let Some((remote, _)) = import
-                .bindings(&self.value_surface(*dep))
-                .into_iter()
-                .find(|(_, local_name)| local_name == name)
-            {
-                return (remote, name.to_string());
-            }
-        }
-        (name.to_string(), name.to_string())
-    }
-
-    /// `src/Ply/Int.ply` is implemented by `foreign/Ply/Int.js`.
-    fn foreign_js(&self, id: usize) -> Option<PathBuf> {
-        let module_path = self.units[id].module_path.as_deref()?;
-        Some(
-            self.package
-                .foreign
-                .as_ref()?
-                .join(module_path)
-                .with_extension("js"),
-        )
-    }
-
-    fn import_spec(&self, import: &Import, dep: usize, from_js: &Path) -> Option<String> {
-        match classify(&import.path) {
-            Some(Spec::Package { .. }) | None => Some(import.path.clone()),
-            Some(Spec::Local(_)) => {
-                let module_path = self.units[dep].module_path.as_ref()?;
-                let to_js = self.package.out.join(module_path).with_extension("js");
-                Some(relative_specifier(from_js, &to_js))
-            }
-        }
-    }
-
     fn fail(&self, id: usize, span: Span, error: Error) -> BuildError {
         located(
             Path::new(&self.units[id].display),
@@ -1793,7 +1435,7 @@ impl<'a> OpenDoc<'a> {
         Ok(exports)
     }
 
-    fn noted(&self) -> BufferNotes {
+    fn noted(&self) -> (Option<Diagnostic>, Vec<StackAt>) {
         let import_count = self.units[0].module.imports.len();
         let mut providers = Vec::with_capacity(import_count);
         let mut knowns = Vec::with_capacity(import_count);
@@ -1816,28 +1458,19 @@ impl<'a> OpenDoc<'a> {
             self.units[0].module_path.as_deref(),
         );
         if self.buffer_needs_public() && matches!(self.units[0].module.exports, Exports::Closed) {
-            return BufferNotes {
-                error: Some(Diagnostic::new(
+            return (
+                Some(Diagnostic::new(
                     self.units[0].module.span,
                     Error::MissingPublicList,
                 )),
-                sites: self.sites(),
-                deps: Vec::new(),
-            };
+                self.sites(),
+            );
         }
         let noted = check_and_note(&self.units[0].module, &resolved, &key);
         if !noted.sites.is_empty() {
-            return BufferNotes {
-                error: noted.error,
-                sites: noted.sites,
-                deps: Vec::new(),
-            };
+            return (noted.error, noted.sites);
         }
-        BufferNotes {
-            error: noted.error,
-            sites: collect_sites(&self.units[0].module),
-            deps: Vec::new(),
-        }
+        (noted.error, collect_sites(&self.units[0].module))
     }
 
     fn dependency_paths(&self) -> Vec<PathBuf> {
@@ -1897,7 +1530,7 @@ impl<'a> OpenDoc<'a> {
             if !seen.insert(id) {
                 continue;
             }
-            out.push(known_doc(&self.units, id));
+            out.push(known_at(&self.units, id));
             for dep in &self.units[id].deps {
                 pending.push(*dep);
             }
@@ -1936,7 +1569,7 @@ fn doc_cycle(units: &[DocUnit], stack: &[usize], again: usize) -> Error {
         .map(|id| units[*id].label.clone())
         .collect();
     names.push(units[again].label.clone());
-    Error::ImportCycle(names.join(", "))
+    import_cycle(names)
 }
 
 fn read_package(root: &Path) -> Result<Package, BuildError> {
@@ -2159,12 +1792,6 @@ fn export_key(subpath: &str) -> String {
     }
 }
 
-struct ExportEntry {
-    key: String,
-    ply: String,
-    js: String,
-}
-
 fn export_entries(units: &[Unit], out_rel: &str, entry: Option<&str>) -> Vec<ExportEntry> {
     let mut entries = Vec::new();
     for unit in units {
@@ -2197,429 +1824,6 @@ fn export_entries(units: &[Unit], out_rel: &str, entry: Option<&str>) -> Vec<Exp
     }
     entries.sort_by(|left, right| left.key.cmp(&right.key));
     entries
-}
-
-/// Replace the top-level `exports` value. Every other byte of `package.json` stays.
-fn write_package_exports(root: &Path, entries: &[ExportEntry]) -> Result<(), BuildError> {
-    let path = root.join("package.json");
-    let text = fs::read_to_string(&path).map_err(|error| os_error(&path, error))?;
-    let updated = match find_exports(&text) {
-        Ok(ExportsSpot::Found { start, end }) => {
-            let indent = line_indent(&text, start);
-            let existing = serde_json::from_str::<Value>(&text[start..end]).unwrap_or(Value::Null);
-            let mut out = String::new();
-            out.push_str(&text[..start]);
-            out.push_str(&render_merged(entries, &existing, &indent));
-            out.push_str(&text[end..]);
-            out
-        }
-        Ok(ExportsSpot::Missing { close }) => insert_exports(&text, close, entries),
-        Err(JsonError::NotObject) => {
-            return Err(pkg_error(&path, &text, Error::PackageJsonNotObject))
-        }
-        Err(JsonError::Invalid) => {
-            return Err(pkg_error(&path, &text, Error::PackageJsonInvalid))
-        }
-    };
-    fs::write(&path, updated).map_err(|error| os_error(&path, error))
-}
-
-enum ExportsSpot {
-    Found { start: usize, end: usize },
-    Missing { close: usize },
-}
-
-#[derive(Debug)]
-enum JsonError {
-    NotObject,
-    Invalid,
-}
-
-/// The last top-level `"exports"` wins, matching `JSON.parse`.
-fn find_exports(text: &str) -> Result<ExportsSpot, JsonError> {
-    let mut scan = JsonScan::new(text);
-    scan.skip_ws();
-    if scan.bump() != Some('{') {
-        return Err(JsonError::NotObject);
-    }
-    let mut found = None;
-    loop {
-        scan.skip_ws();
-        match scan.peek() {
-            Some('}') => {
-                return Ok(match found {
-                    Some((start, end)) => ExportsSpot::Found { start, end },
-                    None => ExportsSpot::Missing { close: scan.index },
-                });
-            }
-            Some('"') => {
-                let name = scan.parse_string().map_err(|_| JsonError::Invalid)?;
-                scan.skip_ws();
-                if scan.bump() != Some(':') {
-                    return Err(JsonError::Invalid);
-                }
-                scan.skip_ws();
-                let start = scan.index;
-                scan.skip_value().map_err(|_| JsonError::Invalid)?;
-                if name == "exports" {
-                    found = Some((start, scan.index));
-                }
-                scan.skip_ws();
-                if scan.peek() == Some(',') {
-                    scan.bump();
-                }
-            }
-            _ => return Err(JsonError::Invalid),
-        }
-    }
-}
-
-fn insert_exports(text: &str, close: usize, entries: &[ExportEntry]) -> String {
-    let indent = object_indent(text);
-    let value = render_exports(entries, &indent);
-    let head = text[..close].trim_end();
-    let mut out = String::new();
-    out.push_str(head);
-    if !head.ends_with('{') && !head.ends_with(',') {
-        out.push(',');
-    }
-    out.push('\n');
-    out.push_str(&indent);
-    out.push_str("\"exports\": ");
-    out.push_str(&value);
-    out.push('\n');
-    out.push('}');
-    out.push_str(&text[close + '}'.len_utf8()..]);
-    out
-}
-
-/// Tool-owned module keys are replaced. A stale `{ ply, import }` key for a
-/// module that is gone is removed. `.` is replaced only when `entries` names
-/// it, which is when `ply.entry` is set. Every other key stays.
-fn render_merged(entries: &[ExportEntry], existing: &Value, indent: &str) -> String {
-    let preserved = preserved_exports(existing, entries);
-    if preserved.is_empty() {
-        return render_exports(entries, indent);
-    }
-    if entries.is_empty() {
-        return render_preserved_only(&preserved, indent);
-    }
-    let owned = render_exports(entries, indent);
-    let key_indent = format!("{indent}{indent}");
-    let close = format!("\n{indent}}}");
-    let Some(head) = owned.strip_suffix(&close) else {
-        return owned;
-    };
-    let mut out = head.to_string();
-    out.push(',');
-    out.push('\n');
-    for (index, (key, value)) in preserved.iter().enumerate() {
-        out.push_str(&key_indent);
-        out.push_str(&json_string(key));
-        out.push_str(": ");
-        out.push_str(&serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()));
-        if index + 1 != preserved.len() {
-            out.push(',');
-        }
-        out.push('\n');
-    }
-    out.push_str(indent);
-    out.push('}');
-    out
-}
-
-fn preserved_exports(existing: &Value, entries: &[ExportEntry]) -> Vec<(String, Value)> {
-    let Some(object) = existing.as_object() else {
-        return Vec::new();
-    };
-    let owned: HashSet<&str> = entries.iter().map(|entry| entry.key.as_str()).collect();
-    let mut kept = Vec::new();
-    for (key, value) in object {
-        if owned.contains(key.as_str()) {
-            continue;
-        }
-        if is_stale_module_export(key, value) {
-            continue;
-        }
-        kept.push((key.clone(), value.clone()));
-    }
-    kept
-}
-
-/// `./Old` written as exactly `{ "ply", "import" }` for a module this build
-/// does not emit. `.` is never stale: without `ply.entry` a hand-written root
-/// stays, and with `ply.entry` the key is owned and replaced above.
-fn is_stale_module_export(key: &str, value: &Value) -> bool {
-    let Some(rest) = key.strip_prefix("./") else {
-        return false;
-    };
-    if module_name_from_path(&format!("{rest}.ply")).is_err() {
-        return false;
-    }
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    object.len() == 2
-        && object.get("ply").and_then(Value::as_str).is_some()
-        && object.get("import").and_then(Value::as_str).is_some()
-}
-
-fn render_preserved_only(preserved: &[(String, Value)], indent: &str) -> String {
-    let key_indent = format!("{indent}{indent}");
-    let mut out = String::from("{\n");
-    for (index, (key, value)) in preserved.iter().enumerate() {
-        out.push_str(&key_indent);
-        out.push_str(&json_string(key));
-        out.push_str(": ");
-        out.push_str(&serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()));
-        if index + 1 != preserved.len() {
-            out.push(',');
-        }
-        out.push('\n');
-    }
-    out.push_str(indent);
-    out.push('}');
-    out
-}
-
-fn render_exports(entries: &[ExportEntry], indent: &str) -> String {
-    if entries.is_empty() {
-        return "{}".to_string();
-    }
-    let key_indent = format!("{indent}{indent}");
-    let field_indent = format!("{key_indent}{indent}");
-    let mut out = String::from("{\n");
-    for (index, entry) in entries.iter().enumerate() {
-        out.push_str(&key_indent);
-        out.push_str(&json_string(&entry.key));
-        out.push_str(": {\n");
-        out.push_str(&field_indent);
-        out.push_str("\"ply\": ");
-        out.push_str(&json_string(&entry.ply));
-        out.push_str(",\n");
-        out.push_str(&field_indent);
-        out.push_str("\"import\": ");
-        out.push_str(&json_string(&entry.js));
-        out.push('\n');
-        out.push_str(&key_indent);
-        out.push('}');
-        if index + 1 != entries.len() {
-            out.push(',');
-        }
-        out.push('\n');
-    }
-    out.push_str(indent);
-    out.push('}');
-    out
-}
-
-fn json_string(text: &str) -> String {
-    let mut out = String::from("\"");
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn line_indent(text: &str, index: usize) -> String {
-    let line_start = text[..index].rfind('\n').map(|pos| pos + 1).unwrap_or(0);
-    text[line_start..]
-        .chars()
-        .take_while(|ch| *ch == ' ' || *ch == '\t')
-        .collect()
-}
-
-fn object_indent(text: &str) -> String {
-    for line in text.lines().skip(1) {
-        let indent: String = line
-            .chars()
-            .take_while(|ch| *ch == ' ' || *ch == '\t')
-            .collect();
-        if !indent.is_empty() {
-            return indent;
-        }
-    }
-    "  ".to_string()
-}
-
-struct JsonScan<'a> {
-    text: &'a str,
-    index: usize,
-}
-
-impl<'a> JsonScan<'a> {
-    fn new(text: &'a str) -> Self {
-        Self { text, index: 0 }
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.text[self.index..].chars().next()
-    }
-
-    fn bump(&mut self) -> Option<char> {
-        let ch = self.peek()?;
-        self.index += ch.len_utf8();
-        Some(ch)
-    }
-
-    fn skip_ws(&mut self) {
-        while self.peek().is_some_and(char::is_whitespace) {
-            self.bump();
-        }
-    }
-
-    fn parse_string(&mut self) -> Result<String, ()> {
-        if self.bump() != Some('"') {
-            return Err(());
-        }
-        let mut out = String::new();
-        loop {
-            match self.bump() {
-                Some('"') => return Ok(out),
-                Some('\\') => {
-                    let escaped = match self.bump() {
-                        Some('"') => '"',
-                        Some('\\') => '\\',
-                        Some('/') => '/',
-                        Some('b') => '\u{0008}',
-                        Some('f') => '\u{000c}',
-                        Some('n') => '\n',
-                        Some('r') => '\r',
-                        Some('t') => '\t',
-                        Some('u') => self.unicode_escape()?,
-                        _ => return Err(()),
-                    };
-                    out.push(escaped);
-                }
-                Some(ch) => out.push(ch),
-                None => return Err(()),
-            }
-        }
-    }
-
-    fn hex4(&mut self) -> Result<u32, ()> {
-        let mut hex = String::new();
-        for _ in 0..4 {
-            let ch = self.bump().ok_or(())?;
-            if !ch.is_ascii_hexdigit() {
-                return Err(());
-            }
-            hex.push(ch);
-        }
-        u32::from_str_radix(&hex, 16).map_err(|_| ())
-    }
-
-    /// JSON encodes a scalar outside the BMP as a surrogate pair.
-    fn unicode_escape(&mut self) -> Result<char, ()> {
-        let code = self.hex4()?;
-        if (0xD800..=0xDBFF).contains(&code) {
-            if self.bump() != Some('\\') || self.bump() != Some('u') {
-                return Err(());
-            }
-            let low = self.hex4()?;
-            if !(0xDC00..=0xDFFF).contains(&low) {
-                return Err(());
-            }
-            let scalar = 0x10000 + (((code - 0xD800) << 10) | (low - 0xDC00));
-            return char::from_u32(scalar).ok_or(());
-        }
-        if (0xDC00..=0xDFFF).contains(&code) {
-            return Err(());
-        }
-        char::from_u32(code).ok_or(())
-    }
-
-    fn skip_value(&mut self) -> Result<(), ()> {
-        match self.peek() {
-            Some('"') => {
-                self.parse_string()?;
-                Ok(())
-            }
-            Some('{') => self.skip_container('{', '}'),
-            Some('[') => self.skip_container('[', ']'),
-            Some('t') => self.skip_literal("true"),
-            Some('f') => self.skip_literal("false"),
-            Some('n') => self.skip_literal("null"),
-            Some('-' | '0'..='9') => self.skip_number(),
-            _ => Err(()),
-        }
-    }
-
-    fn skip_container(&mut self, open: char, close: char) -> Result<(), ()> {
-        if self.bump() != Some(open) {
-            return Err(());
-        }
-        let mut depth = 1;
-        while depth > 0 {
-            match self.peek() {
-                Some('"') => {
-                    self.parse_string()?;
-                }
-                Some(ch) if ch == open => {
-                    self.bump();
-                    depth += 1;
-                }
-                Some(ch) if ch == close => {
-                    self.bump();
-                    depth -= 1;
-                }
-                Some(_) => {
-                    self.bump();
-                }
-                None => return Err(()),
-            }
-        }
-        Ok(())
-    }
-
-    fn skip_literal(&mut self, literal: &str) -> Result<(), ()> {
-        if self.text[self.index..].starts_with(literal) {
-            self.index += literal.len();
-            Ok(())
-        } else {
-            Err(())
-        }
-    }
-
-    fn skip_number(&mut self) -> Result<(), ()> {
-        if self.peek() == Some('-') {
-            self.bump();
-        }
-        if !self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
-            return Err(());
-        }
-        while self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
-            self.bump();
-        }
-        if self.peek() == Some('.') {
-            self.bump();
-            while self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
-                self.bump();
-            }
-        }
-        if matches!(self.peek(), Some('e' | 'E')) {
-            self.bump();
-            if matches!(self.peek(), Some('+' | '-')) {
-                self.bump();
-            }
-            if !self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
-                return Err(());
-            }
-            while self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
-                self.bump();
-            }
-        }
-        Ok(())
-    }
 }
 
 fn target_file(root: &Path, target: &str) -> PathBuf {
@@ -2809,30 +2013,65 @@ pub(crate) fn module_path_of(source: &Path, file: &Path) -> String {
         .to_string()
 }
 
-fn known_at(units: &[Unit], id: usize) -> KnownModule {
-    let origin = units[id].path.display().to_string();
-    let module = units[id].module.clone();
-    let package_root = units[id].package_root.clone();
-    let module_path = units[id].module_path.clone();
-    let deps = units[id]
-        .deps
-        .iter()
-        .map(|dep| units[*dep].path.display().to_string())
-        .collect();
-    known_module(&origin, module, &package_root, module_path.as_deref(), deps)
+trait LoadedUnit {
+    fn file(&self) -> &Path;
+    fn loaded_module(&self) -> &Module;
+    fn loaded_root(&self) -> &Path;
+    fn loaded_module_path(&self) -> Option<&str>;
+    fn dep_ids(&self) -> &[usize];
 }
 
-fn known_doc(units: &[DocUnit], id: usize) -> KnownModule {
-    let origin = units[id].path.display().to_string();
-    let module = units[id].module.clone();
-    let package_root = units[id].package_root.clone();
-    let module_path = units[id].module_path.clone();
-    let deps = units[id]
-        .deps
+impl LoadedUnit for Unit {
+    fn file(&self) -> &Path {
+        &self.path
+    }
+    fn loaded_module(&self) -> &Module {
+        &self.module
+    }
+    fn loaded_root(&self) -> &Path {
+        &self.package_root
+    }
+    fn loaded_module_path(&self) -> Option<&str> {
+        self.module_path.as_deref()
+    }
+    fn dep_ids(&self) -> &[usize] {
+        &self.deps
+    }
+}
+
+impl LoadedUnit for DocUnit {
+    fn file(&self) -> &Path {
+        &self.path
+    }
+    fn loaded_module(&self) -> &Module {
+        &self.module
+    }
+    fn loaded_root(&self) -> &Path {
+        &self.package_root
+    }
+    fn loaded_module_path(&self) -> Option<&str> {
+        self.module_path.as_deref()
+    }
+    fn dep_ids(&self) -> &[usize] {
+        &self.deps
+    }
+}
+
+fn known_at(units: &[impl LoadedUnit], id: usize) -> KnownModule {
+    let unit = &units[id];
+    let origin = unit.file().display().to_string();
+    let deps = unit
+        .dep_ids()
         .iter()
-        .map(|dep| units[*dep].path.display().to_string())
+        .map(|dep| units[*dep].file().display().to_string())
         .collect();
-    known_module(&origin, module, &package_root, module_path.as_deref(), deps)
+    known_module(
+        &origin,
+        unit.loaded_module().clone(),
+        unit.loaded_root(),
+        unit.loaded_module_path(),
+        deps,
+    )
 }
 
 fn known_module(
@@ -2890,6 +2129,10 @@ fn clean_rel(path: &str) -> String {
     path.trim_matches('/').to_string()
 }
 
+fn import_cycle(names: Vec<String>) -> Error {
+    Error::ImportCycle(names.join(", "))
+}
+
 fn cycle_message(units: &[Unit], stack: &[usize], again: usize) -> Error {
     let start = stack.iter().position(|id| *id == again).unwrap_or(0);
     let mut names: Vec<String> = stack[start..]
@@ -2897,7 +2140,7 @@ fn cycle_message(units: &[Unit], stack: &[usize], again: usize) -> Error {
         .map(|id| unit_label(&units[*id]))
         .collect();
     names.push(unit_label(&units[again]));
-    Error::ImportCycle(names.join(", "))
+    import_cycle(names)
 }
 
 fn unit_label(unit: &Unit) -> String {
@@ -2918,359 +2161,6 @@ fn file_label(path: &Path) -> String {
         .to_string()
 }
 
-fn interface_text(module: &Module) -> String {
-    let Exports::List(list) = &module.exports else {
-        return closed_interface(module);
-    };
-    let mut out = String::from("language 1\n\n");
-    out.push_str(&list.to_string());
-    out.push('\n');
-    for import in &module.imports {
-        out.push('\n');
-        out.push_str(&import.to_string());
-        out.push('\n');
-    }
-    for item in &module.items {
-        if !interface_keeps(module, item) {
-            continue;
-        }
-        out.push('\n');
-        match item {
-            Item::Def(def) => push_interface_def(&mut out, def),
-            Item::Place(place) => push_interface_place(&mut out, place),
-            Item::Data(data) => {
-                out.push_str(&interface_data(module, data));
-                out.push('\n');
-            }
-            other => {
-                out.push_str(&other.to_string());
-                out.push('\n');
-            }
-        }
-    }
-    out
-}
-
-fn interface_keeps(module: &Module, item: &Item) -> bool {
-    let Some(list) = module.exports.list() else {
-        return true;
-    };
-    match item {
-        Item::Data(data) => {
-            list.has(&data.name) || data.ctors.iter().any(|ctor| list.has(&ctor.name))
-        }
-        Item::Synonym(synonym) => list.has(&synonym.name),
-        Item::Def(def) => crate::surface::js_exports_def(module, def),
-        Item::Place(place) => list.has(&place.name),
-        Item::Class(class) => {
-            list.has(&class.name) || class.methods.iter().any(|method| list.has(&method.name))
-        }
-        Item::Instance(instance) => !instance_mentions_unlisted(module, instance),
-    }
-}
-
-/// Constructors absent from `@` are not part of the interface.
-/// A listed type with none of its constructors is still mentionable.
-fn interface_data(module: &Module, data: &Data) -> String {
-    let Some(list) = module.exports.list() else {
-        return data.to_string();
-    };
-    if data.foreign {
-        return data.to_string();
-    }
-    let mut kept = data.clone();
-    kept.ctors.retain(|ctor| list.has(&ctor.name));
-    if kept.ctors.is_empty() {
-        kept.foreign = true;
-        kept.newtype = false;
-    }
-    kept.to_string()
-}
-
-fn instance_mentions_unlisted(module: &Module, instance: &Instance) -> bool {
-    instance
-        .args
-        .iter()
-        .any(|ty| type_is_unlisted(module, ty))
-}
-
-fn type_is_unlisted(module: &Module, ty: &Type) -> bool {
-    match ty {
-        Type::Var(_) => false,
-        Type::Ctor(name) => local_unlisted(module, name),
-        Type::App(head, args) => {
-            type_is_unlisted(module, head) || args.iter().any(|ty| type_is_unlisted(module, ty))
-        }
-        Type::Fun(effect) => effect
-            .input
-            .items
-            .iter()
-            .chain(&effect.output.items)
-            .any(|ty| type_is_unlisted(module, ty)),
-        Type::Record(row) => {
-            row.fields.iter().any(|(_, ty)| type_is_unlisted(module, ty))
-                || row.tail_ty().is_some_and(|ty| type_is_unlisted(module, ty))
-        }
-    }
-}
-
-fn local_unlisted(module: &Module, name: &str) -> bool {
-    let local = module.items.iter().any(|item| match item {
-        Item::Data(data) => data.name == name,
-        Item::Synonym(synonym) => synonym.name == name,
-        _ => false,
-    });
-    local
-        && match module.exports.list() {
-            Some(list) => !list.has(name),
-            None => true,
-        }
-}
-
-fn push_interface_def(out: &mut String, def: &Def) {
-    push_doc(out, &def.doc);
-    out.push_str(": ");
-    if def.vis.is_foreign() {
-        out.push_str("foreign ");
-    }
-    out.push_str(&def.name);
-    out.push_str(" ( ");
-    out.push_str(&scheme_string(&def.scheme));
-    out.push_str(" )\n");
-}
-
-fn push_interface_place(out: &mut String, place: &crate::ast::Place) {
-    push_doc(out, &place.doc);
-    out.push_str("= ");
-    out.push_str(&place.name);
-    out.push(' ');
-    out.push_str(&type_string(&place.ty));
-    out.push('\n');
-}
-
-fn closed_interface(module: &Module) -> String {
-    let mut out = String::from("language 1\n");
-    for import in &module.imports {
-        out.push_str(&import.to_string());
-        out.push('\n');
-    }
-    for item in &module.items {
-        match item {
-            Item::Data(data) => {
-                out.push('\n');
-                out.push_str(&data.to_string());
-                out.push('\n');
-            }
-            Item::Synonym(synonym) => {
-                out.push('\n');
-                out.push_str(&synonym.to_string());
-                out.push('\n');
-            }
-            Item::Def(def) => {
-                out.push('\n');
-                push_doc(&mut out, &def.doc);
-                out.push_str(": ");
-                if def.vis.is_foreign() {
-                    out.push_str("foreign ");
-                }
-                out.push_str(&def.name);
-                out.push_str(" ( ");
-                out.push_str(&scheme_string(&def.scheme));
-                out.push_str(" )\n");
-            }
-            Item::Place(place) => {
-                out.push('\n');
-                push_interface_place(&mut out, place);
-            }
-            Item::Class(class) => {
-                out.push('\n');
-                out.push_str(&class.to_string());
-                out.push('\n');
-            }
-            Item::Instance(instance) => {
-                out.push('\n');
-                out.push_str(&instance.to_string());
-                out.push('\n');
-            }
-        }
-    }
-    out
-}
-
-fn foreign_header(module: &Module, sibling: Option<PathBuf>, from_js: &Path) -> String {
-    let foreign = foreign_names(module);
-    if foreign.is_empty() {
-        return String::new();
-    }
-    let Some(sibling) = sibling else {
-        return String::new();
-    };
-    let spec = relative_specifier(from_js, &sibling);
-    let names: Vec<(String, String)> = foreign
-        .iter()
-        .map(|(name, _)| (name.clone(), name.clone()))
-        .collect();
-    let mut header = import_line(&spec, &names);
-    header.push('\n');
-    let exported = foreign
-        .iter()
-        .filter(|(_, hidden)| !hidden)
-        .map(|(name, _)| export_binding(name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if !exported.is_empty() {
-        header.push_str(&format!("export {{ {exported} }};\n"));
-    }
-    header
-}
-
-fn npm_name(root: &Path) -> Option<String> {
-    let text = fs::read_to_string(root.join("package.json")).ok()?;
-    let value: Value = serde_json::from_str(&text).ok()?;
-    let name = value.get("name")?.as_str()?;
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
-}
-
-fn local_runtime_names(module: &Module) -> HashSet<String> {
-    let mut names = HashSet::new();
-    for item in &module.items {
-        match item {
-            Item::Data(data) => {
-                for ctor in &data.ctors {
-                    names.insert(ctor.name.clone());
-                }
-            }
-            Item::Def(def) => {
-                names.insert(def.name.clone());
-            }
-            Item::Place(place) => {
-                names.insert(place.name.clone());
-                names.insert(format!("ply_set_{}", place.name));
-                names.insert(format!("ply_bind_{}", place.name));
-            }
-            Item::Class(_) | Item::Instance(_) | Item::Synonym(_) => {}
-        }
-    }
-    names
-}
-
-fn foreign_names(module: &Module) -> Vec<(String, bool)> {
-    module
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            Item::Def(def) if def.vis.is_foreign() => {
-                Some((def.name.clone(), !crate::surface::js_exports_def(module, def)))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn push_unique(names: &mut Vec<String>, seen: &mut HashSet<String>, name: String) {
-    if seen.insert(name.clone()) {
-        names.push(name);
-    }
-}
-
-fn push_group(
-    groups: &mut Vec<(String, Vec<(String, String)>)>,
-    spec: String,
-    names: Vec<(String, String)>,
-) {
-    if let Some((_, existing)) = groups.iter_mut().find(|(have, _)| have == &spec) {
-        for pair in names {
-            if !existing.iter().any(|have| have.1 == pair.1) {
-                existing.push(pair);
-            }
-        }
-    } else {
-        groups.push((spec, names));
-    }
-}
-
-fn import_line(spec: &str, names: &[(String, String)]) -> String {
-    let bindings = names
-        .iter()
-        .map(|(remote, local)| import_binding(remote, local))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("import {{ {bindings} }} from \"{spec}\";")
-}
-
-fn import_binding(remote: &str, local: &str) -> String {
-    let js = js_ident(local);
-    if js == remote {
-        remote.to_string()
-    } else {
-        format!("{remote} as {js}")
-    }
-}
-
-fn reexport_line(spec: &str, names: &[(String, String)]) -> String {
-    let bindings = names
-        .iter()
-        .map(|(remote, local)| {
-            if remote == local {
-                remote.clone()
-            } else {
-                format!("{remote} as {local}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("export {{ {bindings} }} from \"{spec}\";")
-}
-
-fn export_binding(name: &str) -> String {
-    let local = js_ident(name);
-    if local == name {
-        name.to_string()
-    } else {
-        format!("{local} as {name}")
-    }
-}
-
-fn combine(header: &str, body: &str) -> String {
-    if header.is_empty() {
-        body.to_string()
-    } else if body.is_empty() {
-        header.to_string()
-    } else {
-        format!("{header}\n{body}")
-    }
-}
-
-fn relative_specifier(from_file: &Path, to_file: &Path) -> String {
-    let from: Vec<Component<'_>> = from_file
-        .parent()
-        .unwrap_or(Path::new(""))
-        .components()
-        .collect();
-    let to: Vec<Component<'_>> = to_file.components().collect();
-    let mut shared = 0;
-    while shared < from.len() && shared < to.len() && from[shared] == to[shared] {
-        shared += 1;
-    }
-    let mut parts = Vec::new();
-    for _ in shared..from.len() {
-        parts.push("..".to_string());
-    }
-    for component in &to[shared..] {
-        parts.push(component.as_os_str().to_string_lossy().into_owned());
-    }
-    let spec = parts.join("/");
-    if spec.starts_with('.') {
-        spec
-    } else {
-        format!("./{spec}")
-    }
-}
-
 pub(crate) fn located(path: &Path, source: &str, diagnostic: Diagnostic) -> BuildError {
     BuildError {
         message: diagnostic.message.clone(),
@@ -3281,91 +2171,6 @@ pub(crate) fn located(path: &Path, source: &str, diagnostic: Diagnostic) -> Buil
 
 fn pkg_error(path: &Path, source: &str, error: Error) -> BuildError {
     located(path, source, Diagnostic::new(Span::new(0, 0), error))
-}
-
-fn reject_bad_entry(module: &Module) -> Result<(), Diagnostic> {
-    match entry_def(module) {
-        Some(def) if !accepts_entry(def) => Err(Diagnostic::new(def.name_span, Error::EntryWord)),
-        _ => Ok(()),
-    }
-}
-
-fn apply_entry(
-    path: &Path,
-    source: &str,
-    module: &Module,
-    js: String,
-) -> Result<String, BuildError> {
-    match entry_def(module) {
-        Some(def) if accepts_entry(def) => Ok(with_entry_guard(js)),
-        Some(def) => Err(located(
-            path,
-            source,
-            Diagnostic::new(def.name_span, Error::EntryWord),
-        )),
-        None => Ok(js),
-    }
-}
-
-fn entry_def(module: &Module) -> Option<&Def> {
-    module.items.iter().find_map(|item| match item {
-        Item::Def(def) if def.name == ENTRY_WORD => Some(def),
-        _ => None,
-    })
-}
-
-/// `( -- Unit )`, including a word left off the `@` list. No constraints, no effects, no inputs.
-fn accepts_entry(def: &Def) -> bool {
-    let scheme = &def.scheme;
-    if !scheme.constraints.is_empty() || scheme.effect.effects.is_some() {
-        return false;
-    }
-    scheme.effect.input.items.is_empty()
-        && matches!(
-            scheme.effect.output.items.as_slice(),
-            [Type::Ctor(name)] if name == "Unit"
-        )
-}
-
-fn with_entry_guard(js: String) -> String {
-    let (import_line, call) = entry_pieces(&js);
-    let mut js = format!("{import_line}{js}");
-    if !js.ends_with('\n') {
-        js.push('\n');
-    }
-    js.push_str(&call);
-    js
-}
-
-fn entry_pieces(js: &str) -> (String, String) {
-    let mut used = Vec::new();
-    let realpath = take_js_name(js, &mut used, "plyRealpath");
-    let path_to_file = take_js_name(js, &mut used, "plyPathToFileURL");
-    let flag = take_js_name(js, &mut used, "plyIsEntry");
-    let call = js_ident(ENTRY_WORD);
-    let import_line = format!(
-        "import {{ realpathSync as {realpath} }} from \"node:fs\";\nimport {{ pathToFileURL as {path_to_file} }} from \"node:url\";\n"
-    );
-    let guard = format!(
-        "let {flag} = import.meta.main === true;\nif (import.meta.main === undefined && process.argv[1]) {{\n  try {{\n    {flag} = import.meta.url === {path_to_file}({realpath}(process.argv[1])).href;\n  }} catch {{\n    {flag} = false;\n  }}\n}}\nif ({flag}) {call}();\n"
-    );
-    (import_line, guard)
-}
-
-fn take_js_name(js: &str, used: &mut Vec<String>, base: &str) -> String {
-    let mut name = base.to_string();
-    let mut n = 2u32;
-    while js_word(js, &name) || used.iter().any(|have| have == &name) {
-        name = format!("{base}{n}");
-        n += 1;
-    }
-    used.push(name.clone());
-    name
-}
-
-fn js_word(js: &str, name: &str) -> bool {
-    js.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-        .any(|word| word == name)
 }
 
 pub(crate) fn io_error(path: &Path, error: Error) -> BuildError {
@@ -3386,316 +2191,6 @@ pub(crate) fn os_error(path: &Path, error: std::io::Error) -> BuildError {
     io_error(path, Error::Os(error.to_string()))
 }
 
-fn exported_arity(source: &str, name: &str) -> JsExport {
-    let bytes = source.as_bytes();
-    let mut index = 0;
-    let mut bare = false;
-    let mut arity = None;
-    while index < bytes.len() {
-        if bytes[index].is_ascii_whitespace() {
-            index += 1;
-            continue;
-        }
-        if bytes[index] == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'/' {
-            while index < bytes.len() && bytes[index] != b'\n' {
-                index += 1;
-            }
-            continue;
-        }
-        if bytes[index] == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*' {
-            index += 2;
-            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
-                index += 1;
-            }
-            index = (index + 2).min(bytes.len());
-            continue;
-        }
-        if matches!(bytes[index], b'\'' | b'"' | b'`') {
-            index = skip_js_string(bytes, index);
-            continue;
-        }
-        if is_word_at(bytes, index, b"export") {
-            let mut scan = Scan {
-                bytes,
-                index: index + "export".len(),
-            };
-            match scan.one_export(name) {
-                JsExport::Arity(count) => arity = Some(count),
-                JsExport::Unknown => bare = true,
-                JsExport::Missing => {}
-            }
-            index += "export".len();
-            continue;
-        }
-        if is_ident_start(bytes[index]) {
-            while index < bytes.len() && is_ident_cont(bytes[index]) {
-                index += 1;
-            }
-            continue;
-        }
-        index += 1;
-    }
-    if let Some(count) = arity {
-        JsExport::Arity(count)
-    } else if bare {
-        JsExport::Unknown
-    } else {
-        JsExport::Missing
-    }
-}
-
-struct Scan<'a> {
-    bytes: &'a [u8],
-    index: usize,
-}
-
-impl Scan<'_> {
-    fn skip(&mut self) {
-        loop {
-            while self.index < self.bytes.len() && self.bytes[self.index].is_ascii_whitespace() {
-                self.index += 1;
-            }
-            if self.index + 1 < self.bytes.len()
-                && self.bytes[self.index] == b'/'
-                && self.bytes[self.index + 1] == b'/'
-            {
-                while self.index < self.bytes.len() && self.bytes[self.index] != b'\n' {
-                    self.index += 1;
-                }
-                continue;
-            }
-            if self.index + 1 < self.bytes.len()
-                && self.bytes[self.index] == b'/'
-                && self.bytes[self.index + 1] == b'*'
-            {
-                self.index += 2;
-                while self.index + 1 < self.bytes.len()
-                    && !(self.bytes[self.index] == b'*' && self.bytes[self.index + 1] == b'/')
-                {
-                    self.index += 1;
-                }
-                self.index = (self.index + 2).min(self.bytes.len());
-                continue;
-            }
-            break;
-        }
-    }
-
-    fn eat(&mut self, token: &[u8]) -> bool {
-        self.skip();
-        if self.bytes[self.index..].starts_with(token) {
-            self.index += token.len();
-            true
-        } else {
-            false
-        }
-    }
-
-    fn eat_word(&mut self, word: &[u8]) -> bool {
-        self.skip();
-        if is_word_at(self.bytes, self.index, word) {
-            self.index += word.len();
-            true
-        } else {
-            false
-        }
-    }
-
-    fn ident(&mut self) -> Option<String> {
-        self.skip();
-        if self.index >= self.bytes.len() || !is_ident_start(self.bytes[self.index]) {
-            return None;
-        }
-        let start = self.index;
-        self.index += 1;
-        while self.index < self.bytes.len() && is_ident_cont(self.bytes[self.index]) {
-            self.index += 1;
-        }
-        Some(String::from_utf8_lossy(&self.bytes[start..self.index]).into_owned())
-    }
-
-    fn looking_at_ident(&mut self) -> bool {
-        self.skip();
-        self.index < self.bytes.len() && is_ident_start(self.bytes[self.index])
-    }
-
-    fn parens(&mut self) -> Option<String> {
-        self.skip();
-        if self.index >= self.bytes.len() || self.bytes[self.index] != b'(' {
-            return None;
-        }
-        self.index += 1;
-        let start = self.index;
-        let mut depth = 1i32;
-        while self.index < self.bytes.len() && depth > 0 {
-            match self.bytes[self.index] {
-                b'(' | b'[' | b'{' => {
-                    depth += 1;
-                    self.index += 1;
-                }
-                b')' | b']' | b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let inner =
-                            String::from_utf8_lossy(&self.bytes[start..self.index]).into_owned();
-                        self.index += 1;
-                        return Some(inner);
-                    }
-                    self.index += 1;
-                }
-                b'\'' | b'"' | b'`' => self.index = skip_js_string(self.bytes, self.index),
-                _ => self.index += 1,
-            }
-        }
-        None
-    }
-
-    fn one_export(&mut self, name: &str) -> JsExport {
-        let _ = self.eat_word(b"async");
-        if self.eat_word(b"function") {
-            let Some(found) = self.ident() else {
-                return JsExport::Missing;
-            };
-            if found != name {
-                return JsExport::Missing;
-            }
-            let Some(params) = self.parens() else {
-                return JsExport::Missing;
-            };
-            return JsExport::Arity(param_count(&params));
-        }
-        if self.eat_word(b"const") || self.eat_word(b"let") || self.eat_word(b"var") {
-            let Some(found) = self.ident() else {
-                return JsExport::Missing;
-            };
-            if found != name {
-                return JsExport::Missing;
-            }
-            if !self.eat(b"=") {
-                return JsExport::Missing;
-            }
-            if self.eat_word(b"function") {
-                if self.looking_at_ident() {
-                    let _ = self.ident();
-                }
-                let Some(params) = self.parens() else {
-                    return JsExport::Missing;
-                };
-                return JsExport::Arity(param_count(&params));
-            }
-            self.skip();
-            if self.index < self.bytes.len() && self.bytes[self.index] == b'(' {
-                let Some(params) = self.parens() else {
-                    return JsExport::Missing;
-                };
-                if self.eat(b"=>") {
-                    return JsExport::Arity(param_count(&params));
-                }
-            }
-            return JsExport::Missing;
-        }
-        if self.eat(b"{") {
-            if export_list_has(self, name) {
-                return JsExport::Unknown;
-            }
-            return JsExport::Missing;
-        }
-        JsExport::Unknown
-    }
-}
-
-fn export_list_has(scan: &mut Scan<'_>, name: &str) -> bool {
-    loop {
-        scan.skip();
-        if scan.eat(b"}") {
-            return false;
-        }
-        let Some(first) = scan.ident() else {
-            return false;
-        };
-        let mut exported = first;
-        if scan.eat_word(b"as") {
-            if let Some(alias) = scan.ident() {
-                exported = alias;
-            }
-        }
-        if exported == name {
-            return true;
-        }
-        scan.skip();
-        if scan.eat(b",") {
-            continue;
-        }
-        let _ = scan.eat(b"}");
-        return false;
-    }
-}
-
-fn param_count(params: &str) -> usize {
-    let mut depth = 0i32;
-    let mut count = 0;
-    let mut slot = false;
-    for ch in params.chars() {
-        match ch {
-            '(' | '[' | '{' => {
-                depth += 1;
-                slot = true;
-            }
-            ')' | ']' | '}' if depth > 0 => depth -= 1,
-            ',' if depth == 0 => {
-                if slot {
-                    count += 1;
-                }
-                slot = false;
-            }
-            ch if ch.is_whitespace() => {}
-            _ => slot = true,
-        }
-    }
-    if slot {
-        count += 1;
-    }
-    count
-}
-
-fn is_word_at(bytes: &[u8], index: usize, word: &[u8]) -> bool {
-    if index > 0 && is_ident_cont(bytes[index - 1]) {
-        return false;
-    }
-    if !bytes[index..].starts_with(word) {
-        return false;
-    }
-    let end = index + word.len();
-    end >= bytes.len() || !is_ident_cont(bytes[end])
-}
-
-fn is_ident_start(byte: u8) -> bool {
-    byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$'
-}
-
-fn is_ident_cont(byte: u8) -> bool {
-    is_ident_start(byte) || byte.is_ascii_digit()
-}
-
-fn skip_js_string(bytes: &[u8], index: usize) -> usize {
-    if index >= bytes.len() {
-        return index;
-    }
-    let quote = bytes[index];
-    let mut index = index + 1;
-    while index < bytes.len() {
-        if bytes[index] == b'\\' {
-            index = (index + 2).min(bytes.len());
-            continue;
-        }
-        if bytes[index] == quote {
-            return index + 1;
-        }
-        index += 1;
-    }
-    index
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -3703,32 +2198,7 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::parser::parse;
-    use crate::paths::ParseMode;
-
-    use super::{
-        build, build_exports, check_buffer, check_package, compile, exported_arity, interface_text,
-        relative_specifier, JsExport,
-    };
-
-    #[test]
-    fn an_unexported_constructor_is_omitted_from_the_interface() {
-        let hidden = parse("@ Box\n\n; Box a = Mk a\n", ParseMode::Source).unwrap();
-        let text = interface_text(&hidden);
-        assert!(text.contains("; foreign Box a"), "{text}");
-        assert!(!text.contains("Mk"), "{text}");
-        let shared = parse("@ Box\n\n; Box a = Box a\n", ParseMode::Source).unwrap();
-        let text = interface_text(&shared);
-        assert!(text.contains("= Box a"), "{text}");
-        let one = parse(
-            "@ Maybe, Nothing\n\n; Maybe a = Nothing | Just a\n",
-            ParseMode::Source,
-        )
-        .unwrap();
-        let text = interface_text(&one);
-        assert!(text.contains("Nothing"), "{text}");
-        assert!(!text.contains("Just"), "{text}");
-    }
+    use super::{build, build_exports, check_buffer, check_package, compile, relative_specifier};
 
     struct Temp(PathBuf);
 
@@ -3984,70 +2454,38 @@ mod tests {
     }
 
     #[test]
-    fn counts_foreign_js_parameters() {
-        assert!(matches!(
-            exported_arity("export function add(a, b) { return a + b; }", "add"),
-            JsExport::Arity(2)
-        ));
-        assert!(matches!(
-            exported_arity("export const add = (a, b) => a + b;", "add"),
-            JsExport::Arity(2)
-        ));
-        assert!(matches!(
-            exported_arity("export const add = function (a) { return a; }", "add"),
-            JsExport::Arity(1)
-        ));
-        assert!(matches!(
-            exported_arity("export const add = function add(a, b, c) { return a; }", "add"),
-            JsExport::Arity(3)
-        ));
-        assert!(matches!(
-            exported_arity("export { add };", "add"),
-            JsExport::Unknown
-        ));
-        assert!(matches!(
-            exported_arity("export function sub(a) {}", "add"),
-            JsExport::Missing
-        ));
-        assert!(matches!(
-            exported_arity("export { sub }", "add"),
-            JsExport::Missing
-        ));
-        assert!(matches!(
-            exported_arity("export class add {}", "add"),
-            JsExport::Unknown
-        ));
-        assert!(matches!(
-            exported_arity("export async function add(a, b) { return a; }", "add"),
-            JsExport::Arity(2)
-        ));
-        assert!(matches!(
-            exported_arity("export async\nfunction add(a, b) { return a; }", "add"),
-            JsExport::Arity(2)
-        ));
-        assert!(matches!(
-            exported_arity("export /* c */ function add(a) { return a; }", "add"),
-            JsExport::Arity(1)
-        ));
-        assert!(matches!(
-            exported_arity("export // c\nfunction add(a) { return a; }", "add"),
-            JsExport::Arity(1)
-        ));
-    }
-
-    #[test]
-    fn json_scan_keeps_surrogate_pairs_and_the_last_exports() {
-        let pair = r#"{ "name": "\ud83d\ude00", "exports": { "a": 1 }, "exports": { "b": 2 } }"#;
-        let super::ExportsSpot::Found { start, end } = super::find_exports(pair).unwrap() else {
-            panic!("expected the exports value");
-        };
-        assert_eq!(&pair[start..end], r#"{ "b": 2 }"#);
-        assert!(matches!(super::find_exports("[]"), Err(super::JsonError::NotObject)));
-        assert!(matches!(
-            super::find_exports(r#"{ "name": "\ud800" }"#),
-            Err(super::JsonError::Invalid)
-        ));
-        assert!(matches!(super::find_exports("{"), Err(super::JsonError::Invalid)));
+    fn an_instance_word_comes_from_the_selected_module() {
+        let temp = Temp::new("instance-home");
+        temp.write(
+            "package.json",
+            &package_json(
+                r#"
+    "./A": { "ply": "./dist/A.d.ply", "import": "./dist/A.js" },
+    "./B": { "ply": "./dist/B.d.ply", "import": "./dist/B.js" },
+    "./App": { "ply": "./dist/App.d.ply", "import": "./dist/App.js" }
+"#,
+            ),
+        );
+        temp.write(
+            "src/A.ply",
+            "@ Eq\n\n& Eq a\n  eq ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  drop drop true\n\n# Eq Int\n  eq = eqInt\n",
+        );
+        temp.write(
+            "src/B.ply",
+            "@ Eq, eq\n\n& Eq a\n  eq ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  drop drop false\n\n# Eq Int\n  eq = eqInt\n",
+        );
+        temp.write(
+            "src/App.ply",
+            "@ use\n~ \"B\" Eq, eq\n\n: use ( Int Int -- Bool )\n  eq\n",
+        );
+        build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let js = fs::read_to_string(temp.0.join("dist/App.js")).unwrap();
+        assert!(js.contains("from \"./B.js\""), "{js}");
+        assert!(!js.contains("from \"./A.js\""), "{js}");
+        node(
+            &temp.0,
+            "import { use } from \"./dist/App.js\";\nif (use(1n, 2n) !== false) throw new Error(\"home\");\n",
+        );
     }
 
     #[test]

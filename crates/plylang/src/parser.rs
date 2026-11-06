@@ -146,7 +146,6 @@ impl Parser {
     }
 
     fn parse_public_list(&mut self) -> Result<PublicList, Diagnostic> {
-        let start = self.cur().span;
         self.bump();
         let mut names = Vec::new();
         loop {
@@ -169,10 +168,7 @@ impl Parser {
             }
             return Err(self.error(Error::ExpectedName));
         }
-        Ok(PublicList {
-            span: start.merge(self.last_span),
-            names,
-        })
+        Ok(PublicList { names })
     }
 
     /// The name list is over when the next column-0 declaration, a doc, or
@@ -239,23 +235,17 @@ impl Parser {
             let name_span = self.cur().span;
             let remote = self.expect_ident(Error::ExpectedImportedName)?;
             let mut local = remote.clone();
-            let mut end = self.last_span;
             if self.is(TokenKind::Colon) && !self.at_column_0() {
                 self.bump();
                 let local_span = self.cur().span;
                 local = self.expect_ident(Error::ExpectedName)?;
-                end = self.last_span;
                 if !seen.insert(local.clone()) {
                     return Err(self.error_at(local_span, Error::DuplicateDefinition(local)));
                 }
             } else if !seen.insert(local.clone()) {
                 return Err(self.error_at(name_span, Error::DuplicateDefinition(local)));
             }
-            names.push(ImportedName {
-                span: name_span.merge(end),
-                remote,
-                local,
-            });
+            names.push(ImportedName { remote, local });
             self.skip_newlines();
             if self.eat(&TokenKind::Comma) {
                 continue;
@@ -394,7 +384,6 @@ impl Parser {
                 || self.is(TokenKind::Doc(String::new()))
             {
                 return Ok(Data {
-                    span: start.merge(self.last_span),
                     name_span,
                     name,
                     params,
@@ -436,7 +425,6 @@ impl Parser {
             return Err(self.error_at(ctors[0].span, Error::NewtypeOneField));
         }
         Ok(Data {
-            span: start.merge(self.last_span),
             name_span,
             name,
             params,
@@ -448,7 +436,6 @@ impl Parser {
     }
 
     fn parse_synonym(&mut self) -> Result<Synonym, Diagnostic> {
-        let start = self.last_span;
         let name_span = self.cur().span;
         let name = self.expect_upper(Error::ExpectedTypeName)?;
         let mut params = Vec::new();
@@ -463,7 +450,6 @@ impl Parser {
         self.skip_newlines();
         let rhs = self.parse_type_item()?;
         Ok(Synonym {
-            span: start.merge(self.last_span),
             name_span,
             name,
             params,
@@ -1014,7 +1000,6 @@ impl Parser {
     }
 
     fn parse_class(&mut self) -> Result<Class, Diagnostic> {
-        let start = self.last_span;
         // `& Comparable a, Show a => Sortable a`, or `& Sortable a` when there is no superclass.
         let first_span = self.cur().span;
         let first_name = self.expect_qualified(Error::ExpectedClassName)?;
@@ -1068,7 +1053,6 @@ impl Parser {
             });
         }
         Ok(Class {
-            span: start.merge(self.last_span),
             name_span,
             name,
             supers,
@@ -1907,13 +1891,13 @@ fn apply(head: Type, args: Vec<Type>) -> Type {
     }
 }
 
-fn is_upper(name: &str) -> bool {
+pub(crate) fn is_upper(name: &str) -> bool {
     name.chars()
         .next()
         .is_some_and(|ch| ch.is_ascii_uppercase())
 }
 
-fn is_lower(name: &str) -> bool {
+pub(crate) fn is_lower(name: &str) -> bool {
     name.chars()
         .next()
         .is_some_and(|ch| ch.is_ascii_lowercase())

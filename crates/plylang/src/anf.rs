@@ -16,6 +16,8 @@ pub struct AnfModule {
     /// Source order. An empty list leaves the JavaScript unchanged.
     pub places: Vec<AnfPlace>,
     pub needs_unit: bool,
+    /// Instance words this module calls, and the module that wrote the `#`.
+    pub method_homes: Vec<MethodHome>,
 }
 
 /// One place. `init` fills the first frame and is not exported.
@@ -188,6 +190,20 @@ pub fn local_name(id: LocalId) -> String {
     format!("v{id}")
 }
 
+/// The discriminant owns the key `tag`. A field of that name is stored beside it.
+pub(crate) fn field_key(name: &str) -> &str {
+    if name == "tag" { "$tag" } else { name }
+}
+
+/// The module that wrote the `#` whose word `local` calls.
+/// `remote` is the word's name in that module. `origin` is its module key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MethodHome {
+    pub local: String,
+    pub remote: String,
+    pub origin: String,
+}
+
 impl AnfModule {
     pub fn javascript(&self) -> String {
         let mut out = String::new();
@@ -307,7 +323,7 @@ fn ctor_export(ctor: &AnfCtor) -> String {
         ctor.names
             .iter()
             .enumerate()
-            .map(|(index, name)| format!("{}: v{index}", name.as_deref().unwrap()))
+            .map(|(index, name)| format!("{}: v{index}", field_key(name.as_deref().unwrap())))
             .collect::<Vec<_>>()
             .join(", ")
     } else {
@@ -500,7 +516,7 @@ fn render_cond(cond: &Cond) -> String {
             Access::Field { width: 1, .. } => path.push_str(".value"),
             Access::Field { index, .. } => path.push_str(&format!(".value{index}")),
             Access::Index(index) => path.push_str(&format!("[{index}]")),
-            Access::Prop(name) => path.push_str(&format!(".{name}")),
+            Access::Prop(name) => path.push_str(&format!(".{}", field_key(name))),
         }
     }
     match &cond.test {
@@ -552,6 +568,16 @@ fn render_value(value: &Value) -> String {
                 .join(", ");
             format!("{}({args})", js_ident(name))
         }
+        Value::Call { word, args } if word == "#show_cat" => format!(
+            "({} + {})",
+            local_name(args[0]),
+            local_name(args[1])
+        ),
+        Value::Call { word, args } if word == "#hash_mix" => format!(
+            "({} * 31n + {})",
+            local_name(args[0]),
+            local_name(args[1])
+        ),
         Value::Call { word, args } => {
             let list = args
                 .iter()
@@ -577,10 +603,11 @@ fn render_value(value: &Value) -> String {
             }
         }
         Value::Index { base, index } => format!("{}[{index}]", local_name(*base)),
-        Value::Prop { base, name } => format!("{}.{}", local_name(*base), name),
+        Value::Prop { base, name } => format!("{}.{}", local_name(*base), field_key(name)),
         Value::SetProp { base, name, value } => format!(
-            "({{ ...{}, {name}: {} }})",
+            "({{ ...{}, {}: {} }})",
             local_name(*base),
+            field_key(name),
             local_name(*value)
         ),
         Value::Array(items) => {
@@ -627,6 +654,7 @@ fn collect_words(expr: &Expr, names: &mut Vec<String>) {
 
 fn collect_value(value: &Value, names: &mut Vec<String>) {
     match value {
+        Value::Call { word, .. } if word.starts_with('#') => {}
         Value::Call { word, .. } => names.push(word.clone()),
         Value::Dict { fields } => {
             for field in fields {

@@ -40,10 +40,12 @@ pub(super) struct CtorShape {
 /// A child is an [`Rc`], so cloning a node copies one layer. The same type at the
 /// same depth is built once. Past [`NEED_DEPTH`], or after [`NEED_NODES`] shapes,
 /// the walk stops at `Deep` instead of copying a recursive type down every field.
+/// A wildcard covers that slot. A constructor does not, because the other
+/// constructors were not built.
 #[derive(Clone, Debug)]
 enum Need {
     Any,
-    /// The walk stopped. Any pattern covers the slot.
+    /// The walk stopped. A wildcard or a binding covers the slot.
     Deep,
     Bool { yes: bool, no: bool },
     Open { name: String, excluded: Vec<Lit> },
@@ -545,7 +547,7 @@ fn row_hit(row: &[Need], patterns: &[Pattern]) -> bool {
 }
 
 fn overlaps(pattern: &Pattern, need: &Need) -> bool {
-    if matches!(need, Need::Any | Need::Deep) {
+    if matches!(need, Need::Any) {
         return true;
     }
     match pattern {
@@ -637,9 +639,6 @@ fn subtract_row(row: &[Need], patterns: &[Pattern]) -> Vec<Vec<Need>> {
 fn subtract_slot(need: &Need, pattern: &Pattern) -> Vec<Need> {
     if !overlaps(pattern, need) {
         return vec![need.clone()];
-    }
-    if matches!(need, Need::Deep) {
-        return Vec::new();
     }
     match pattern {
         Pattern::Wild | Pattern::Bind(..) => Vec::new(),
@@ -770,9 +769,6 @@ fn subtract_array(need: &Need, patterns: &[Pattern]) -> Vec<Need> {
 }
 
 fn covered_slot(pattern: &Pattern, need: &Need) -> Option<Need> {
-    if matches!(need, Need::Deep) {
-        return Some(Need::Deep);
-    }
     match pattern {
         Pattern::Wild | Pattern::Bind(..) => Some(need.clone()),
         _ if matches!(need, Need::Any) => None,

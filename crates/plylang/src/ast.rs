@@ -24,7 +24,6 @@ pub enum Exports {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublicList {
-    pub span: Span,
     pub names: Vec<ExportedName>,
 }
 
@@ -52,7 +51,6 @@ impl Exports {
 /// One name brought in from another module. `local` is the spelling in this file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImportedName {
-    pub span: Span,
     pub remote: String,
     pub local: String,
 }
@@ -112,7 +110,6 @@ pub enum Item {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Data {
-    pub span: Span,
     pub name_span: Span,
     pub name: String,
     pub params: Vec<String>,
@@ -128,7 +125,6 @@ pub struct Data {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Synonym {
-    pub span: Span,
     pub name_span: Span,
     pub name: String,
     pub params: Vec<String>,
@@ -225,7 +221,6 @@ pub enum Pattern {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Class {
-    pub span: Span,
     pub name_span: Span,
     pub name: String,
     /// Written before `=>`. Empty when the class has no superclass.

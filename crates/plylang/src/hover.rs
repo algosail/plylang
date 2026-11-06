@@ -14,7 +14,7 @@ use crate::surface::{self, Found};
 use crate::builtin;
 use crate::check::StackAt;
 use crate::lexer::tokenize;
-use crate::parser::parse;
+use crate::parser::{is_upper, parse};
 use crate::paths::mode_from_path;
 use crate::span::Span;
 use crate::token::{Token, TokenKind};
@@ -475,10 +475,6 @@ fn qualified_span(tokens: &[Token], token: &Token, name: &str) -> (String, Span)
         }
     }
     (name.to_string(), token.span)
-}
-
-fn is_upper(name: &str) -> bool {
-    name.chars().next().is_some_and(|ch| ch.is_ascii_uppercase())
 }
 
 fn token_at(tokens: &[Token], offset: u32) -> Option<&Token> {

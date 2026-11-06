@@ -8,7 +8,7 @@ use crate::build::{load_surface, provider_file, read_module};
 use crate::surface::{self, Found};
 use crate::complete::{is_import_path, name_space_at, NameSpace};
 use crate::lexer::tokenize;
-use crate::parser::parse;
+use crate::parser::{is_lower, is_upper, parse};
 use crate::paths::mode_from_path;
 use crate::span::{byte_offset, Span};
 use crate::token::{Token, TokenKind};
@@ -357,18 +357,6 @@ fn ident_in(tokens: &[Token], within: Span, name: &str) -> Span {
         })
         .map(|token| token.span)
         .unwrap_or(within)
-}
-
-fn is_upper(name: &str) -> bool {
-    name.chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_uppercase())
-}
-
-fn is_lower(name: &str) -> bool {
-    name.chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_lowercase())
 }
 
 #[cfg(test)]

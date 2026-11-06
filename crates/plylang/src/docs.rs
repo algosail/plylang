@@ -6,8 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::ast::{
-    method_line, scheme_string, type_string, Class, Data, Def, Exports, Instance, Item, Module,
-    Synonym,
+    method_line, type_string, Class, Data, Def, Exports, Instance, Item, Module, Synonym, Type,
 };
 use crate::build::{io_error, located, module_path_of, open_package, os_error, walk_ply, BuildError};
 use crate::codes::Error;
@@ -103,13 +102,21 @@ fn render_pages(package_name: Option<&str>, pages: &[Page]) -> String {
     if !headings.is_empty() {
         out.push('\n');
     }
-    for (page, (title, _)) in pages.iter().zip(&headings) {
-        render_page(&mut out, title, page, &mut seen);
+    for (index, page) in pages.iter().enumerate() {
+        let (title, _) = &headings[index];
+        render_page(&mut out, title, page, pages, index, &mut seen);
     }
     out
 }
 
-fn render_page(out: &mut String, title: &str, page: &Page, seen: &mut HashMap<String, usize>) {
+fn render_page(
+    out: &mut String,
+    title: &str,
+    page: &Page,
+    pages: &[Page],
+    index: usize,
+    seen: &mut HashMap<String, usize>,
+) {
     out.push_str("## ");
     out.push_str(title);
     out.push_str("\n\n");
@@ -147,6 +154,11 @@ fn render_page(out: &mut String, title: &str, page: &Page, seen: &mut HashMap<St
     }
     if matches!(page.module.exports, Exports::List(_)) {
         append_published(&page.file, &page.module, &mut types, &mut classes, &mut instances, &mut words);
+    }
+    for head in heads_defined_here(pages, index) {
+        if !instances.iter().any(|have| have == &head) {
+            instances.push(head);
+        }
     }
     render_group(out, "Types", &types, seen);
     render_group(out, "Classes", &classes, seen);
@@ -332,73 +344,30 @@ fn join_doc(lines: &[String]) -> String {
 }
 
 fn format_place(place: &crate::ast::Place) -> String {
-    format!("= {} {}", place.name, type_string(&place.ty))
+    let mut place = place.clone();
+    place.doc.clear();
+    place.body.clear();
+    place.to_string()
 }
 
 fn format_word(def: &Def) -> String {
-    let mut out = String::from(": ");
-    if def.vis.is_foreign() {
-        out.push_str("foreign ");
-    }
-    out.push_str(&def.name);
-    out.push_str(" ( ");
-    out.push_str(&scheme_string(&def.scheme));
-    out.push_str(" )");
-    out
+    let mut def = def.clone();
+    def.doc.clear();
+    def.body.clear();
+    def.clauses.clear();
+    def.to_string()
 }
 
 fn format_data(data: &Data) -> String {
-    let mut out = String::from("; ");
-    if data.foreign {
-        out.push_str("foreign ");
-    }
-    out.push_str(&data.name);
-    for param in &data.params {
-        out.push(' ');
-        out.push_str(param);
-    }
-    if data.foreign {
-        return out;
-    }
-    if data.newtype {
-        out.push_str(" == ");
-    } else {
-        out.push_str(" = ");
-    }
-    for (index, ctor) in data.ctors.iter().enumerate() {
-        if index > 0 {
-            out.push_str(" | ");
-        }
-        out.push_str(&ctor.name);
-        if ctor.fields.iter().any(|field| field.name.is_some()) {
-            for (index, field) in ctor.fields.iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                out.push(' ');
-                out.push_str(field.name.as_deref().unwrap_or("_"));
-                out.push_str(" : ");
-                out.push_str(&type_string(&field.ty));
-            }
-        } else {
-            for field in &ctor.fields {
-                out.push(' ');
-                out.push_str(&type_string(&field.ty));
-            }
-        }
-    }
-    out
+    let mut data = data.clone();
+    data.doc.clear();
+    data.to_string()
 }
 
 fn format_synonym(synonym: &Synonym) -> String {
-    let mut out = format!("- {}", synonym.name);
-    for param in &synonym.params {
-        out.push(' ');
-        out.push_str(param);
-    }
-    out.push(' ');
-    out.push_str(&type_string(&synonym.rhs));
-    out
+    let mut synonym = synonym.clone();
+    synonym.doc.clear();
+    synonym.to_string()
 }
 
 fn format_class(class: &Class) -> String {
@@ -426,6 +395,61 @@ fn format_class(class: &Class) -> String {
         out.push_str(&method_line(class, method));
     }
     out
+}
+
+/// Instances written in another module whose head type is declared here.
+fn heads_defined_here(pages: &[Page], index: usize) -> Vec<String> {
+    let defined = defined_types(&pages[index].module);
+    if defined.is_empty() {
+        return Vec::new();
+    }
+    let mut heads = Vec::new();
+    for (other, page) in pages.iter().enumerate() {
+        if other == index {
+            continue;
+        }
+        for item in &page.module.items {
+            let Item::Instance(instance) = item else {
+                continue;
+            };
+            let mentions = instance
+                .args
+                .iter()
+                .any(|ty| type_head(ty).is_some_and(|name| defined.contains(name)));
+            if !mentions {
+                continue;
+            }
+            let head = instance_head(instance);
+            if !heads.iter().any(|have| have == &head) {
+                heads.push(head);
+            }
+        }
+    }
+    heads
+}
+
+fn defined_types(module: &Module) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for item in &module.items {
+        match item {
+            Item::Data(data) => {
+                names.insert(data.name.clone());
+            }
+            Item::Synonym(synonym) => {
+                names.insert(synonym.name.clone());
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+fn type_head(ty: &Type) -> Option<&str> {
+    match ty {
+        Type::Ctor(name) => Some(name),
+        Type::App(head, _) => type_head(head),
+        Type::Var(_) | Type::Fun(_) | Type::Record(_) => None,
+    }
 }
 
 fn instance_head(instance: &Instance) -> String {
@@ -582,6 +606,31 @@ mod tests {
         assert!(page.contains("## Data/Maybe\n"), "{page}");
         assert!(!page.contains("# shelf"), "{page}");
         assert!(!temp.0.join("DOCS.md").exists());
+    }
+
+    #[test]
+    fn an_instance_is_listed_on_the_module_that_defines_the_head() {
+        let temp = Temp::new("head");
+        temp.write("package.json", &package_json("head"));
+        temp.write(
+            "src/Data/Maybe.ply",
+            "@ Maybe, Nothing, Just\n\n; Maybe a = Nothing | Just a\n",
+        );
+        temp.write(
+            "src/Show.ply",
+            "@ Show, show\n\n& Show a\n  show ( a -- Str )\n\n# Show (Maybe a)\n  show = showMaybe\n\n# Show Num\n  show = showNum\n",
+        );
+        write_docs(&temp.0, None).unwrap_or_else(|error| panic!("{}", error.render()));
+        let page = fs::read_to_string(temp.0.join("DOCS.md")).unwrap();
+        let maybe_at = page
+            .find("## head/Data/Maybe\n")
+            .expect("Maybe section");
+        let maybe = page[maybe_at..].split("\n## ").next().unwrap();
+        assert!(maybe.contains("- Show (Maybe a)\n"), "{maybe}");
+        assert!(!maybe.contains("- Show Num\n"), "{maybe}");
+        assert!(page.contains("## head/Show\n"), "{page}");
+        assert!(page.contains("- Show (Maybe a)\n"), "{page}");
+        assert!(page.contains("- Show Num\n"), "{page}");
     }
 
     const EXPECTED: &str = r#"# shelf

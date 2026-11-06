@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use crate::anf::{
     js_ident, Access, AnfCtor, AnfData, AnfDef, AnfModule, AnfPlace, Choice, Cond, DictField,
-    DictValue, Expr, Let, LocalId, PatTest, QuoteForm, Value,
+    DictValue, Expr, Let, LocalId, MethodHome, PatTest, QuoteForm, Value,
 };
 use crate::builtin::{self, Lowering};
 use crate::ast::{Item, Lit, Module, Pattern, Term, TermNode};
@@ -138,6 +138,21 @@ impl Checker {
     }
 
     pub(crate) fn lower_prepared(&mut self, module: &Module) -> Result<AnfModule, Diagnostic> {
+        let added_show = self.inline_show_cat
+            && self.install_derive_word("ply_show_cat", "( Str Str -- Str )");
+        let added_hash = self.inline_hash_mix
+            && self.install_derive_word("ply_hash_mix", "( Int Int -- Int )");
+        let result = self.lower_prepared_body(module);
+        if added_show {
+            self.words.remove("ply_show_cat");
+        }
+        if added_hash {
+            self.words.remove("ply_hash_mix");
+        }
+        result
+    }
+
+    fn lower_prepared_body(&mut self, module: &Module) -> Result<AnfModule, Diagnostic> {
         let mut defs = Vec::new();
         let bodies: Vec<crate::ast::Def> = module
             .items
@@ -194,6 +209,7 @@ impl Checker {
             defs,
             places,
             needs_unit: false,
+            method_homes: std::mem::take(&mut self.method_homes),
         };
         anf.needs_unit = module_uses_unit(&anf);
         Ok(anf)
@@ -289,7 +305,8 @@ impl Checker {
         }
         Ok(AnfDef {
             name: def.name.clone(),
-            export: crate::surface::js_exports_def(module, def),
+            export: crate::surface::js_exports_def(module, def)
+                || self.publishes_derived_word(&def.name),
             params,
             body: Expr {
                 lets: frame.lets,
@@ -901,7 +918,8 @@ impl Checker {
                 let mut args = self.materialize_dicts(&method.dicts, frame);
                 args.extend(self.materialize_dicts(extras, frame));
                 args.extend(stack_args);
-                self.emit_call(&method.word, args, produced, frame);
+                let word = self.note_method_home(&method.word, &method.origin);
+                self.emit_call(&word, args, produced, frame);
             }
         }
     }
@@ -926,7 +944,52 @@ impl Checker {
             args.push(self.materialize_dict(dict, frame));
         }
         args.extend(stack_args);
-        self.emit_call(name, args, produced, frame);
+        let call = self.derived_js_word(name);
+        self.emit_call(&call, args, produced, frame);
+    }
+
+    /// `ply_show_cat` and `ply_hash_mix` are not functions. The renderer
+    /// turns these sentinels into `+` and `* 31n +`.
+    fn derived_js_word(&self, name: &str) -> String {
+        if self.inline_show_cat && name == "ply_show_cat" {
+            return "#show_cat".to_string();
+        }
+        if self.inline_hash_mix && name == "ply_hash_mix" {
+            return "#hash_mix".to_string();
+        }
+        name.to_string()
+    }
+
+    /// A public derived instance's word is exported even though the definition
+    /// was not in the module when the export flag was decided.
+    fn publishes_derived_word(&self, name: &str) -> bool {
+        self.derived.iter().any(|item| {
+            matches!(item, Item::Instance(instance) if instance.methods.iter().any(|bind| bind.word == name))
+        })
+    }
+
+    /// JavaScript name of an instance word. The same word from the same module
+    /// keeps one name. A second module's word is renamed so the import is that module.
+    fn note_method_home(&mut self, remote: &str, origin: &str) -> String {
+        if let Some(found) = self
+            .method_homes
+            .iter()
+            .find(|home| home.remote == remote && home.origin == origin)
+        {
+            return found.local.clone();
+        }
+        let plain_taken = self.method_homes.iter().any(|home| home.local == remote);
+        let local = if origin == self.module_key || !plain_taken {
+            remote.to_string()
+        } else {
+            format!("{remote}${}", self.method_homes.len())
+        };
+        self.method_homes.push(MethodHome {
+            local: local.clone(),
+            remote: remote.to_string(),
+            origin: origin.to_string(),
+        });
+        local
     }
 
     fn emit_call(&mut self, word: &str, args: Vec<LocalId>, produced: usize, frame: &mut Frame) {
@@ -983,8 +1046,9 @@ impl Checker {
             Dict::Instance { methods, supers } => {
                 let mut fields = Vec::new();
                 for method in methods {
+                    let word = self.note_method_home(&method.word, &method.origin);
                     let value = if method.dicts.is_empty() {
-                        DictValue::Word(method.word.clone())
+                        DictValue::Word(word)
                     } else {
                         let mut dicts = Vec::new();
                         for nested in &method.dicts {
@@ -993,7 +1057,7 @@ impl Checker {
                         DictValue::Closure {
                             params: self.fresh_vec(method.extra + method.arity),
                             dicts,
-                            word: method.word.clone(),
+                            word,
                         }
                     };
                     fields.push(DictField {
@@ -2111,6 +2175,189 @@ mod tests {
         );
     }
 
+    /// `docs/Algebra.md`. A shuffle reuses the operands already on the stack, so
+    /// an inverse pair disappears. A quotation written at its use is inlined.
+    /// The assertion renumbers locals, so a quotation that was inlined matches
+    /// the same body written on its own.
+    #[test]
+    fn stack_algebra_cancels() {
+        fn renumber(code: &str) -> String {
+            let mut map = std::collections::HashMap::<String, usize>::new();
+            let mut next = 0usize;
+            let chars: Vec<char> = code.chars().collect();
+            let mut out = String::with_capacity(code.len());
+            let mut index = 0;
+            while index < chars.len() {
+                let boundary = index == 0 || !chars[index - 1].is_ascii_alphanumeric();
+                if boundary && chars[index] == 'v' {
+                    let mut end = index + 1;
+                    if end < chars.len() && chars[end].is_ascii_digit() {
+                        while end < chars.len() && chars[end].is_ascii_digit() {
+                            end += 1;
+                        }
+                        let name: String = chars[index..end].iter().collect();
+                        let id = *map.entry(name).or_insert_with(|| {
+                            let id = next;
+                            next += 1;
+                            id
+                        });
+                        out.push_str(&format!("v{id}"));
+                        index = end;
+                        continue;
+                    }
+                }
+                out.push(chars[index]);
+                index += 1;
+            }
+            out
+        }
+
+        fn canonical(body: &str) -> String {
+            renumber(&js(body))
+        }
+
+        let same = |left: &str, right: &str| {
+            assert_eq!(canonical(left), canonical(right), "\n{left}\n---\n{right}");
+        };
+
+        let identity = |scheme: &str, body: &str, signature: &str, returned: &str| {
+            let source = format!(": restored {scheme}\n  {body}");
+            let code = canonical(&source);
+            assert_eq!(
+                code,
+                format!("export function restored{signature} {{\n{returned}}}\n"),
+                "{body}\n{code}"
+            );
+            assert!(!code.contains("=>"), "{body}\n{code}");
+        };
+
+        identity("( Int Int -- Int Int )", "swap swap", "(v0, v1)", "  return [v0, v1];\n");
+        identity("( Int -- Int )", "dup drop", "(v0)", "  return v0;\n");
+        identity("( Int -- Int )", "quote call", "(v0)", "  return v0;\n");
+        identity("( Int -- Int )", "[ ] call", "(v0)", "  return v0;\n");
+        identity("( Int -- Int )", "[ ] dip", "(v0)", "  return v0;\n");
+        identity("( Int -- Int )", "[ drop ] keep", "(v0)", "  return v0;\n");
+        identity("( Int -- Int )", "dup [ drop ] dip", "(v0)", "  return v0;\n");
+        identity(
+            "( Int Int Int -- Int Int Int )",
+            "rot unrot",
+            "(v0, v1, v2)",
+            "  return [v0, v1, v2];\n",
+        );
+        identity(
+            "( Int Int Int -- Int Int Int )",
+            "unrot rot",
+            "(v0, v1, v2)",
+            "  return [v0, v1, v2];\n",
+        );
+        identity(
+            "( Int Int Int -- Int Int Int )",
+            "[ swap swap ] dip",
+            "(v0, v1, v2)",
+            "  return [v0, v1, v2];\n",
+        );
+        identity(
+            "( Int Int -- Int Int )",
+            "[ swap swap ] call",
+            "(v0, v1)",
+            "  return [v0, v1];\n",
+        );
+
+        let top = "export function restored(v0, v1) {\n  return v1;\n}\n";
+        assert_eq!(canonical(": restored ( Int Int -- Int )\n  nip"), top);
+        assert_eq!(canonical(": restored ( Int Int -- Int )\n  swap drop"), top);
+        assert_eq!(canonical(": restored ( Int Int -- Int )\n  [ drop ] dip"), top);
+
+        let copied = "export function restored(v0, v1) {\n  return [v0, v1, v0];\n}\n";
+        assert_eq!(canonical(": restored ( Int Int -- Int Int Int )\n  over"), copied);
+        assert_eq!(
+            canonical(": restored ( Int Int -- Int Int Int )\n  dupd swap"),
+            copied
+        );
+
+        let tucked = "export function restored(v0, v1) {\n  return [v1, v0, v1];\n}\n";
+        assert_eq!(canonical(": restored ( Int Int -- Int Int Int )\n  tuck"), tucked);
+        assert_eq!(
+            canonical(": restored ( Int Int -- Int Int Int )\n  swap over"),
+            tucked
+        );
+
+        let gone = "export function restored(v0, v1) {\n}\n";
+        assert_eq!(canonical(": restored ( Int Int -- )\n  drop drop"), gone);
+        assert_eq!(canonical(": restored ( Int Int -- )\n  drop2"), gone);
+
+        let foreign = ": foreign iadd ( Int Int -- Int )\n";
+        same(
+            &format!("{foreign}: restored ( Int Int -- Int )\n  iadd"),
+            &format!("{foreign}: restored ( Int Int -- Int )\n  [ iadd ] call"),
+        );
+        let added = canonical(&format!("{foreign}: restored ( Int Int -- Int )\n  iadd"));
+        assert_eq!(
+            added,
+            "export function restored(v0, v1) {\n  const v2 = iadd(v0, v1);\n  return v2;\n}\n"
+        );
+
+        same(
+            ": restored ( -- Int )\n  5n",
+            ": restored ( -- Int )\n  5n quote call",
+        );
+
+        let next = ": foreign next ( -- Int )\n";
+        let once = format!("{next}: restored ( -- Int )\n  next");
+        same(&once, &format!("{next}: restored ( -- Int )\n  next dup drop"));
+        same(&once, &format!("{next}: restored ( -- Int )\n  next quote call"));
+        same(&once, &format!("{next}: restored ( -- Int )\n  [ next ] call"));
+        assert_eq!(canonical(&once).matches("next(").count(), 1);
+
+        let ordered = ": foreign left ( -- Int )\n: foreign right ( -- Int )\n";
+        same(
+            &format!("{ordered}: restored ( -- Int Int )\n  left right"),
+            &format!("{ordered}: restored ( -- Int Int )\n  left right swap swap"),
+        );
+        let order = canonical(&format!("{ordered}: restored ( -- Int Int )\n  left right"));
+        assert_eq!(
+            order,
+            "export function restored() {\n  const v0 = left();\n  const v1 = right();\n  return [v0, v1];\n}\n"
+        );
+
+        assert_eq!(
+            canonical(": restored ( -- ( Int Int -- Int Int ) )\n  [ swap swap ]"),
+            "export function restored() {\n  const v0 = (v1, v2) => [v1, v2];\n  return v0;\n}\n"
+        );
+        assert_eq!(
+            canonical(": restored ( Int Int -- ( -- Int Int ) )\n  [ swap swap ] cons cons"),
+            "export function restored(v0, v1) {\n  const v2 = () => [v0, v1];\n  return v2;\n}\n"
+        );
+
+        let defined = canonical(
+            ": exchange ( a b. a b -- b a )\n  swap\n: restored ( Int Int -- Int Int )\n  exchange exchange",
+        );
+        assert_eq!(
+            defined,
+            "export function exchange(v0, v1) {\n  return [v1, v0];\n}\n\nexport function restored(v2, v3) {\n  const [v4, v5] = exchange(v2, v3);\n  const [v6, v7] = exchange(v4, v5);\n  return [v6, v7];\n}\n"
+        );
+
+        let dynamic = canonical(": restored ( a b. a b (a b -- b a) -- b a )\n  call");
+        assert_eq!(
+            dynamic,
+            "export function restored(v0, v1, v2) {\n  const [v3, v4] = v2(v0, v1);\n  return [v3, v4];\n}\n"
+        );
+
+        let both = canonical(
+            ": foreign twice ( Int -- Int )\n: foreign thrice ( Int -- Int )\n: restored ( Int -- Int Int )\n  [ twice ] [ thrice ] bi",
+        );
+        assert_eq!(
+            both,
+            "export function restored(v0) {\n  const v1 = twice(v0);\n  const v2 = thrice(v0);\n  return [v1, v2];\n}\n"
+        );
+
+        let branch = canonical(": restored ( Int Int Bool -- Int )\n  [ drop ] [ nip ] if");
+        assert_eq!(
+            branch,
+            "export function restored(v0, v1, v2) {\n  let v3;\n  if (v2) {\n    v3 = v0;\n  } else {\n    v3 = v1;\n  }\n  return v3;\n}\n"
+        );
+    }
+
     #[test]
     fn javascript_runs_the_fragment() {
         run(
@@ -2598,6 +2845,90 @@ if (useBoth(1n, 2n) !== false) throw new Error("both neq");
     }
 
     #[test]
+    fn derived_show_compare_and_hash_run() {
+        let body = r#"
+; Ordering = LT | EQ | GT
+
+& Comparable a
+  eq ( a a -- Bool )
+
+& Showable a
+  show ( a -- Str )
+
+& Comparable a => Sortable a
+  compare ( a a -- Ordering )
+
+& Comparable a => Hashable a
+  hash ( a -- Int )
+
+: foreign showInt ( Int -- Str )
+: foreign compareInt ( Int Int -- Ordering )
+
+: eqInt ( Int Int -- Bool )
+  drop drop true
+
+: hashInt ( Int -- Int )
+  dup drop
+
+# Comparable Int
+  eq = eqInt
+
+# Showable Int
+  show = showInt
+
+# Sortable Int
+  compare = compareInt
+
+# Hashable Int
+  hash = hashInt
+
+; Answer = No | Yes Int
+; Pair = Pair left : Int, right : Int
+
+: shown ( Answer -- Str )
+  show
+
+: paired ( Pair -- Str )
+  show
+
+: ordered ( Answer Answer -- Ordering )
+  compare
+
+: ranked ( Pair Pair -- Ordering )
+  compare
+
+: hashed ( Pair -- Int )
+  hash
+"#;
+        let code = js(body);
+        assert!(code.contains('+'), "{code}");
+        assert!(!code.contains("ply_show_cat"), "{code}");
+        assert!(code.contains("* 31n +"), "{code}");
+        assert!(!code.contains("ply_hash_mix"), "{code}");
+        run(
+            body,
+            r#"
+function showInt(n) { return n.toString() + "n"; }
+function compareInt(a, b) {
+  if (a < b) return LT;
+  if (a > b) return GT;
+  return EQ;
+}
+if (shown(No) !== "No") throw new Error("show no " + shown(No));
+if (shown(Yes(1n)) !== "(Yes 1n)") throw new Error("show yes " + shown(Yes(1n)));
+if (paired(Pair(1n, 2n)) !== "(Pair 1n 2n)") throw new Error("show pair " + paired(Pair(1n, 2n)));
+if (ordered(No, No).tag !== "EQ") throw new Error("ord nn");
+if (ordered(No, Yes(1n)).tag !== "LT") throw new Error("ord ny");
+if (ordered(Yes(1n), No).tag !== "GT") throw new Error("ord yn");
+if (ranked(Pair(1n, 2n), Pair(1n, 3n)).tag !== "LT") throw new Error("rank lt");
+if (ranked(Pair(2n, 0n), Pair(1n, 9n)).tag !== "GT") throw new Error("rank gt");
+if (ranked(Pair(1n, 2n), Pair(1n, 2n)).tag !== "EQ") throw new Error("rank eq");
+if (hashed(Pair(1n, 2n)) !== 33n) throw new Error("hash " + hashed(Pair(1n, 2n)));
+"#,
+        );
+    }
+
+    #[test]
     fn result_type_picks_empty_and_pure() {
         let body = r#"
 : foreign scat ( Str Str -- Str )
@@ -2703,6 +3034,51 @@ const first = Entry(1, 10);
 const next = shift(first);
 if (first.at !== 10 || first.id !== 1) throw new Error("old " + JSON.stringify(first));
 if (next.at !== 11 || next.id !== 1 || next.tag !== "Entry") throw new Error("next " + JSON.stringify(next));
+"#,
+        );
+        let tagged = js(
+            "; Entry = Entry tag : Num, at : Num | Nope\n\n: read ( Entry -- Num )\n  (Entry n _) -> n\n  Nope -> 0\n",
+        );
+        assert!(tagged.contains("tag: \"Entry\""), "{tagged}");
+        assert!(tagged.contains("$tag: v0"), "{tagged}");
+        assert!(tagged.contains(".tag === \"Entry\""), "{tagged}");
+        assert!(tagged.contains(".$tag"), "{tagged}");
+        run(
+            r#"
+; Entry = Entry tag : Num, at : Num | Nope
+
+: kind ( Entry -- Int )
+  (Entry _ _) -> 0n
+  Nope -> 1n
+
+: read ( Entry -- Num )
+  (Entry n _) -> n
+  Nope -> 0
+"#,
+            r#"
+const row = Entry(7, 10);
+if (row.tag !== "Entry" || row.$tag !== 7 || row.at !== 10) throw new Error("stored " + JSON.stringify(row));
+if (kind(row) !== 0n) throw new Error("kind " + kind(row));
+if (kind(Nope) !== 1n) throw new Error("nope");
+if (read(row) !== 7) throw new Error("read");
+"#,
+        );
+        run(
+            r#"
+; Row = Row tag : Num, at : Num
+
+: read ( Row -- Num )
+  tag>>
+
+: move ( Row Num -- Row )
+  >>tag
+"#,
+            r#"
+const row = Row(7, 10);
+if (row.tag !== "Row" || row.$tag !== 7 || row.at !== 10) throw new Error("stored " + JSON.stringify(row));
+if (read(row) !== 7) throw new Error("read");
+const next = move(row, 8);
+if (row.$tag !== 7 || next.$tag !== 8 || next.tag !== "Row" || next.at !== 10) throw new Error("moved " + JSON.stringify(next));
 "#,
         );
     }

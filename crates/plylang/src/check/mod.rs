@@ -18,13 +18,15 @@
 //! and a program cannot name a label.
 
 mod clauses;
+mod derive;
+mod instance;
 mod lower;
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ast::{
-    Class, Def, EffectRow, Exports, Import, Instance, Item, Lit, Module, Place, RecordTail,
+    Class, Def, EffectRow, Exports, Import, Item, Lit, Module, Place, RecordTail,
     Scheme, Stack, StackEffect, StackTail, Synonym, Term, TermNode, Type, Vis,
 };
 
@@ -168,7 +170,7 @@ pub(crate) fn check_and_note(
                 sites: Vec::new(),
             };
         }
-        if let Err(error) = checker.derive_comparable(module) {
+        if let Err(error) = checker.derive_instances(module) {
             return ImportNotes {
                 error: Some(error),
                 sites: checker.render_sites(),
@@ -238,7 +240,7 @@ pub(crate) fn collect_sites_with_imports_key(
         if checker.prepare(module).is_err() {
             return Vec::new();
         }
-        let _ = checker.derive_comparable(module);
+        let _ = checker.derive_instances(module);
         let _ = checker.check_bodies(module);
         checker.render_sites()
     })
@@ -460,6 +462,8 @@ enum Dict {
 struct ResolvedMethod {
     name: String,
     word: String,
+    /// Module key of the `#` that selected this word.
+    origin: String,
     dicts: Vec<Dict>,
     extra: usize,
     arity: usize,
@@ -587,6 +591,8 @@ struct Checker {
     bind_arity: HashMap<(Span, String), (usize, usize)>,
     /// Solved form of [`deferred`], keyed by the use span. The second lower pass reads it.
     use_dicts: HashMap<Span, Vec<Dict>>,
+    /// Instance words lowered in this module, with the `#` that selected them.
+    method_homes: Vec<crate::anf::MethodHome>,
     /// Parallel to [`assumptions`] while lowering. Empty during checking.
     assumption_locals: Vec<u32>,
     solving: Vec<String>,
@@ -608,9 +614,13 @@ struct Checker {
     ctor_words: HashMap<String, CtorWord>,
     /// Local spelling of an import to the name the provider published.
     renamed: HashMap<String, String>,
-    /// `Comparable` instances derived for this module. The def is lowered.
+    /// Instances derived for this module. The def is lowered.
     /// A public type's instance is also appended to the module.
     derived: Vec<Item>,
+    /// Derived `show` calls `ply_show_cat`. Lowering inlines string addition.
+    inline_show_cat: bool,
+    /// Derived `hash` calls `ply_hash_mix`. Lowering inlines the mix.
+    inline_hash_mix: bool,
     /// Place names in this check. The reader scheme lives in `words`.
     places: HashSet<String>,
     /// Modules whose instances are already in `instances`. The import graph
@@ -658,6 +668,7 @@ impl Checker {
             bind_tys: Vec::new(),
             bind_arity: HashMap::new(),
             use_dicts: HashMap::new(),
+            method_homes: Vec::new(),
             assumption_locals: Vec::new(),
             solving: Vec::new(),
             trail: Vec::new(),
@@ -672,6 +683,8 @@ impl Checker {
             ctor_words: HashMap::new(),
             renamed: HashMap::new(),
             derived: Vec::new(),
+            inline_show_cat: false,
+            inline_hash_mix: false,
             places: HashSet::new(),
             seen_instances: HashSet::new(),
         };
@@ -715,6 +728,7 @@ impl Checker {
         self.bind_tys.clear();
         self.bind_arity.clear();
         self.use_dicts.clear();
+        self.method_homes.clear();
         self.assumption_locals.clear();
         self.solving.clear();
         self.trail.clear();
@@ -729,6 +743,8 @@ impl Checker {
         self.ctor_words.clear();
         self.renamed.clear();
         self.derived.clear();
+        self.inline_show_cat = false;
+        self.inline_hash_mix = false;
         self.places.clear();
         self.seen_instances.clear();
         self.preload();
@@ -741,7 +757,7 @@ impl Checker {
 
     /// Derived instances are visible to the bodies that follow them.
     fn check_ready(&mut self, module: &Module) -> Result<(), Diagnostic> {
-        self.derive_comparable(module)?;
+        self.derive_instances(module)?;
         self.check_bodies(module)
     }
 
@@ -789,9 +805,10 @@ impl Checker {
                 _ => None,
             })
             .collect();
+        let graph = place_graph(module);
         for item in &module.items {
             if let Item::Place(place) = item {
-                self.reject_unready_place(place, &unready)?;
+                self.reject_unready_place(place, &unready, &graph)?;
                 unready.remove(&place.name);
                 if !place.body.is_empty() {
                     self.check_body(&place_def(place))?;
@@ -860,167 +877,6 @@ impl Checker {
             }
         }
         Ok(())
-    }
-
-    /// Build a `Comparable` instance for a sum or product whose fields are comparable.
-    /// A function field or a `Ref` field has none. A handwritten instance stays.
-    fn derive_comparable(&mut self, module: &Module) -> Result<(), Diagnostic> {
-        if module.language.is_some() {
-            return Ok(());
-        }
-        let added_eq = !self.words.contains_key("eq");
-        if !self.comparable_ready() {
-            return Ok(());
-        }
-        let mut pending: Vec<usize> = module
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| match item {
-                Item::Data(data) if self.derivable(data) => Some(index),
-                _ => None,
-            })
-            .collect();
-        loop {
-            let mut later = Vec::new();
-            let mut progress = false;
-            for index in pending {
-                let Item::Data(data) = &module.items[index] else {
-                    continue;
-                };
-                let data = data.clone();
-                if let Some(items) = self.derive_one(module, &data)? {
-                    progress = true;
-                    self.derived.extend(items);
-                } else {
-                    later.push(index);
-                }
-            }
-            if !progress {
-                break;
-            }
-            pending = later;
-        }
-        self.use_dicts.clear();
-        if added_eq && self.derived.is_empty() {
-            self.words.remove("eq");
-        }
-        Ok(())
-    }
-
-    /// `Comparable` is the class in scope, and `eq` is that class's method.
-    fn comparable_ready(&mut self) -> bool {
-        let Some(class) = self.classes.get("Comparable").cloned() else {
-            return false;
-        };
-        let Some(method) = class.methods.iter().find(|method| method.name == "eq") else {
-            return false;
-        };
-        if let Some(existing) = self.words.get("eq") {
-            return existing
-                .constraints
-                .iter()
-                .any(|constraint| constraint.class_name == "Comparable");
-        }
-        if !self.visible_classes.contains("Comparable") {
-            return false;
-        }
-        self.words.insert("eq".to_string(), method.scheme.clone());
-        true
-    }
-
-    fn derivable(&self, data: &crate::ast::Data) -> bool {
-        if data.foreign || data.ctors.is_empty() || self.has_comparable(&data.name) {
-            return false;
-        }
-        if self.words.contains_key(&format!("eq{}", data.name)) {
-            return false;
-        }
-        data.ctors.iter().all(|ctor| {
-            ctor.fields
-                .iter()
-                .all(|field| !type_blocks_eq(&field.ty))
-        })
-    }
-
-    fn has_comparable(&self, data_name: &str) -> bool {
-        self.instances.iter().any(|inst| {
-            if inst.class_name != "Comparable" || inst.args.len() != 1 {
-                return false;
-            }
-            let ty = self.expose(inst.args[0]);
-            matches!(&self.tys[ty.0 as usize], TyNode::Ctor(name, _) if name == data_name)
-        })
-    }
-
-    /// `Ok(None)` when a field has no `Comparable` instance. The attempt is removed.
-    fn derive_one(
-        &mut self,
-        module: &Module,
-        data: &crate::ast::Data,
-    ) -> Result<Option<Vec<Item>>, Diagnostic> {
-        let source = eq_source(data);
-        let parsed = parse(&source, ParseMode::Source).unwrap_or_else(|error| {
-            panic!("derived eq for {}: {}\n{source}", data.name, error.message)
-        });
-        let mut def = None;
-        let mut instance = None;
-        for item in parsed.items {
-            match item {
-                Item::Def(item) => def = Some(item),
-                Item::Instance(item) => instance = Some(item),
-                _ => {}
-            }
-        }
-        let Some(mut def) = def else {
-            panic!("derived eq for {} has no word\n{source}", data.name);
-        };
-        let Some(mut instance) = instance else {
-            panic!("derived eq for {} has no instance\n{source}", data.name);
-        };
-        let base = 1_000_000_000u32 + (self.derived.len() as u32) * 10_000;
-        shift_def(&mut def, base);
-        shift_instance(&mut instance, base);
-        let mark = self.instances.len();
-        let sites = self.sites.len();
-        let word = def.name.clone();
-        let saved = self.relax_visibility;
-        self.relax_visibility = true;
-        let registered = self.register_def(&def);
-        self.relax_visibility = saved;
-        registered?;
-        let origin = self.module_key.clone();
-        self.relax_visibility = true;
-        let declared = self.declare_instance(&instance, module, true, &origin);
-        self.relax_visibility = saved;
-        if let Err(error) = declared {
-            self.words.remove(&word);
-            self.instances.truncate(mark);
-            self.sites.truncate(sites);
-            if error.code == "PL0087" || error.code == "PL0088" {
-                return Ok(None);
-            }
-            return Err(error);
-        }
-        self.relax_visibility = true;
-        let checked = self.check_body(&def);
-        self.relax_visibility = saved;
-        if let Err(error) = checked {
-            self.words.remove(&word);
-            self.instances.truncate(mark);
-            self.sites.truncate(sites);
-            self.use_dicts.clear();
-            if error.code == "PL0088" {
-                return Ok(None);
-            }
-            return Err(Diagnostic::with_code(data.name_span, error.code, error.message));
-        }
-        self.sites.truncate(sites);
-        let mut items = vec![Item::Def(def)];
-        if derived_is_public(module, data) {
-            items.push(Item::Instance(instance));
-        }
-        Ok(Some(items))
     }
 
     fn preload(&mut self) {
@@ -1794,8 +1650,9 @@ impl Checker {
         &self,
         place: &Place,
         unready: &HashSet<String>,
+        graph: &HashMap<String, BTreeSet<String>>,
     ) -> Result<(), Diagnostic> {
-        if let Some((span, name)) = unready_mention(&place.body, unready) {
+        if let Some((span, name)) = unready_mention(&place.body, unready, graph) {
             return Err(self.error(span, Error::PlaceNotReady(name)));
         }
         Ok(())
@@ -1881,7 +1738,7 @@ impl Checker {
             TermNode::FieldSet(name) => self.set_field(term.span, name, stack),
             TermNode::FieldInsert(name) => self.insert_field(term.span, name, stack),
             TermNode::Array(elements) => {
-                let ty = self.check_array(term.span, elements)?;
+                let ty = self.check_array(elements)?;
                 Ok(self.stack_cons(stack, ty))
             }
             TermNode::Record(fields) => {
@@ -2478,13 +2335,13 @@ impl Checker {
         match &term.node {
             TermNode::Lit(lit) => Ok(self.lit_ty(lit)),
             TermNode::Quote(terms) => self.check_quote(term.span, terms),
-            TermNode::Array(elements) => self.check_array(term.span, elements),
+            TermNode::Array(elements) => self.check_array(elements),
             TermNode::Record(fields) => self.check_record(term.span, fields),
             _ => Err(self.error(term.span, Error::ExpectedElement)),
         }
     }
 
-    fn check_array(&mut self, _span: Span, elements: &[Term]) -> Result<TyId, Diagnostic> {
+    fn check_array(&mut self, elements: &[Term]) -> Result<TyId, Diagnostic> {
         let mut elem_ty = None;
         for element in elements {
             let ty = self.check_element(element)?;
@@ -4426,1218 +4283,6 @@ impl Checker {
         }
     }
 
-    fn register_class(&mut self, class: &Class) -> Result<(), Diagnostic> {
-        if self.classes.contains_key(&class.name) {
-            return Err(self.error(
-                class.name_span,
-                Error::DuplicateDefinition(class.name.to_string()),
-            ));
-        }
-        self.install_class(class, true)
-    }
-
-    fn ensure_class(&mut self, class: &Class) -> Result<(), Diagnostic> {
-        if self.classes.contains_key(&class.name) {
-            return Ok(());
-        }
-        self.install_class(class, false)
-    }
-
-    fn install_class(&mut self, class: &Class, export_methods: bool) -> Result<(), Diagnostic> {
-        if class.params.is_empty() {
-            return Err(self.error(
-                class.name_span,
-                Error::ClassNeedsParameter(class.name.to_string()),
-            ));
-        }
-        let mut params = Vec::new();
-        for param in &class.params {
-            if params.iter().any(|(name, _)| name == param) {
-                return Err(self.error(
-                    class.name_span,
-                    Error::DuplicateTypeVariable(param.to_string()),
-                ));
-            }
-            let kind = self.kind_var();
-            params.push((param.clone(), self.ty_of_kind(kind)));
-        }
-        // Reinstalling a class from an import closure elaborates constraints
-        // on classes that are installed but not named in this import list.
-        let saved_relax = self.relax_visibility;
-        if !export_methods {
-            self.relax_visibility = true;
-        }
-        let methods = self.elaborate_methods(class, &params, export_methods);
-        self.relax_visibility = saved_relax;
-        let methods = methods?;
-        // A methodless class learns its parameter kind from the superclasses.
-        // Defaulting first would turn that variable into `Type`.
-        let supers = self.elaborate_supers(class, &params, export_methods)?;
-        for (_, id) in &params {
-            if let Some(kind) = self.ty_kind.get(id).copied() {
-                self.default_kind(kind);
-            }
-        }
-        if export_methods {
-            self.visible_classes.insert(class.name.clone());
-            self.defined_classes.insert(class.name.clone());
-        }
-        self.classes.insert(
-            class.name.clone(),
-            ClassInfo {
-                params,
-                methods,
-                supers,
-            },
-        );
-        Ok(())
-    }
-
-    fn elaborate_methods(
-        &mut self,
-        class: &Class,
-        params: &[(String, TyId)],
-        export_methods: bool,
-    ) -> Result<Vec<ClassMethod>, Diagnostic> {
-        let mut methods = Vec::new();
-        for method in &class.methods {
-            if methods.iter().any(|have: &ClassMethod| have.name == method.name) {
-                return Err(self.error(
-                    method.name_span,
-                    Error::DuplicateDefinition(method.name.to_string()),
-                ));
-            }
-            let mut scope = Scope::new();
-            for (name, id) in params {
-                scope.tys.insert(name.clone(), *id);
-                scope.quantified_tys.push((name.clone(), *id));
-            }
-            let preset = scope.quantified_tys.len();
-            let mut scheme = self.elaborate_with(&method.scheme, method.name_span, scope, preset)?;
-            scheme.constraints.insert(
-                0,
-                SemConstraint {
-                    class_name: class.name.clone(),
-                    args: params.iter().map(|(_, id)| *id).collect(),
-                },
-            );
-            let arity = self.prefix_len(scheme.input);
-            if export_methods {
-                self.export_word(&method.name, scheme.clone(), method.name_span)?;
-            }
-            methods.push(ClassMethod {
-                name: method.name.clone(),
-                scheme,
-                arity,
-            });
-        }
-        Ok(methods)
-    }
-
-    /// Superclass arguments are the class parameters. A free name is not quantified.
-    /// An unsolved parameter kind is still a variable here. It is defaulted to
-    /// `Type` after the superclasses have been elaborated.
-    fn elaborate_supers(
-        &mut self,
-        class: &Class,
-        params: &[(String, TyId)],
-        local: bool,
-    ) -> Result<Vec<SemConstraint>, Diagnostic> {
-        let mut scope = Scope::new();
-        for (name, id) in params {
-            scope.tys.insert(name.clone(), *id);
-        }
-        let saved = self.relax_visibility;
-        // Re-installing an imported class sees superclasses that are installed
-        // but not named in this import list.
-        if !local {
-            self.relax_visibility = true;
-        }
-        let mut seen = HashSet::new();
-        let mut supers = Vec::new();
-        for constraint in &class.supers {
-            if constraint.class_name == class.name
-                || self.superclass_reaches(&constraint.class_name, &class.name)
-            {
-                self.relax_visibility = saved;
-                return Err(self.error(
-                    class.name_span,
-                    Error::CyclicSuperclass(class.name.to_string()),
-                ));
-            }
-            if !seen.insert(constraint.class_name.clone()) {
-                self.relax_visibility = saved;
-                return Err(self.error(
-                    class.name_span,
-                    Error::DuplicateDefinition(constraint.class_name.to_string()),
-                ));
-            }
-            match self.elab_constraint(constraint, &mut scope, class.name_span) {
-                Ok(sem) => supers.push(sem),
-                Err(error) => {
-                    self.relax_visibility = saved;
-                    return Err(error);
-                }
-            }
-        }
-        self.relax_visibility = saved;
-        Ok(supers)
-    }
-
-    fn superclass_reaches(&self, start: &str, target: &str) -> bool {
-        let mut seen = HashSet::new();
-        let mut stack = vec![start.to_string()];
-        while let Some(name) = stack.pop() {
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            let Some(class) = self.classes.get(&name) else {
-                continue;
-            };
-            for sup in &class.supers {
-                if sup.class_name == target {
-                    return true;
-                }
-                stack.push(sup.class_name.clone());
-            }
-        }
-        false
-    }
-
-    fn elab_constraint(
-        &mut self,
-        constraint: &crate::ast::Constraint,
-        scope: &mut Scope,
-        span: Span,
-    ) -> Result<SemConstraint, Diagnostic> {
-        let written = constraint.class_name.clone();
-        if !self.relax_visibility && !self.visible_classes.contains(&written) {
-            return Err(self.error(span, Error::UndefinedClass(written)));
-        }
-        let canon = self.canonical(&written).to_string();
-        let class = self.classes.get(&canon).cloned().ok_or_else(|| {
-            self.error(span, Error::UndefinedClass(written.clone()))
-        })?;
-        if constraint.args.len() != class.params.len() {
-            let count = class.params.len();
-            return Err(self.error(
-                span,
-                Error::ClassArity { name: written, count },
-            ));
-        }
-        let mut args = Vec::new();
-        for (arg, (_, param)) in constraint.args.iter().zip(&class.params) {
-            let (ty, kind) = self.elab_ty(arg, scope, span)?;
-            let expect = match self.ty_kind.get(param).copied() {
-                Some(kind) => kind,
-                None => self.kind_type(),
-            };
-            self.unify_kind(kind, expect)
-                .map_err(|message| self.error(span, message))?;
-            args.push(ty);
-        }
-        Ok(SemConstraint {
-            class_name: canon,
-            args,
-        })
-    }
-
-    fn export_imported_method(
-        &mut self,
-        provider: &Module,
-        remote: &str,
-        local: &str,
-        span: Span,
-    ) -> Result<bool, Diagnostic> {
-        let Some(class) = provider.items.iter().find_map(|item| match item {
-            Item::Class(class) if class.methods.iter().any(|method| method.name == remote) => {
-                Some(class.clone())
-            }
-            _ => None,
-        }) else {
-            return Ok(false);
-        };
-        self.ensure_class(&class)?;
-        let scheme = self
-            .classes
-            .get(&class.name)
-            .and_then(|info| {
-                info.methods
-                    .iter()
-                    .find(|method| method.name == remote)
-                    .map(|method| method.scheme.clone())
-            })
-            .expect("class method was installed");
-        self.export_word(local, scheme, span)?;
-        Ok(true)
-    }
-
-    /// Instances written in `origin`, plus instances reached through its imports.
-    /// A module is entered once. Dropping it from the path afterwards walked
-    /// every path through the import graph and copied each instance again.
-    fn import_instance_surface(
-        &mut self,
-        origin: &str,
-        known: &[KnownModule],
-    ) -> Result<(), Diagnostic> {
-        if self.seen_instances.contains(origin) {
-            return Ok(());
-        }
-        let Some(known_module) = known_at(known, origin) else {
-            return Ok(());
-        };
-        self.seen_instances.insert(origin.to_string());
-        let key = instance_key(known_module);
-        for item in &known_module.module.items {
-            if let Item::Instance(instance) = item {
-                self.declare_instance(instance, &known_module.module, false, &key)?;
-            }
-        }
-        for (index, _) in known_module.module.imports.iter().enumerate() {
-            let Some(dep) = known_module.deps.get(index) else {
-                continue;
-            };
-            self.import_instance_surface(dep, known)?;
-        }
-        Ok(())
-    }
-
-    fn declare_instance(
-        &mut self,
-        instance: &Instance,
-        module: &Module,
-        local: bool,
-        origin: &str,
-    ) -> Result<(), Diagnostic> {
-        let mut seen_classes = HashSet::new();
-        for name in &instance.class_names {
-            if !seen_classes.insert(name.clone()) {
-                return Err(self.error(instance.span, Error::DuplicateDefinition(name.to_string())));
-            }
-        }
-        let mut classes = Vec::new();
-        for name in &instance.class_names {
-            let class = self.classes.get(name).cloned().ok_or_else(|| {
-                self.error(instance.span, Error::UndefinedClass(name.to_string()))
-            })?;
-            classes.push(class);
-        }
-        let mut seen = HashSet::new();
-        for binding in &instance.methods {
-            if !seen.insert(binding.name.clone()) {
-                return Err(self.error(
-                    binding.name_span,
-                    Error::DuplicateDefinition(binding.name.to_string()),
-                ));
-            }
-            let owners: Vec<&str> = instance
-                .class_names
-                .iter()
-                .zip(&classes)
-                .filter(|(_, class)| class.methods.iter().any(|method| method.name == binding.name))
-                .map(|(name, _)| name.as_str())
-                .collect();
-            if owners.len() != 1 {
-                let error = if owners.is_empty() {
-                    Error::MethodNotOf {
-                        name: binding.name.to_string(),
-                        classes: instance.class_names.join(", "),
-                    }
-                } else {
-                    Error::MethodOfSeveral {
-                        name: binding.name.to_string(),
-                        owners: owners.join(" and "),
-                    }
-                };
-                return Err(self.error(binding.name_span, error));
-            }
-        }
-        for (name, class) in instance.class_names.iter().zip(&classes) {
-            self.declare_class_instance(instance, module, local, name, class, origin)?;
-        }
-        Ok(())
-    }
-
-    /// One class from an instance declaration. The head is elaborated again so
-    /// each class sees the argument kinds afresh.
-    fn declare_class_instance(
-        &mut self,
-        instance: &Instance,
-        module: &Module,
-        local: bool,
-        class_name: &str,
-        class: &ClassInfo,
-        origin: &str,
-    ) -> Result<(), Diagnostic> {
-        if local && self.orphan(class_name, &instance.args) {
-            return Err(self.error(instance.span, Error::OrphanInstance));
-        }
-        if instance.args.len() != class.params.len() {
-            let count = class.params.len();
-            return Err(self.error(
-                instance.span,
-                Error::ClassArity { name: class_name.to_string(), count },
-            ));
-        }
-        let mut names = Vec::new();
-        for arg in &instance.args {
-            collect_ty_vars(arg, &mut names);
-        }
-        let mut scope = Scope::new();
-        for name in &names {
-            let kind = self.kind_var();
-            let id = self.ty_of_kind(kind);
-            scope.tys.insert(name.clone(), id);
-            scope.quantified_tys.push((name.clone(), id));
-        }
-        let mut head = Vec::new();
-        for (arg, (_, param)) in instance.args.iter().zip(&class.params) {
-            let (ty, kind) = self.elab_ty(arg, &mut scope, instance.span)?;
-            let expect = match self.ty_kind.get(param).copied() {
-                Some(kind) => kind,
-                None => self.kind_type(),
-            };
-            self.unify_kind(kind, expect)
-                .map_err(|message| self.error(instance.span, message))?;
-            head.push(ty);
-        }
-        for (_, id) in &scope.quantified_tys {
-            if let Some(kind) = self.ty_kind.get(id).copied() {
-                self.default_kind(kind);
-            }
-        }
-        let bound: HashSet<&str> = instance
-            .methods
-            .iter()
-            .map(|binding| binding.name.as_str())
-            .collect();
-        for method in &class.methods {
-            if !bound.contains(method.name.as_str()) {
-                return Err(self.error(instance.span, Error::MissingMethod(method.name.to_string())));
-            }
-        }
-        let mut methods = Vec::new();
-        for method in &class.methods {
-            let binding = instance
-                .methods
-                .iter()
-                .find(|binding| binding.name == method.name)
-                .expect("method was checked");
-            let word = self.lookup_word_scheme(module, &binding.word, binding.name_span)?;
-            let (context, extra) =
-                self.check_impl(class, method, &word, &head, binding.name_span)?;
-            methods.push(InstanceMethod {
-                name: method.name.clone(),
-                word: binding.word.clone(),
-                context,
-                extra,
-                arity: method.arity,
-            });
-        }
-        let supers = self.substitute_constraints(&class.params, &head, &class.supers);
-        self.require_superclass_instances(&supers, instance.span)?;
-        let info = InstanceInfo {
-            class_name: class_name.to_string(),
-            vars: scope.quantified_tys,
-            tails: scope.quantified_tails,
-            rows: scope.quantified_rows,
-            args: head,
-            methods,
-            supers,
-            origin: origin.to_string(),
-        };
-        for existing in self.instances.clone() {
-            if self.overlaps(&existing, &info) {
-                // The same instance from the same module is idempotent. A second
-                // `#` in this file is still incoherent.
-                if !local && existing.origin == info.origin {
-                    return Ok(());
-                }
-                return Err(self.error(instance.span, Error::IncoherentInstance));
-            }
-        }
-        self.instances.push(info);
-        Ok(())
-    }
-
-    fn orphan(&self, class_name: &str, args: &[Type]) -> bool {
-        if self.defined_classes.contains(class_name) {
-            return false;
-        }
-        !args
-            .iter()
-            .any(|ty| self.defines_type(ty) || self.builtin_in(ty))
-    }
-
-    /// Any builtin constructor in the head counts, including under another type.
-    fn builtin_in(&self, ty: &Type) -> bool {
-        self.builtin_in_seen(ty, &mut Vec::new())
-    }
-
-    fn builtin_in_seen(&self, ty: &Type, seen: &mut Vec<String>) -> bool {
-        if let Some((name, rhs)) = self.expand_ast(ty, seen) {
-            seen.push(name);
-            let found = self.builtin_in_seen(&rhs, seen);
-            seen.pop();
-            return found;
-        }
-        match ty {
-            Type::Ctor(name) => builtin::builtin_type(name),
-            Type::App(head, args) => {
-                self.builtin_in_seen(head, seen)
-                    || args.iter().any(|arg| self.builtin_in_seen(arg, seen))
-            }
-            Type::Fun(effect) => effect
-                .input
-                .items
-                .iter()
-                .chain(&effect.output.items)
-                .any(|ty| self.builtin_in_seen(ty, seen)),
-            Type::Record(row) => {
-                row.fields
-                    .iter()
-                    .any(|(_, ty)| self.builtin_in_seen(ty, seen))
-                    || row
-                        .tail_ty()
-                        .is_some_and(|ty| self.builtin_in_seen(ty, seen))
-            }
-            Type::Var(_) => false,
-        }
-    }
-
-    fn defines_type(&self, ty: &Type) -> bool {
-        self.defines_type_seen(ty, &mut Vec::new())
-    }
-
-    /// A synonym expands before the orphan rule, so it is not its own head.
-    fn defines_type_seen(&self, ty: &Type, seen: &mut Vec<String>) -> bool {
-        if let Some((name, rhs)) = self.expand_ast(ty, seen) {
-            seen.push(name);
-            let owns = self.defines_type_seen(&rhs, seen);
-            seen.pop();
-            return owns;
-        }
-        match ty {
-            Type::Ctor(name) => self.defined_data.contains(name),
-            Type::App(head, args) => {
-                self.defines_type_seen(head, seen)
-                    || args.iter().any(|arg| self.defines_type_seen(arg, seen))
-            }
-            Type::Fun(effect) => {
-                effect
-                    .input
-                    .items
-                    .iter()
-                    .chain(&effect.output.items)
-                    .any(|ty| self.defines_type_seen(ty, seen))
-            }
-            Type::Record(row) => {
-                row.fields
-                    .iter()
-                    .any(|(_, ty)| self.defines_type_seen(ty, seen))
-                    || row
-                        .tail_ty()
-                        .is_some_and(|ty| self.defines_type_seen(ty, seen))
-            }
-            Type::Var(_) => false,
-        }
-    }
-
-    fn expand_ast(&self, ty: &Type, seen: &[String]) -> Option<(String, Type)> {
-        let (name, args) = match ty {
-            Type::Ctor(name) => (name, Vec::new()),
-            Type::App(head, args) => {
-                let Type::Ctor(name) = head.as_ref() else {
-                    return None;
-                };
-                (name, args.clone())
-            }
-            _ => return None,
-        };
-        if seen.iter().any(|have| have == name) || !self.syn_in_scope(name) {
-            return None;
-        }
-        let body = self.synonyms.get(name)?;
-        if args.len() != body.params.len() {
-            return None;
-        }
-        Some((name.clone(), subst_type(&body.rhs, &body.params, &args)))
-    }
-
-    fn lookup_word_scheme(
-        &mut self,
-        module: &Module,
-        name: &str,
-        span: Span,
-    ) -> Result<SemScheme, Diagnostic> {
-        // The provider's own definition is the instance. An importer often
-        // already has the class method under that name, and that scheme is
-        // not the implementation.
-        if let Some(def) = find_def(module, name) {
-            let saved = self.relax_visibility;
-            self.relax_visibility = true;
-            let result = self.elaborate_scheme(&def.scheme, def.name_span);
-            self.relax_visibility = saved;
-            return result;
-        }
-        if let Some(scheme) = self.lookup(name) {
-            return Ok(scheme);
-        }
-        Err(self.error(span, Error::UndefinedWord(name.to_string())))
-    }
-
-    /// The implementation word lists head dictionaries first and the method's own
-    /// constraints last. A head dictionary is solved when the instance dictionary
-    /// is built. A method constraint mentions a variable of the method, so the
-    /// call site passes that dictionary.
-    fn check_impl(
-        &mut self,
-        class: &ClassInfo,
-        method: &ClassMethod,
-        word: &SemScheme,
-        head: &[TyId],
-        span: Span,
-    ) -> Result<(Vec<SemConstraint>, usize), Diagnostic> {
-        let (need_in, need_out, need_effect, skolems, extras) =
-            self.method_at_head(class, method, head);
-        let (have_in, have_out, have_effect, context) = self.instantiate_scheme(word, false);
-        self.unify_stack(have_in, need_in)
-            .map_err(|message| self.error(span, message))?;
-        self.unify_stack(have_out, need_out)
-            .map_err(|message| self.error(span, message))?;
-        self.unify_effect(have_effect, need_effect)
-            .map_err(|message| self.error(span, message))?;
-        if context.len() < extras.len() {
-            return Err(self.error(
-                span,
-                Error::TypeMismatch {
-                    expected: self.show_constraints(&extras),
-                    found: self.show_constraints(&context),
-                },
-            ));
-        }
-        let split = context.len() - extras.len();
-        for (have, need) in context[split..].iter().zip(&extras) {
-            if have.class_name != need.class_name || have.args.len() != need.args.len() {
-                return Err(self.error(
-                    span,
-                    Error::TypeMismatch {
-                        expected: self.show_constraint(need),
-                        found: self.show_constraint(have),
-                    },
-                ));
-            }
-            for (have_arg, need_arg) in have.args.iter().zip(&need.args) {
-                self.unify_ty(*have_arg, *need_arg)
-                    .map_err(|message| self.error(span, message))?;
-            }
-        }
-        let mut kept = Vec::new();
-        for constraint in &context[..split] {
-            let shown = self.show_constraint(constraint);
-            if constraint
-                .args
-                .iter()
-                .any(|arg| self.ty_has_skolem(*arg, &skolems, &mut Seen::default()))
-            {
-                return Err(self.error(span, Error::AmbiguousConstraint(shown)));
-            }
-            for arg in &constraint.args {
-                if self.flexible(*arg, &mut Seen::default()) {
-                    return Err(self.error(span, Error::AmbiguousConstraint(shown)));
-                }
-            }
-            kept.push(constraint.clone());
-        }
-        Ok((kept, extras.len()))
-    }
-
-    /// A method variable that is not the class parameter. The implementation
-    /// must work for every such variable, so a constraint still mentioning it
-    /// is not determined by the instance head.
-    fn ty_has_skolem(&self, ty: TyId, skolems: &[TyId], seen: &mut Seen) -> bool {
-        let ty = self.find_ty(ty);
-        if skolems.contains(&ty) {
-            return true;
-        }
-        if !seen.ty.insert(ty) {
-            return false;
-        }
-        match self.tys[ty.0 as usize].clone() {
-            TyNode::Ctor(_, args) => args
-                .into_iter()
-                .any(|arg| self.ty_has_skolem(arg, skolems, seen)),
-            TyNode::App(head, args) => {
-                self.ty_has_skolem(head, skolems, seen)
-                    || args
-                        .into_iter()
-                        .any(|arg| self.ty_has_skolem(arg, skolems, seen))
-            }
-            TyNode::Fun(input, output, _) => {
-                self.stack_has_skolem(input, skolems, seen)
-                    || self.stack_has_skolem(output, skolems, seen)
-            }
-            TyNode::Record(row) => self.row_has_skolem(row, skolems, seen),
-            TyNode::Alias { args, body, .. } => {
-                args.into_iter()
-                    .any(|arg| self.ty_has_skolem(arg, skolems, seen))
-                    || self.ty_has_skolem(body, skolems, seen)
-            }
-            TyNode::Link(next) => self.ty_has_skolem(next, skolems, seen),
-            _ => false,
-        }
-    }
-
-    fn stack_has_skolem(&self, stack: StackId, skolems: &[TyId], seen: &mut Seen) -> bool {
-        let stack = self.find_stack(stack);
-        if !seen.stack.insert(stack) {
-            return false;
-        }
-        match self.stacks[stack.0 as usize].clone() {
-            StackNode::Cons(rest, ty) => {
-                self.stack_has_skolem(rest, skolems, seen)
-                    || self.ty_has_skolem(ty, skolems, seen)
-            }
-            StackNode::Link(next) => self.stack_has_skolem(next, skolems, seen),
-            _ => false,
-        }
-    }
-
-    fn row_has_skolem(&self, row: RowId, skolems: &[TyId], seen: &mut Seen) -> bool {
-        let row = self.find_row(row);
-        if !seen.row.insert(row) {
-            return false;
-        }
-        match self.rows[row.0 as usize].clone() {
-            RowNode::Fields { fields, tail } => {
-                fields
-                    .into_iter()
-                    .any(|(_, ty)| self.ty_has_skolem(ty, skolems, seen))
-                    || tail.is_some_and(|tail| self.row_has_skolem(tail, skolems, seen))
-            }
-            RowNode::Link(next) => self.row_has_skolem(next, skolems, seen),
-            _ => false,
-        }
-    }
-
-    fn method_at_head(
-        &mut self,
-        class: &ClassInfo,
-        method: &ClassMethod,
-        head: &[TyId],
-    ) -> (StackId, StackId, EffectId, Vec<TyId>, Vec<SemConstraint>) {
-        let mut subst = Subst::default();
-        let mut skolems = Vec::new();
-        for ((_, param), arg) in class.params.iter().zip(head) {
-            subst.ty.insert(*param, *arg);
-        }
-        for (name, id) in &method.scheme.tys {
-            if subst.ty.contains_key(id) {
-                continue;
-            }
-            let fresh = self.ty_rigid(name);
-            skolems.push(fresh);
-            if let Some(kind) = self.ty_kind.get(id).copied() {
-                self.ty_kind.insert(fresh, kind);
-            }
-            subst.ty.insert(*id, fresh);
-        }
-        for tail in &method.scheme.tails {
-            subst.stack.insert(tail.id, self.stack_var());
-        }
-        for row in &method.scheme.rows {
-            subst.row.insert(row.id, self.row_var());
-        }
-        for effect in &method.scheme.effect_vars {
-            let fresh = if effect.skolem {
-                self.effect_rigid(&effect.name)
-            } else {
-                self.effect_var()
-            };
-            subst.effect.insert(effect.id, fresh);
-        }
-        let mut memo = Memo::default();
-        let input = self.copy_stack(method.scheme.input, &subst, &mut memo);
-        let output = self.copy_stack(method.scheme.output, &subst, &mut memo);
-        let effect = self.copy_effect(method.scheme.effect, &subst, &mut memo);
-        // The first constraint is the class itself, inserted when the class was installed.
-        let extras = if method.scheme.constraints.is_empty() {
-            Vec::new()
-        } else {
-            self.copy_constraints(&method.scheme.constraints[1..], &subst, &mut memo)
-        };
-        (input, output, effect, skolems, extras)
-    }
-
-    fn overlaps(&mut self, left: &InstanceInfo, right: &InstanceInfo) -> bool {
-        if left.class_name != right.class_name || left.args.len() != right.args.len() {
-            return false;
-        }
-        let (left_args, _, _) = self.copy_instance(left);
-        let (right_args, _, _) = self.copy_instance(right);
-        self.trial(|checker| {
-            for (left_arg, right_arg) in left_args.iter().zip(&right_args) {
-                checker.unify_ty(*left_arg, *right_arg)?;
-            }
-            Ok(())
-        })
-        .is_ok()
-    }
-
-    fn copy_instance(
-        &mut self,
-        inst: &InstanceInfo,
-    ) -> (Vec<TyId>, Vec<InstanceMethod>, Vec<SemConstraint>) {
-        let mut subst = Subst::default();
-        for (_, id) in &inst.vars {
-            subst.ty.insert(*id, self.ty_var());
-        }
-        for tail in &inst.tails {
-            subst.stack.insert(tail.id, self.stack_var());
-        }
-        for row in &inst.rows {
-            subst.row.insert(row.id, self.row_var());
-        }
-        let mut memo = Memo::default();
-        let args = inst
-            .args
-            .iter()
-            .map(|arg| self.copy_ty(*arg, &subst, &mut memo))
-            .collect();
-        let methods = inst
-            .methods
-            .iter()
-            .map(|method| InstanceMethod {
-                name: method.name.clone(),
-                word: method.word.clone(),
-                arity: method.arity,
-                extra: method.extra,
-                context: self.copy_constraints(&method.context, &subst, &mut memo),
-            })
-            .collect();
-        let supers = self.copy_constraints(&inst.supers, &subst, &mut memo);
-        (args, methods, supers)
-    }
-
-    fn copy_constraints(
-        &mut self,
-        constraints: &[SemConstraint],
-        subst: &Subst,
-        memo: &mut Memo,
-    ) -> Vec<SemConstraint> {
-        constraints
-            .iter()
-            .map(|constraint| SemConstraint {
-                class_name: constraint.class_name.clone(),
-                args: constraint
-                    .args
-                    .iter()
-                    .map(|arg| self.copy_ty(*arg, subst, memo))
-                    .collect(),
-            })
-            .collect()
-    }
-
-    /// Class parameters are replaced by `args`. The arguments stay the same ids.
-    fn substitute_constraints(
-        &mut self,
-        params: &[(String, TyId)],
-        args: &[TyId],
-        constraints: &[SemConstraint],
-    ) -> Vec<SemConstraint> {
-        let mut subst = Subst::default();
-        for ((_, param), arg) in params.iter().zip(args) {
-            subst.ty.insert(*param, *arg);
-        }
-        let mut memo = Memo::default();
-        self.copy_constraints(constraints, &subst, &mut memo)
-    }
-
-    /// Solve now when the head is concrete. `empty` and `pure` pin it from the
-    /// result, which is not known until the body has been unified.
-    fn solve_or_defer(
-        &mut self,
-        constraints: &[SemConstraint],
-        span: Span,
-    ) -> Result<(), Diagnostic> {
-        if self.constraints_flexible(constraints) {
-            self.deferred.push(DeferredUse {
-                span,
-                constraints: constraints.to_vec(),
-            });
-            return Ok(());
-        }
-        self.solve_all(constraints, span)?;
-        Ok(())
-    }
-
-    fn constraints_flexible(&self, constraints: &[SemConstraint]) -> bool {
-        constraints
-            .iter()
-            .any(|constraint| constraint.args.iter().any(|ty| self.flexible(*ty, &mut Seen::default())))
-    }
-
-    fn dicts_for_use(
-        &mut self,
-        constraints: &[SemConstraint],
-        span: Span,
-    ) -> Result<Option<Vec<Dict>>, Diagnostic> {
-        if let Some(dicts) = self.use_dicts.get(&span) {
-            return Ok(Some(dicts.clone()));
-        }
-        if self.constraints_flexible(constraints) {
-            self.deferred.push(DeferredUse {
-                span,
-                constraints: constraints.to_vec(),
-            });
-            return Ok(None);
-        }
-        Ok(Some(self.solve_all(constraints, span)?))
-    }
-
-    fn finish_deferred(&mut self) -> Result<(), Diagnostic> {
-        let pending = std::mem::take(&mut self.deferred);
-        for item in pending {
-            if let Some(constraint) = item.constraints.iter().find(|constraint| {
-                constraint.args.iter().any(|ty| self.flexible(*ty, &mut Seen::default()))
-            }) {
-                let shown = self.show_constraint(constraint);
-                return Err(self.error(item.span, Error::AmbiguousConstraint(shown)));
-            }
-            let dicts = self.solve_all(&item.constraints, item.span)?;
-            self.use_dicts.insert(item.span, dicts);
-        }
-        Ok(())
-    }
-
-    fn solve_all(
-        &mut self,
-        constraints: &[SemConstraint],
-        span: Span,
-    ) -> Result<Vec<Dict>, Diagnostic> {
-        let mut dicts = Vec::new();
-        for constraint in constraints {
-            dicts.push(self.solve_one(constraint, span)?);
-        }
-        Ok(dicts)
-    }
-
-    fn solve_one(&mut self, constraint: &SemConstraint, span: Span) -> Result<Dict, Diagnostic> {
-        let key = self.show_constraint(constraint);
-        if self.solving.iter().any(|seen| seen == &key) {
-            return Err(self.error(span, Error::CyclicInstance(key)));
-        }
-        if let Some(index) = self.match_assumption(constraint) {
-            return Ok(Dict::Assumption(index));
-        }
-        if let Some(dict) = self.entail(constraint, span)? {
-            return Ok(dict);
-        }
-        self.solving.push(key);
-        let saved = (
-            self.frozen_ty.clone(),
-            self.frozen_stack.clone(),
-            self.frozen_row.clone(),
-            self.frozen_effect.clone(),
-        );
-        for arg in &constraint.args {
-            self.freeze_ty(*arg);
-        }
-        let instances = self.instances.clone();
-        let mut found = None;
-        let mut failure = None;
-        for inst in &instances {
-            if inst.class_name != constraint.class_name {
-                continue;
-            }
-            let Ok((methods, supers)) = self.match_instance(inst, &constraint.args) else {
-                continue;
-            };
-            let mut resolved = Vec::new();
-            let mut skip = false;
-            for method in &methods {
-                match self.solve_all(&method.context, span) {
-                    Ok(dicts) => resolved.push(ResolvedMethod {
-                        name: method.name.clone(),
-                        word: method.word.clone(),
-                        dicts,
-                        extra: method.extra,
-                        arity: method.arity,
-                    }),
-                    Err(error) if error.code == "PL0088" => {
-                        skip = true;
-                        break;
-                    }
-                    Err(error) => {
-                        failure = Some(error);
-                        break;
-                    }
-                }
-            }
-            if failure.is_some() {
-                break;
-            }
-            if skip {
-                continue;
-            }
-            let mut super_dicts = Vec::new();
-            for sup in &supers {
-                match self.solve_one(sup, span) {
-                    Ok(dict) => super_dicts.push((sup.class_name.clone(), dict)),
-                    Err(error) if error.code == "PL0088" => {
-                        skip = true;
-                        break;
-                    }
-                    Err(error) => {
-                        failure = Some(error);
-                        break;
-                    }
-                }
-            }
-            if failure.is_some() {
-                break;
-            }
-            if skip {
-                continue;
-            }
-            if found.is_some() {
-                failure = Some(self.error(span, Error::IncoherentInstance));
-                break;
-            }
-            found = Some(Dict::Instance {
-                methods: resolved,
-                supers: super_dicts,
-            });
-        }
-        self.frozen_ty = saved.0;
-        self.frozen_stack = saved.1;
-        self.frozen_row = saved.2;
-        self.frozen_effect = saved.3;
-        self.solving.pop();
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        found.ok_or_else(|| {
-            self.error(
-                span,
-                Error::NoInstance(self.show_constraint(constraint)),
-            )
-        })
-    }
-
-    fn match_assumption(&mut self, wanted: &SemConstraint) -> Option<usize> {
-        let assumptions = self.assumptions.clone();
-        for (index, assumption) in assumptions.iter().enumerate() {
-            if assumption.class_name != wanted.class_name
-                || assumption.args.len() != wanted.args.len()
-            {
-                continue;
-            }
-            let saved = (
-                self.frozen_ty.clone(),
-                self.frozen_stack.clone(),
-                self.frozen_row.clone(),
-            self.frozen_effect.clone(),
-            );
-            for arg in assumption.args.iter().chain(&wanted.args) {
-                self.freeze_ty(*arg);
-            }
-            let ok = self
-                .trial(|checker| {
-                    for (have, need) in assumption.args.iter().zip(&wanted.args) {
-                        checker.unify_ty(*have, *need)?;
-                    }
-                    Ok(())
-                })
-                .is_ok();
-            self.frozen_ty = saved.0;
-            self.frozen_stack = saved.1;
-            self.frozen_row = saved.2;
-        self.frozen_effect = saved.3;
-            if ok {
-                return Some(index);
-            }
-        }
-        None
-    }
-
-    fn match_instance(
-        &mut self,
-        inst: &InstanceInfo,
-        wanted: &[TyId],
-    ) -> Result<(Vec<InstanceMethod>, Vec<SemConstraint>), Error> {
-        if inst.args.len() != wanted.len() {
-            return Err(Error::Arity);
-        }
-        let (args, methods, supers) = self.copy_instance(inst);
-        let saved = (
-            self.frozen_ty.clone(),
-            self.frozen_stack.clone(),
-            self.frozen_row.clone(),
-            self.frozen_effect.clone(),
-        );
-        for arg in wanted {
-            self.freeze_ty(*arg);
-        }
-        let result = self.trial(|checker| {
-            for (got, need) in args.iter().zip(wanted) {
-                checker.unify_ty(*got, *need)?;
-            }
-            Ok((methods, supers))
-        });
-        self.frozen_ty = saved.0;
-        self.frozen_stack = saved.1;
-        self.frozen_row = saved.2;
-        self.frozen_effect = saved.3;
-        result
-    }
-
-    /// The subclass instance needs each superclass instance for the same head.
-    /// A matching head is enough: its method context is solved when the
-    /// dictionary is built, which is how `Comparable (Box a)` keeps `Comparable a`.
-    fn require_superclass_instances(
-        &mut self,
-        constraints: &[SemConstraint],
-        span: Span,
-    ) -> Result<(), Diagnostic> {
-        let instances = self.instances.clone();
-        for constraint in constraints {
-            let matched = instances.iter().any(|inst| {
-                inst.class_name == constraint.class_name
-                    && self.instance_head_matches(inst, &constraint.args)
-            });
-            if !matched {
-                return Err(self.error(
-                    span,
-                    Error::NoInstance(self.show_constraint(constraint)),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn instance_head_matches(&mut self, inst: &InstanceInfo, wanted: &[TyId]) -> bool {
-        if inst.args.len() != wanted.len() {
-            return false;
-        }
-        let (args, _, _) = self.copy_instance(inst);
-        let saved = (
-            self.frozen_ty.clone(),
-            self.frozen_stack.clone(),
-            self.frozen_row.clone(),
-            self.frozen_effect.clone(),
-        );
-        for arg in wanted {
-            self.freeze_ty(*arg);
-        }
-        let mark = self.trail.len();
-        let recording = self.recording;
-        self.recording = true;
-        let mut ok = true;
-        for (got, need) in args.iter().zip(wanted) {
-            if self.unify_ty(*got, *need).is_err() {
-                ok = false;
-                break;
-            }
-        }
-        self.undo(mark);
-        self.recording = recording;
-        self.frozen_ty = saved.0;
-        self.frozen_stack = saved.1;
-        self.frozen_row = saved.2;
-        self.frozen_effect = saved.3;
-        ok
-    }
-
-    /// An assumption's superclasses cover `wanted`. One path becomes a chain of
-    /// field projections. Two paths, or two assumptions, are incoherent.
-    fn entail(
-        &mut self,
-        wanted: &SemConstraint,
-        span: Span,
-    ) -> Result<Option<Dict>, Diagnostic> {
-        let assumptions = self.assumptions.clone();
-        let mut found = None;
-        for (index, assumption) in assumptions.iter().enumerate() {
-            let paths = self.entail_paths(
-                &assumption.class_name,
-                &assumption.args,
-                wanted,
-                &HashSet::new(),
-            )?;
-            if paths.is_empty() {
-                continue;
-            }
-            if paths.len() > 1 || found.is_some() {
-                return Err(self.error(span, Error::IncoherentInstance));
-            }
-            let mut dict = Dict::Assumption(index);
-            for field in &paths[0] {
-                dict = Dict::Super {
-                    base: Box::new(dict),
-                    field: field.clone(),
-                };
-            }
-            found = Some(dict);
-        }
-        Ok(found)
-    }
-
-    fn entail_paths(
-        &mut self,
-        class_name: &str,
-        args: &[TyId],
-        wanted: &SemConstraint,
-        seen: &HashSet<String>,
-    ) -> Result<Vec<Vec<String>>, Diagnostic> {
-        if seen.contains(class_name) {
-            return Ok(Vec::new());
-        }
-        let Some(class) = self.classes.get(class_name).cloned() else {
-            return Ok(Vec::new());
-        };
-        let supers = self.substitute_constraints(&class.params, args, &class.supers);
-        let mut next_seen = seen.clone();
-        next_seen.insert(class_name.to_string());
-        let mut paths = Vec::new();
-        for sup in &supers {
-            if self.constraints_match(sup, wanted) {
-                paths.push(vec![sup.class_name.clone()]);
-            }
-            for mut path in self.entail_paths(&sup.class_name, &sup.args, wanted, &next_seen)? {
-                path.insert(0, sup.class_name.clone());
-                paths.push(path);
-            }
-        }
-        Ok(paths)
-    }
-
-    /// True when both constraints are the same class and the arguments already agree.
-    /// Links made by the comparison are dropped: entailment does not instantiate.
-    fn constraints_match(&mut self, have: &SemConstraint, need: &SemConstraint) -> bool {
-        if have.class_name != need.class_name || have.args.len() != need.args.len() {
-            return false;
-        }
-        let saved = self.frozen_ty.clone();
-        for arg in have.args.iter().chain(&need.args) {
-            self.freeze_ty(*arg);
-        }
-        let mark = self.trail.len();
-        let recording = self.recording;
-        self.recording = true;
-        let mut ok = true;
-        for (have_arg, need_arg) in have.args.iter().zip(&need.args) {
-            if self.unify_ty(*have_arg, *need_arg).is_err() {
-                ok = false;
-                break;
-            }
-        }
-        self.undo(mark);
-        self.recording = recording;
-        self.frozen_ty = saved;
-        ok
-    }
-
     fn trial<T>(
         &mut self,
         body: impl FnOnce(&mut Self) -> Result<T, Error>,
@@ -5802,26 +4447,6 @@ impl Checker {
         }
     }
 
-    fn show_constraint(&self, constraint: &SemConstraint) -> String {
-        let mut out = constraint.class_name.clone();
-        for arg in &constraint.args {
-            out.push(' ');
-            out.push_str(&self.show_ty(*arg));
-        }
-        out
-    }
-
-    fn show_constraints(&self, constraints: &[SemConstraint]) -> String {
-        if constraints.is_empty() {
-            return "no constraint".to_string();
-        }
-        constraints
-            .iter()
-            .map(|constraint| self.show_constraint(constraint))
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
     fn prefix_len(&self, mut current: StackId) -> usize {
         let mut count = 0;
         loop {
@@ -5833,13 +4458,6 @@ impl Checker {
                 _ => return count,
             }
         }
-    }
-
-    fn is_class_method(&self, name: &str) -> bool {
-        let name = self.canonical(name);
-        self.classes
-            .values()
-            .any(|class| class.methods.iter().any(|method| method.name == name))
     }
 
     fn error(&self, span: Span, error: Error) -> Diagnostic {
@@ -6112,196 +4730,6 @@ fn hidden_local(module: &Module, name: &str) -> Option<String> {
     }
 }
 
-fn type_blocks_eq(ty: &Type) -> bool {
-    match ty {
-        Type::Var(_) => false,
-        Type::Ctor(name) => name == "Ref",
-        Type::App(head, args) => type_blocks_eq(head) || args.iter().any(type_blocks_eq),
-        Type::Fun(_) => true,
-        Type::Record(row) => {
-            row.fields.iter().any(|(_, ty)| type_blocks_eq(ty))
-                || row.tail_ty().is_some_and(type_blocks_eq)
-        }
-    }
-}
-
-fn derived_is_public(module: &Module, data: &crate::ast::Data) -> bool {
-    let Some(list) = module.exports.list() else {
-        return false;
-    };
-    list.has(&data.name) || data.ctors.iter().any(|ctor| list.has(&ctor.name))
-}
-
-fn eq_vars(data: &crate::ast::Data) -> Vec<String> {
-    let mut found = Vec::new();
-    for ctor in &data.ctors {
-        for field in &ctor.fields {
-            collect_eq_vars(&field.ty, &mut found);
-        }
-    }
-    data.params
-        .iter()
-        .filter(|param| found.iter().any(|have| have == *param))
-        .cloned()
-        .collect()
-}
-
-fn collect_eq_vars(ty: &Type, found: &mut Vec<String>) {
-    match ty {
-        Type::Var(name) => {
-            if !found.iter().any(|have| have == name) {
-                found.push(name.clone());
-            }
-        }
-        Type::Ctor(_) => {}
-        Type::App(head, args) => {
-            collect_eq_vars(head, found);
-            for arg in args {
-                collect_eq_vars(arg, found);
-            }
-        }
-        Type::Fun(effect) => {
-            for ty in effect.input.items.iter().chain(&effect.output.items) {
-                collect_eq_vars(ty, found);
-            }
-        }
-        Type::Record(row) => {
-            for (_, ty) in &row.fields {
-                collect_eq_vars(ty, found);
-            }
-            if let Some(ty) = row.tail_ty() {
-                collect_eq_vars(ty, found);
-            }
-        }
-    }
-}
-
-fn eq_source(data: &crate::ast::Data) -> String {
-    let word = format!("eq{}", data.name);
-    let head = if data.params.is_empty() {
-        data.name.clone()
-    } else {
-        format!("({} {})", data.name, data.params.join(" "))
-    };
-    let effect = format!("{head} {head} -- Bool");
-    let constrained = eq_vars(data);
-    let scheme = if constrained.is_empty() {
-        format!("( {effect} )")
-    } else {
-        let vars = constrained.join(" ");
-        let classes = constrained
-            .iter()
-            .map(|var| format!("Comparable {var}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("( {vars}. {classes} => {effect} )")
-    };
-    let mut body = String::new();
-    for ctor in &data.ctors {
-        let left = ctor_pattern(&ctor.name, ctor.fields.len(), "l");
-        let right = ctor_pattern(&ctor.name, ctor.fields.len(), "r");
-        body.push_str(&format!("  {left} {right} ->\n"));
-        if ctor.fields.is_empty() {
-            body.push_str("    true\n");
-            continue;
-        }
-        body.push_str("    l0 r0 eq\n");
-        for index in 1..ctor.fields.len() {
-            body.push_str(&format!("    l{index} r{index} [ eq ] cons cons\n"));
-            body.push_str("    [ false ]\n");
-            body.push_str("    if\n");
-        }
-    }
-    if data.ctors.len() > 1 {
-        body.push_str("  _ _ ->\n    false\n");
-    }
-    format!(": {word} {scheme}\n{body}\n# Comparable {head}\n  eq = {word}\n")
-}
-
-fn ctor_pattern(name: &str, fields: usize, side: &str) -> String {
-    if fields == 0 {
-        return format!("({name})");
-    }
-    let names = (0..fields)
-        .map(|index| format!("{side}{index}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("({name} {names})")
-}
-
-fn shift_span(span: Span, base: u32) -> Span {
-    Span {
-        start: span.start.saturating_add(base),
-        end: span.end.saturating_add(base),
-    }
-}
-
-fn shift_def(def: &mut crate::ast::Def, base: u32) {
-    def.span = shift_span(def.span, base);
-    def.name_span = shift_span(def.name_span, base);
-    for clause in &mut def.clauses {
-        clause.span = shift_span(clause.span, base);
-        for pattern in &mut clause.patterns {
-            shift_pattern(pattern, base);
-        }
-        for term in &mut clause.body {
-            shift_term(term, base);
-        }
-    }
-    for term in &mut def.body {
-        shift_term(term, base);
-    }
-}
-
-fn shift_instance(instance: &mut Instance, base: u32) {
-    instance.span = shift_span(instance.span, base);
-    for binding in &mut instance.methods {
-        binding.name_span = shift_span(binding.name_span, base);
-    }
-}
-
-fn shift_pattern(pattern: &mut crate::ast::Pattern, base: u32) {
-    match pattern {
-        crate::ast::Pattern::Bind(span, _) => *span = shift_span(*span, base),
-        crate::ast::Pattern::Ctor(_, fields) | crate::ast::Pattern::Array(fields) => {
-            for field in fields {
-                shift_pattern(field, base);
-            }
-        }
-        crate::ast::Pattern::Record(fields) => {
-            for (_, field) in fields {
-                shift_pattern(field, base);
-            }
-        }
-        crate::ast::Pattern::Wild | crate::ast::Pattern::Lit(_) | crate::ast::Pattern::Unpack(_) => {
-        }
-    }
-}
-
-fn shift_term(term: &mut Term, base: u32) {
-    term.span = shift_span(term.span, base);
-    match &mut term.node {
-        TermNode::Quote(terms) | TermNode::Array(terms) => {
-            for term in terms {
-                shift_term(term, base);
-            }
-        }
-        TermNode::Record(fields) => {
-            for (_, term) in fields {
-                shift_term(term, base);
-            }
-        }
-        TermNode::Word(_)
-        | TermNode::Lit(_)
-        | TermNode::Field(_)
-        | TermNode::FieldSet(_)
-        | TermNode::FieldInsert(_)
-        | TermNode::PlaceSet(_)
-        | TermNode::PlaceBind(_)
-        | TermNode::Bind(_) => {}
-    }
-}
-
 fn place_def(place: &Place) -> Def {
     Def {
         span: place.span,
@@ -6329,7 +4757,11 @@ fn place_def(place: &Place) -> Def {
     }
 }
 
-fn unready_mention(terms: &[Term], unready: &HashSet<String>) -> Option<(Span, String)> {
+fn unready_mention(
+    terms: &[Term],
+    unready: &HashSet<String>,
+    graph: &HashMap<String, BTreeSet<String>>,
+) -> Option<(Span, String)> {
     for term in terms {
         match &term.node {
             TermNode::Word(name) | TermNode::PlaceSet(name) | TermNode::PlaceBind(name)
@@ -6337,14 +4769,23 @@ fn unready_mention(terms: &[Term], unready: &HashSet<String>) -> Option<(Span, S
             {
                 return Some((term.span, name.clone()));
             }
+            TermNode::Word(name) => {
+                if let Some(places) = graph.get(name) {
+                    if let Some(place) = places.iter().find(|place| unready.contains(*place)) {
+                        return Some((term.span, place.clone()));
+                    }
+                }
+            }
             TermNode::Quote(inner) | TermNode::Array(inner) => {
-                if let Some(found) = unready_mention(inner, unready) {
+                if let Some(found) = unready_mention(inner, unready, graph) {
                     return Some(found);
                 }
             }
             TermNode::Record(fields) => {
                 for (_, value) in fields {
-                    if let Some(found) = unready_mention(std::slice::from_ref(value), unready) {
+                    if let Some(found) =
+                        unready_mention(std::slice::from_ref(value), unready, graph)
+                    {
                         return Some(found);
                     }
                 }
@@ -6353,6 +4794,87 @@ fn unready_mention(terms: &[Term], unready: &HashSet<String>) -> Option<(Span, S
         }
     }
     None
+}
+
+/// Places a word can reach through its body and the words it calls.
+fn place_graph(module: &Module) -> HashMap<String, BTreeSet<String>> {
+    let place_names: HashSet<String> = module
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Place(place) => Some(place.name.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut direct: HashMap<String, (BTreeSet<String>, BTreeSet<String>)> = HashMap::new();
+    for item in &module.items {
+        let Item::Def(def) = item else {
+            continue;
+        };
+        let mut places = BTreeSet::new();
+        let mut calls = BTreeSet::new();
+        collect_place_uses(&def.body, &place_names, &mut places, &mut calls);
+        for clause in &def.clauses {
+            collect_place_uses(&clause.body, &place_names, &mut places, &mut calls);
+        }
+        direct.insert(def.name.clone(), (places, calls));
+    }
+    let mut graph = HashMap::new();
+    for name in direct.keys() {
+        let mut seen = HashSet::new();
+        let mut found = BTreeSet::new();
+        walk_places(name, &direct, &mut seen, &mut found);
+        graph.insert(name.clone(), found);
+    }
+    graph
+}
+
+fn walk_places(
+    name: &str,
+    direct: &HashMap<String, (BTreeSet<String>, BTreeSet<String>)>,
+    seen: &mut HashSet<String>,
+    found: &mut BTreeSet<String>,
+) {
+    if !seen.insert(name.to_string()) {
+        return;
+    }
+    let Some((places, calls)) = direct.get(name) else {
+        return;
+    };
+    found.extend(places.iter().cloned());
+    let calls: Vec<String> = calls.iter().cloned().collect();
+    for call in calls {
+        walk_places(&call, direct, seen, found);
+    }
+}
+
+fn collect_place_uses(
+    terms: &[Term],
+    place_names: &HashSet<String>,
+    places: &mut BTreeSet<String>,
+    calls: &mut BTreeSet<String>,
+) {
+    for term in terms {
+        match &term.node {
+            TermNode::Word(name) | TermNode::PlaceSet(name) | TermNode::PlaceBind(name)
+                if place_names.contains(name) =>
+            {
+                places.insert(name.clone());
+            }
+            TermNode::Word(name) => {
+                calls.insert(name.clone());
+            }
+            TermNode::Quote(inner) | TermNode::Array(inner) => {
+                collect_place_uses(inner, place_names, places, calls);
+            }
+            TermNode::Record(fields) => {
+                for (_, value) in fields {
+                    collect_place_uses(std::slice::from_ref(value), place_names, places, calls);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn known_at<'a>(known: &'a [KnownModule], origin: &str) -> Option<&'a KnownModule> {
@@ -6910,6 +5432,45 @@ mod tests {
     }
 
     #[test]
+    fn a_subclass_instance_follows_its_imported_superclass() {
+        let comparable = parse(
+            "@ Comparable, eq\n\n& Comparable a\n  eq ( a a -- Bool )\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let ints = parse(
+            "@\n~ \"Ply/Comparable\" Comparable\n\n: eqInt ( Int Int -- Bool )\n  drop drop true\n\n# Comparable Int\n  eq = eqInt\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let hashable = parse(
+            "@ Hashable, hash\n~ \"Ply/Comparable\" Comparable\n~ \"Ply/Int\"\n\n& Comparable a => Hashable a\n  hash ( a -- Int )\n\n: hashInt ( Int -- Int )\n  dup drop\n\n# Hashable Int\n  hash = hashInt\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let consumer = parse(
+            "~ \"Ply/Hashable\" hash\n\n: use ( Int -- Int )\n  hash\n",
+            ParseMode::Source,
+        )
+        .unwrap();
+        let comparable_known = super::KnownModule::new("Ply/Comparable.ply".to_string(), comparable);
+        let mut ints_known = super::KnownModule::new("Ply/Int.ply".to_string(), ints);
+        ints_known.deps = vec!["Ply/Comparable.ply".to_string()];
+        let mut hashable_known = super::KnownModule::new("Ply/Hashable.ply".to_string(), hashable.clone());
+        hashable_known.deps = vec!["Ply/Comparable.ply".to_string(), "Ply/Int.ply".to_string()];
+        let known = vec![hashable_known, comparable_known, ints_known];
+        super::check_with_imports(
+            &consumer,
+            &[super::ResolvedImport {
+                provider: &hashable,
+                import: &consumer.imports[0],
+                known: &known,
+            }],
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn a_superclass_module_is_installed_before_the_subclass() {
         let mappable = parse(
             "@ Mappable\n\n& Mappable f\n  map ( a b. (f a) (a -- b) -- (f b) )\n",
@@ -7400,6 +5961,212 @@ mod tests {
 ",
             "no instance for Comparable Cell",
         );
+        err(
+            "\
+& Comparable a
+  eq ( a a -- Bool )
+
+; foreign Cell a
+
+; Box = Box (Cell Int)
+
+: same ( Box Box -- Bool )
+  eq
+",
+            "no instance for Comparable Box",
+        );
+    }
+
+    #[test]
+    fn showable_and_sortable_and_hashable_are_derived() {
+        ok(
+            "\
+& Showable a
+  show ( a -- Str )
+
+: showInt ( Int -- Str )
+  drop \"n\"
+
+# Showable Int
+  show = showInt
+
+; Person = Person name : Int, age : Int
+
+: shown ( Person -- Str )
+  show
+",
+        );
+        ok(
+            "\
+& Showable a
+  show ( a -- Str )
+
+: showInt ( Int -- Str )
+  drop \"n\"
+
+# Showable Int
+  show = showInt
+
+; Answer = No | Yes Int
+
+: shown ( Answer -- Str )
+  show
+",
+        );
+        ok(
+            "\
+& Showable a
+  show ( a -- Str )
+
+; Wrap = Wrap Quiet
+; Quiet = Quiet
+
+: shown ( Wrap -- Str )
+  show
+",
+        );
+        ok(
+            "\
+& Showable a
+  show ( a -- Str )
+
+: showInt ( Int -- Str )
+  drop \"n\"
+
+# Showable Int
+  show = showInt
+
+; Person = Person Int
+
+: showPerson ( Person -- Str )
+  drop \"hand\"
+
+# Showable Person
+  show = showPerson
+
+: shown ( Person -- Str )
+  show
+",
+        );
+        err(
+            "\
+& Showable a
+  show ( a -- Str )
+
+: showInt ( Int -- Str )
+  drop \"n\"
+
+# Showable Int
+  show = showInt
+
+; Person = Person Int
+
+: bad ( Str Str -- Str )
+  ply_show_cat
+",
+            "undefined word ply_show_cat",
+        );
+        err(
+            "\
+& Showable a
+  show ( a -- Str )
+
+; Task = Task ( Int -- Int )
+
+: same ( Task -- Str )
+  show
+",
+            "no instance for Showable Task",
+        );
+        err(
+            "\
+& Showable a
+  show ( a -- Str )
+
+; foreign Ref a
+
+; Cell = Cell (Ref Int)
+
+: same ( Cell -- Str )
+  show
+",
+            "no instance for Showable Cell",
+        );
+        ok(
+            "\
+; Ordering = LT | EQ | GT
+
+& Comparable a
+  eq ( a a -- Bool )
+
+& Comparable a => Sortable a
+  compare ( a a -- Ordering )
+
+: eqInt ( Int Int -- Bool )
+  drop drop true
+
+: compareInt ( Int Int -- Ordering )
+  drop drop EQ
+
+# Comparable Int
+  eq = eqInt
+
+# Sortable Int
+  compare = compareInt
+
+; Answer = No | Yes Int
+
+: ordered ( Answer Answer -- Ordering )
+  compare
+",
+        );
+        err(
+            "\
+& Comparable a
+  eq ( a a -- Bool )
+
+& Comparable a => Sortable a
+  compare ( a a -- Int )
+
+: eqInt ( Int Int -- Bool )
+  drop drop true
+
+# Comparable Int
+  eq = eqInt
+
+; Person = Person name : Int, age : Int
+
+: bad ( Person Person -- Int )
+  compare
+",
+            "no instance for Sortable Person",
+        );
+        ok(
+            "\
+& Comparable a
+  eq ( a a -- Bool )
+
+& Comparable a => Hashable a
+  hash ( a -- Int )
+
+: eqInt ( Int Int -- Bool )
+  drop drop true
+
+: hashInt ( Int -- Int )
+  dup drop
+
+# Comparable Int
+  eq = eqInt
+
+# Hashable Int
+  hash = hashInt
+
+; Person = Person name : Int, age : Int
+
+: hashed ( Person -- Int )
+  hash
+",
+        );
     }
 
     #[test]
@@ -7699,13 +6466,44 @@ mod tests {
     fn a_deep_constructor_is_covered() {
         let mut ty = "Int".to_string();
         let mut pat = "n".to_string();
-        for _ in 0..20 {
+        for _ in 0..17 {
             ty = format!("(Box {ty})");
             pat = format!("(Mk {pat})");
         }
         ok(&format!(
             "; Box a = Mk a\n\n: unwrap ( {ty} -- Int )\n  {pat} -> n\n"
         ));
+        let mut deep_ty = "Int".to_string();
+        let mut deep_pat = "n".to_string();
+        for _ in 0..18 {
+            deep_ty = format!("(Box {deep_ty})");
+            deep_pat = format!("(Mk {deep_pat})");
+        }
+        err(
+            &format!("; Box a = Mk a\n\n: unwrap ( {deep_ty} -- Int )\n  {deep_pat} -> n\n"),
+            "redundant pattern",
+        );
+        ok("\
+; Rec = More Rec | Stop
+
+: kind ( Rec -- Int )
+  Stop -> 0n
+  (More _) -> 0n
+");
+        let mut chain = String::from("Stop -> 0n\n");
+        let mut nested = "Stop".to_string();
+        for _ in 0..16 {
+            nested = format!("(More {nested})");
+            chain.push_str(&format!("  {nested} -> 0n\n"));
+        }
+        let mut missing = "More".to_string();
+        for _ in 1..17 {
+            missing = format!("More {missing}");
+        }
+        err(
+            &format!("; Rec = More Rec | Stop\n\n: kind ( Rec -- Int )\n  {chain}"),
+            &format!("non-exhaustive match: {missing}"),
+        );
     }
 
     #[test]
@@ -7903,6 +6701,36 @@ mod tests {
 ",
             "duplicate definition Eq",
         );
+        ok(
+            "\
+& Mappable f
+  map ( (f a) (a -- b) -- (f b) )
+
+& Mappable f => Left f
+
+& Mappable f => Right f
+
+& Left f, Right f => Both f
+
+; Box a = Mk a
+
+: mapBox ( (Box a) (a -- b) -- (Box b) )
+  (Mk x) f ->
+    x f call Mk
+
+# Mappable Box
+  map = mapBox
+
+# Left Box
+
+# Right Box
+
+# Both Box
+
+: use ( Both f => (f Int) (Int -- Bool) -- (f Bool) )
+  map
+",
+        );
         err(
             "& Eq a\n  eq ( a a -- Bool )\n\n& Eq a => Ord a\n  compare ( a a -- Bool )\n\n& Eq a => Show a\n  show ( a -- Str )\n\n: bad ( Ord a, Show a => a a -- Bool )\n  eq\n",
             "incoherent instance",
@@ -7938,6 +6766,28 @@ mod tests {
   20 [ 3 [ base ] =>scale ] =>base
 ");
         err("= base Num\n  base\n", "place base is not ready");
+        err(
+            "= early Num\n  read\n\n: read ( -- Num )\n  early\n",
+            "place early is not ready",
+        );
+        err(
+            ": read ( -- Num )\n  later\n\n= early Num\n  read\n\n= later Num\n  1\n",
+            "place later is not ready",
+        );
+        err(
+            ": mid ( -- Num )\n  read\n\n: read ( -- Num )\n  early\n\n= early Num\n  mid\n",
+            "place early is not ready",
+        );
+        ok("\
+= base Num
+  1
+
+: read ( -- Num )
+  base
+
+= early Num
+  read
+");
         err("= base Num\n  [ base ] call\n", "place base is not ready");
         err("= base Num\n  1 =base\n", "place base is not ready");
         err(

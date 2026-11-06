@@ -345,7 +345,7 @@ Fix: write the class name. Several classes on one instance are separated by comm
 
 An instance method binding needed the method's name before `=`.
 
-Fix: write `eq = eqNum` under the instance head.
+Fix: write `equal = equalNum` under the instance head.
 
 ## PL0041
 
@@ -353,7 +353,7 @@ Fix: write `eq = eqNum` under the instance head.
 
 The right-hand side of an instance binding is the name of a word.
 
-Fix: write that name: `eq = eqNum`.
+Fix: write that name: `equal = equalNum`.
 
 ## PL0042
 
@@ -723,9 +723,9 @@ This code is not produced. A word bound in `#` stays in its file when it is abse
 
 `incoherent instance`
 
-Two instances match the same head, a new instance overlaps one already in scope, or two superclass paths reach the same constraint. A synonym is expanded before this check, so two spellings of one type still overlap.
+Two instances match the same head, a new instance overlaps one already in scope, or two constraints in one signature each supply the wanted class. Several superclass paths from one constraint are one dictionary, and the checker uses the shortest path. A synonym is expanded before this check, so two spellings of one type still overlap.
 
-Fix: delete one of the instances, or change a head so the two do not overlap.
+Fix: delete one of the instances, or write the wanted class once in the signature.
 
 ## PL0088
 
@@ -1103,7 +1103,7 @@ Fix: put the names on their own `~` line, or list them instead of `: Alias`.
 
 `place NAME is not ready`
 
-The program under `= NAME` reads `NAME`, writes `=NAME`, binds `=>NAME`, or mentions a place that is declared later. That program runs once, when the module loads, and this place's frame does not exist until the program has finished. A later place is still empty.
+The program under `= NAME` reads `NAME`, writes `=NAME`, binds `=>NAME`, or mentions a place that is declared later. A word that program calls counts the same way when the word reads or writes the place. That program runs once, when the module loads, and this place's frame does not exist until the program has finished. A later place is still empty.
 
 Fix: fill the place from a value that does not use it. A word below the declaration may read and write it.
 

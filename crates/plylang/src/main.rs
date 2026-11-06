@@ -152,8 +152,7 @@ fn build_command(mut args: impl Iterator<Item = String>) -> ExitCode {
     }
     let dir = dir.unwrap_or_else(|| ".".to_string());
     let dir = Path::new(&dir);
-    // `--exports` stays accepted. Both forms align `exports`.
-    let _exports = exports;
+    let _ = exports;
     finish_package(build_exports(dir))
 }
 

@@ -53,13 +53,13 @@ One parameter, written `(Array a)`. A literal lists the elements between `<` and
 
 An element is a literal, a quotation, or a nested array.
 
-JavaScript emits an array.
+JavaScript emits an array. `dup` shares that reference. A word that writes returns a new array, and the array it received stays as it was. A shared cell that a program passes is `Cell`, from the prelude.
 
 A pattern has one fixed length. `<>` matches only the empty array. One length does not cover every `Array`. A later `_` covers the other lengths.
 
 ## StrMap
 
-One parameter, written `(StrMap a)`. The key is `Str`. The program chooses the key when it runs, and the type does not name that key. A value of this type comes from an imported word.
+One parameter, written `(StrMap a)`. The key is `Str`. The program chooses the key when it runs, and the type does not name that key. A value of this type comes from an imported word. `dup` shares the reference. A word that writes returns a new map, and the map it received stays as it was.
 
 ## Foreign data
 
@@ -72,3 +72,5 @@ A parameter indexes the value. `(Hub Num)` and `(Hub Str)` are different types. 
 ```
 
 A name binds the value. There is no constructor to match. Writing `=`, `==`, or a constructor is [PL0116](Errors.md#pl0116).
+
+A data type derives Comparable, Showable, Sortable, and Hashable when that class is in scope, the module does not already give the type an instance, no field is a function, a Ref, or a Cell, and Sortable can see LT, EQ, and GT.
