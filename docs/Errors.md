@@ -407,9 +407,7 @@ Fix: write `Nothing | Just a`. `{` and `}` are an unexpected character (`PL0001`
 
 `expected element`
 
-A record field needed an element, and the next token is not one.
-
-Fix: put a literal, a quotation, a nested array, or a nested record in the field. An array between `<` and `>` is a program. A token that is not a term there is PL0031.
+Source does not produce this message. An array is a program between `<` and `>`. `{` and `}` are an unexpected character (`PL0001`).
 
 ## PL0049
 
