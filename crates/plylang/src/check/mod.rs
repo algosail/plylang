@@ -2470,13 +2470,55 @@ impl Checker {
         }
     }
 
-    fn check_array(&mut self, elements: &[Term]) -> Result<TyId, Diagnostic> {
+    /// Cons cells bottom to top. The id is the cell itself, so a later word
+    /// that only pushes keeps the earlier ids.
+    fn stack_spine(&self, stack: StackId) -> Vec<(StackId, TyId)> {
+        let mut items = Vec::new();
+        let mut current = self.find_stack(stack);
+        loop {
+            match self.stacks[current.0 as usize] {
+                StackNode::Cons(rest, ty) => {
+                    items.push((current, ty));
+                    current = self.find_stack(rest);
+                }
+                _ => break,
+            }
+        }
+        items.reverse();
+        items
+    }
+
+    fn shared_spine(before: &[(StackId, TyId)], after: &[(StackId, TyId)]) -> usize {
+        let mut shared = 0;
+        while shared < before.len()
+            && shared < after.len()
+            && before[shared].0 == after[shared].0
+        {
+            shared += 1;
+        }
+        shared
+    }
+
+    /// The body runs on an empty stack. It does not see the stack outside.
+    /// The values it leaves are the elements, and they are one type.
+    fn check_array(&mut self, terms: &[Term]) -> Result<TyId, Diagnostic> {
+        let mut stack = self.stack_empty();
+        let mut slots: Vec<(TyId, Span)> = Vec::new();
+        for term in terms {
+            let before = self.stack_spine(stack);
+            stack = self.check_term(term, stack)?;
+            let after = self.stack_spine(stack);
+            let shared = Self::shared_spine(&before, &after);
+            slots.truncate(shared);
+            for (_, ty) in after.into_iter().skip(shared) {
+                slots.push((ty, term.span));
+            }
+        }
         let mut elem_ty = None;
-        for element in elements {
-            let ty = self.check_element(element)?;
+        for (ty, span) in slots {
             if let Some(prev) = elem_ty {
                 self.unify_ty(ty, prev)
-                    .map_err(|message| self.error(element.span, message))?;
+                    .map_err(|message| self.error(span, message))?;
             } else {
                 elem_ty = Some(ty);
             }
@@ -6734,7 +6776,24 @@ mod tests {
     fn checks_arrays_strings_and_maps() {
         ok(": none ( -- (Array Int) )\n  <>");
         ok(": nums ( -- (Array Num) )\n  < 1 2 3 >");
+        ok(": paired ( -- (Array Num) )\n  < 1 dup >");
+        ok(": kept ( -- (Array Num) )\n  < 1 9 drop 2 >");
+        ok(": one ( -- Num )\n  1\n\n: two ( -- Num )\n  2\n\n: both ( -- (Array Num) )\n  < one two >");
+        ok(": pair ( -- Num Num )\n  1 2\n\n: fromPair ( -- (Array Num) )\n  < pair >");
+        ok(": ran ( -- (Array Num) )\n  < [ 1 ] call [ 2 ] call >");
+        ok("; Maybe a = Nothing | Just a\n\n: opts ( -- (Array (Maybe Num)) )\n  < 1 Just Nothing >");
+        ok(": grid ( -- (Array (Array Num)) )\n  < < 1 dup > < 3 > >");
+        ok(": repeat ( Num -- (Array Num) )\n  n -> < n dup >");
+        ok(": hidden ( Num -- (Array Num) )\n  drop < 1 >");
         ok(": quotes ( -- (Array (Num -- Num)) )\n  < [ dup drop ] [ dup drop ] >");
+        err(
+            ": bad ( Num -- (Array Num) )\n  < dup >",
+            "stack underflow",
+        );
+        err(
+            ": pair ( -- Num Str )\n  1 \"a\"\n\n: bad ( -- (Array Num) )\n  < pair >",
+            "type mismatch: expected Num, found Str",
+        );
         ok("; Person = Person name : Str, age : Num\n\n: person ( -- Person )\n  \"Ada\" 36 Person");
         ok("; Person = Person name : Str, age : Num\n\n: older ( Person -- Person )\n  37 >>age");
         ok(": text ( -- Str )\n  \"ab\"");

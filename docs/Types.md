@@ -44,14 +44,17 @@ That word is also the constructor. `Unit ->` checks the value and leaves it. `(U
 
 ## Array
 
-One parameter, written `(Array a)`. A literal lists the elements between `<` and `>`. The left element is index 0. `<>` is empty.
+One parameter, written `(Array a)`. A literal is a program between `<` and `>`. It starts from an empty stack and does not see the stack outside. The values it leaves are the elements. The left element, index 0, is the bottom value. `<>` is empty. Every element has one type.
 
 ```ply
 : nums ( -- (Array Num) )
   < 1 2 3 >
+
+: paired ( -- (Array Num) )
+  < 1 dup >
 ```
 
-An element is a literal, a quotation, or a nested array.
+`< 1 2 add >` is one number, once `add` is in scope. A quotation is a value. `< [ dup drop ] [ dup drop ] >` is an array of quotations, and the quotations do not run until something calls them. A pattern does not run the program.
 
 JavaScript emits an array. `dup` shares that reference. A word that writes returns a new array, and the array it received stays as it was. A shared cell that a program passes is `Cell`, from the prelude.
 

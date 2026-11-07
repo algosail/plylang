@@ -538,25 +538,55 @@ impl Checker {
         Ok(output)
     }
 
+    /// The body runs on its own empty stack. Locals of the caller stay visible.
+    /// The values left on that stack are the elements, bottom first.
     fn lower_array(
         &mut self,
-        elements: &[Term],
+        terms: &[Term],
         stack: StackId,
         frame: &mut Frame,
     ) -> Result<StackId, Diagnostic> {
+        let mut inner = Frame {
+            stack: Vec::new(),
+            params: Vec::new(),
+            flexible: false,
+            lets: Vec::new(),
+            env: frame.env.clone(),
+        };
+        let mut acc = self.stack_empty();
+        let mut spans = Vec::new();
+        for term in terms {
+            let before = self.stack_spine(acc);
+            acc = self.lower_term(term, acc, &mut inner)?;
+            let after = self.stack_spine(acc);
+            let shared = Self::shared_spine(&before, &after);
+            spans.truncate(shared);
+            spans.extend(std::iter::repeat(term.span).take(after.len() - shared));
+        }
+        let tys = self.cons_tys(acc);
+        if tys.len() != inner.stack.len() || tys.len() != spans.len() {
+            panic!(
+                "array left {} values, {} operands, {} spans",
+                tys.len(),
+                inner.stack.len(),
+                spans.len()
+            );
+        }
         let mut elem_ty = None;
-        let mut items = Vec::new();
-        for element in elements {
-            let (ty, local) = self.lower_element(element, frame)?;
+        for (ty, span) in tys.into_iter().zip(spans) {
             if let Some(prev) = elem_ty {
                 self.unify_ty(ty, prev)
-                    .map_err(|message| self.error(element.span, message))?;
+                    .map_err(|message| self.error(span, message))?;
             } else {
                 elem_ty = Some(ty);
             }
-            items.push(local);
         }
         let elem_ty = elem_ty.unwrap_or_else(|| self.ty_var());
+        let mut items = Vec::with_capacity(inner.stack.len());
+        for operand in std::mem::take(&mut inner.stack) {
+            items.push(inner.force(self, operand)?);
+        }
+        frame.lets.extend(inner.lets);
         let id = self.fresh_local();
         frame.lets.push(Let {
             binds: vec![id],
@@ -3630,6 +3660,36 @@ export function say(v2) {
 : foreign amap ( (Array a) (a -- b) -- (Array b) )
 : foreign push ( (Array a) a -- (Array a) )
 
+: one ( -- Num )
+  1
+
+: two ( -- Num )
+  2
+
+: paired ( -- (Array Num) )
+  < 1 dup >
+
+: summed ( -- (Array Num) )
+  < 1 2 nadd >
+
+: bothWords ( -- (Array Num) )
+  < one two >
+
+: twin ( -- Num Num )
+  4 5
+
+: fromTwin ( -- (Array Num) )
+  < twin >
+
+: kept ( -- (Array Num) )
+  < 1 9 drop 2 >
+
+: repeat ( Num -- (Array Num) )
+  n -> < n dup >
+
+: hidden ( Num -- (Array Num) )
+  drop < 4 dup >
+
 : shift ( -- (Array Num) )
   < 1 2 3 > [ 1 nadd ] amap
 
@@ -3665,6 +3725,13 @@ if (ints[0] !== 2n || ints[2] !== 4n) throw new Error("exact");
 const base = nums();
 const grown = grow(base);
 if (base.length !== 2 || grown.length !== 3 || grown[2] !== 3) throw new Error("push");
+if (paired().join(",") !== "1,1") throw new Error("paired");
+if (summed().join(",") !== "3") throw new Error("summed");
+if (bothWords().join(",") !== "1,2") throw new Error("words");
+if (fromTwin().join(",") !== "4,5") throw new Error("fromTwin");
+if (kept().join(",") !== "1,2") throw new Error("kept");
+if (repeat(5).join(",") !== "5,5") throw new Error("repeat");
+if (hidden(9).join(",") !== "4,4") throw new Error("hidden");
 const p = person();
 const q = older(p);
 if (p.age !== 36 || q.age !== 37 || q.name !== "Ada" || p.tag !== "Person") throw new Error("product");

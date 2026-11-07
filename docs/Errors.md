@@ -407,9 +407,9 @@ Fix: write `Nothing | Just a`. `{` and `}` are an unexpected character (`PL0001`
 
 `expected element`
 
-An array slot was required and the next token is not an element.
+A record field needed an element, and the next token is not one.
 
-Fix: put a literal, a quotation, or a nested array in the slot. Arrays are `< 1 2 3 >`.
+Fix: put a literal, a quotation, a nested array, or a nested record in the field. An array between `<` and `>` is a program. A token that is not a term there is PL0031.
 
 ## PL0049
 

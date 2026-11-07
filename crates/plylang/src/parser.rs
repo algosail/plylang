@@ -1561,9 +1561,9 @@ impl Parser {
     }
 
     /// `<` is already consumed and `group_depth` includes it.
-    /// `< 1 2 3 >` is an array. `<>` is empty. A word inside is `expected element`.
+    /// The body is a program. `<>` is empty. It starts from nothing when it runs.
     fn parse_array(&mut self, start: Span) -> Result<Term, Diagnostic> {
-        let mut elements = Vec::new();
+        let mut terms = Vec::new();
         loop {
             self.skip_newlines();
             if self.eat(&TokenKind::RAngle) {
@@ -1572,10 +1572,13 @@ impl Parser {
             if self.is_eof() {
                 return Err(self.error_at(start, Error::UnterminatedArray));
             }
-            elements.push(self.parse_element()?);
+            if !self.starts_term() {
+                return Err(self.error(Error::ExpectedTerm));
+            }
+            terms.push(self.parse_term()?);
         }
         self.group_depth -= 1;
-        Ok(self.term(start.merge(self.last_span), TermNode::Array(elements)))
+        Ok(self.term(start.merge(self.last_span), TermNode::Array(terms)))
     }
 
     /// `{` is already consumed and `group_depth` includes it.
@@ -2073,11 +2076,14 @@ mod tests {
         let empty = ok(": none ( -- (Array Int) )\n  <>\n");
         assert!(empty.contains("<>"), "{empty}");
         assert_eq!(ok(&empty), empty);
+        let program = ok(": one ( -- Num )\n  1\n\n: nums ( -- (Array Num) )\n  < 1 one dup >\n");
+        assert!(program.contains("< 1 one dup >"), "{program}");
+        assert_eq!(ok(&program), program);
         let read = ok("; Person = Person name : Str, age : Num\n: get ( Person -- Str )\n  name>>\n");
         assert!(read.contains("name>>"), "{read}");
         assert_eq!(
-            err(": bad ( -- (Array Num) )\n  < 1 dup >\n", ParseMode::Source),
-            "expected element"
+            err(": bad ( -- (Array Num) )\n  < 1 | 2 >\n", ParseMode::Source),
+            "expected term"
         );
         assert_eq!(
             err(": bad ( -- Str )\n  { name: \"Ada\" }\n", ParseMode::Source),

@@ -355,7 +355,8 @@ pub enum TermNode {
     PlaceBind(String),
     /// `+name`. The record is below the new value. The label must be absent.
     FieldInsert(String),
-    /// `< 1 2 3 >`. Elements are constants, not a stack program.
+    /// `< 1 2 3 >`. The terms are a program on an empty stack. What it leaves
+    /// are the elements, bottom first.
     Array(Vec<Term>),
     /// `{ name: "Ada", age: 36 }`. Each value is one constant. `{}` is empty.
     Record(Vec<(String, Term)>),

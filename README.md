@@ -185,7 +185,9 @@ In JavaScript a constructor with no fields is `{ tag: "Nothing" }`. One field is
 
 ## Array
 
-`< 1 2 3 >` is an array of three numbers, of type `(Array Num)`. Index 0 is the left element. The empty array is `<>`. A word is not written inside the angle brackets: an element is a literal, a quotation, or a nested array.
+`< 1 2 3 >` is an array of three numbers, of type `(Array Num)`. Index 0 is the left element. The empty array is `<>`.
+
+The text between the angles is a program. It starts from an empty stack and does not see the stack outside. The values it leaves are the elements, and they must be one type. `< 1 dup >` is two numbers. `< 1 2 add >` is one number, once `add` is in scope. A quotation is a value, so `< [ 1 add ] [ 2 add ] >` is an array of quotations. `[ call ] map` runs those. A pattern does not run this program. `<>` matches only the empty array.
 
 A word that walks an array is imported. In the example the quotation sits on top. The name comes from one module, and the instance for the array comes from another.
 
