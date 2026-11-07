@@ -3379,6 +3379,8 @@ mod tests {
         assert!(app.contains("function main("), "{app}");
         assert!(!app.contains("export function main("), "{app}");
         assert!(app.contains("if (plyIsEntry) main();"), "{app}");
+        assert!(!app.contains("node:fs"), "{app}");
+        assert!(!app.contains("node:url"), "{app}");
         assert!(!app.lines().any(|line| line.trim() == "main();"), "{app}");
         let tool = fs::read_to_string(temp.0.join("dist/Tool.js")).unwrap();
         assert!(tool.contains("export function main("), "{tool}");

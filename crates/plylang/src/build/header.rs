@@ -606,9 +606,12 @@ pub(super) fn accepts_entry(def: &Def) -> bool {
         )
 }
 
+/// `main` runs when Node started this file. `import.meta.main` is that check.
+/// The guard imports nothing: a module with `main` is still imported by other
+/// files, and those importers must not gain `node:fs`.
 pub(super) fn with_entry_guard(js: String) -> String {
-    let (import_line, call) = entry_pieces(&js);
-    let mut js = format!("{import_line}{js}");
+    let call = entry_guard(&js);
+    let mut js = js;
     if !js.ends_with('\n') {
         js.push('\n');
     }
@@ -616,19 +619,11 @@ pub(super) fn with_entry_guard(js: String) -> String {
     js
 }
 
-fn entry_pieces(js: &str) -> (String, String) {
+fn entry_guard(js: &str) -> String {
     let mut used = Vec::new();
-    let realpath = take_js_name(js, &mut used, "plyRealpath");
-    let path_to_file = take_js_name(js, &mut used, "plyPathToFileURL");
     let flag = take_js_name(js, &mut used, "plyIsEntry");
     let call = js_ident(ENTRY_WORD);
-    let import_line = format!(
-        "import {{ realpathSync as {realpath} }} from \"node:fs\";\nimport {{ pathToFileURL as {path_to_file} }} from \"node:url\";\n"
-    );
-    let guard = format!(
-        "let {flag} = import.meta.main === true;\nif (import.meta.main === undefined && process.argv[1]) {{\n  try {{\n    {flag} = import.meta.url === {path_to_file}({realpath}(process.argv[1])).href;\n  }} catch {{\n    {flag} = false;\n  }}\n}}\nif ({flag}) {call}();\n"
-    );
-    (import_line, guard)
+    format!("let {flag} = import.meta.main === true;\nif ({flag}) {call}();\n")
 }
 
 fn take_js_name(js: &str, used: &mut Vec<String>, base: &str) -> String {

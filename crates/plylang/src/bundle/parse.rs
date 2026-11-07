@@ -59,6 +59,35 @@ fn cut_guard_suffix(js: &str) -> Option<String> {
 }
 
 fn guard_matches(text: &str) -> bool {
+    guard_matches_short(text) || guard_matches_long(text)
+}
+
+fn guard_matches_short(text: &str) -> bool {
+    let Some(text) = text.strip_prefix("let ") else {
+        return false;
+    };
+    let Some((flag, text)) = take_ident(text) else {
+        return false;
+    };
+    let Some(text) = text.strip_prefix(" = import.meta.main === true;\nif (") else {
+        return false;
+    };
+    let Some(text) = text.strip_prefix(flag) else {
+        return false;
+    };
+    let Some(text) = text.strip_prefix(") ") else {
+        return false;
+    };
+    let Some((_, text)) = take_ident(text) else {
+        return false;
+    };
+    let Some(text) = text.strip_prefix("();") else {
+        return false;
+    };
+    text.trim().is_empty()
+}
+
+fn guard_matches_long(text: &str) -> bool {
     let Some(text) = text.strip_prefix("let ") else {
         return false;
     };
@@ -1110,6 +1139,15 @@ if (plyIsEntry) main();
 ";
         let body = strip_entry_guard(js).unwrap();
         assert_eq!(body, "export function ping() { return 1; }\n");
+        let short = "\
+export function ping() { return 1; }
+let plyIsEntry = import.meta.main === true;
+if (plyIsEntry) main();
+";
+        assert_eq!(
+            strip_entry_guard(short).unwrap(),
+            "export function ping() { return 1; }\n"
+        );
         let bare = "export function ping() { return 1; }\n";
         assert_eq!(strip_entry_guard(bare).unwrap(), bare);
         let leftover = "import { realpathSync as plyRealpath } from \"node:fs\";\nexport function ping() {}\n";
