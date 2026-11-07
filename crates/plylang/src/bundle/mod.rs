@@ -1,7 +1,9 @@
 //! Page script for `plylang compile`.
-//! `compile` still writes the Node modules. This writes `script.js` beside
-//! them: each reached binding is a function, dependencies first, then `main()`.
-//! A binding stays when `main` can call it. The rest of a file is left out.
+//! `compile` still writes the Node modules. This writes one classic script:
+//! each reached binding is a function, dependencies first. A `main` of scheme
+//! `( -- Unit )` is the root and the script calls it. A module with no `main`
+//! and at least one place roots the script at those places and does not call
+//! `main`. A binding stays when that root can call it. The rest of a file is left out.
 //! The graph is the JavaScript this compiler wrote and the foreign files it
 //! imports. A `node:` import, a package without `ply`, or a file outside that
 //! package stops the compile.
@@ -22,31 +24,40 @@ mod parse;
 
 use parse::{is_ident, parse_module, split_items, strip_entry_guard};
 
-pub(crate) fn write_page(out: &Path, entry: &str) -> Result<(), BuildError> {
-    let entry_path = out.join(entry).with_extension("js");
+pub(crate) fn write_page(
+    modules_dir: &Path,
+    entry: &str,
+    script: &Path,
+    call_main: bool,
+) -> Result<(), BuildError> {
+    let entry_path = modules_dir.join(entry).with_extension("js");
     if !entry_path.is_file() {
         return Err(fail(&entry_path, "", "missing script"));
     }
-    let text = link(&entry_path)?;
-    let script = out.join("script.js");
-    fs::write(&script, text).map_err(|error| os_error(&script, error))
+    let text = link(&entry_path, call_main)?;
+    if let Some(parent) = script.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|error| os_error(parent, error))?;
+        }
+    }
+    fs::write(script, text).map_err(|error| os_error(script, error))
 }
 
-fn link(entry: &Path) -> Result<String, BuildError> {
+fn link(entry: &Path, call_main: bool) -> Result<String, BuildError> {
     let mut graph = Graph {
         mods: Vec::new(),
         index: HashMap::new(),
     };
     let mut stack = Vec::new();
     let entry_id = graph.load(entry.to_path_buf(), &mut stack)?;
-    if !publishes_main(&graph.mods[entry_id]) {
+    if call_main && !publishes_main(&graph.mods[entry_id]) {
         graph.mods[entry_id]
             .exports
             .push(("main".to_string(), "main".to_string()));
     }
     prepare_items(&mut graph);
-    let reach = reachable(&graph, entry_id)?;
-    Ok(emit(&graph, &reach, entry_id))
+    let reach = reachable(&graph, entry_id, call_main)?;
+    Ok(emit(&graph, &reach, entry_id, call_main))
 }
 
 struct Graph {
@@ -194,38 +205,55 @@ struct Reach {
     imports: Vec<HashSet<String>>,
 }
 
-fn reachable(graph: &Graph, entry: usize) -> Result<Reach, BuildError> {
+fn reachable(graph: &Graph, entry: usize, call_main: bool) -> Result<Reach, BuildError> {
     let mut reach = Reach {
         bindings: vec![HashSet::new(); graph.mods.len()],
         imports: vec![HashSet::new(); graph.mods.len()],
     };
     let mut loose = vec![false; graph.mods.len()];
-    let slot = find_slot(graph, entry, "main").ok_or_else(|| {
-        fail(
-            &graph.mods[entry].path,
-            &graph.mods[entry].source,
-            "main",
-        )
-    })?;
-    let mut work = vec![slot];
+    let mut work = Vec::new();
+    if call_main {
+        let slot = find_slot(graph, entry, "main").ok_or_else(|| {
+            fail(
+                &graph.mods[entry].path,
+                &graph.mods[entry].source,
+                "main",
+            )
+        })?;
+        work.push(slot);
+    } else {
+        follow_loose(graph, entry, &mut reach, &mut loose, &mut work)?;
+    }
     while let Some(slot) = work.pop() {
         if !reach.bindings[slot.module].insert(slot.name.clone()) {
             continue;
         }
         let uses = binding_uses(graph, slot.module, &slot.name);
         follow_uses(graph, slot.module, &uses, &mut reach, &mut work)?;
-        if !loose[slot.module] {
-            loose[slot.module] = true;
-            let mut extra = Vec::new();
-            for item in &graph.mods[slot.module].items {
-                if let Item::Loose { uses, .. } = item {
-                    extra.extend(uses.iter().cloned());
-                }
-            }
-            follow_uses(graph, slot.module, &extra, &mut reach, &mut work)?;
-        }
+        follow_loose(graph, slot.module, &mut reach, &mut loose, &mut work)?;
     }
     Ok(reach)
+}
+
+/// Loose statements of a reached module run once. A place-rooted page starts here.
+fn follow_loose(
+    graph: &Graph,
+    module: usize,
+    reach: &mut Reach,
+    loose: &mut [bool],
+    work: &mut Vec<Slot>,
+) -> Result<(), BuildError> {
+    if loose[module] {
+        return Ok(());
+    }
+    loose[module] = true;
+    let mut extra = Vec::new();
+    for item in &graph.mods[module].items {
+        if let Item::Loose { uses, .. } = item {
+            extra.extend(uses.iter().cloned());
+        }
+    }
+    follow_uses(graph, module, &extra, reach, work)
 }
 
 fn binding_uses(graph: &Graph, module: usize, name: &str) -> Vec<String> {
@@ -334,11 +362,18 @@ fn reexport_public(module: &Mod, public: &str) -> Option<(usize, String)> {
     None
 }
 
-fn live_order(graph: &Graph, reach: &Reach, entry: usize) -> Vec<usize> {
+fn live_order(graph: &Graph, reach: &Reach, entry: usize, force_entry: bool) -> Vec<usize> {
     let mut seen = vec![false; graph.mods.len()];
     let mut order = Vec::new();
-    fn walk(graph: &Graph, reach: &Reach, id: usize, seen: &mut [bool], order: &mut Vec<usize>) {
-        if seen[id] || reach.bindings[id].is_empty() {
+    fn walk(
+        graph: &Graph,
+        reach: &Reach,
+        id: usize,
+        force: bool,
+        seen: &mut [bool],
+        order: &mut Vec<usize>,
+    ) {
+        if seen[id] || (reach.bindings[id].is_empty() && !force) {
             return;
         }
         seen[id] = true;
@@ -357,17 +392,17 @@ fn live_order(graph: &Graph, reach: &Reach, entry: usize) -> Vec<usize> {
                 continue;
             }
             if let Some(slot) = find_slot(graph, dep, &remote) {
-                walk(graph, reach, slot.module, seen, order);
+                walk(graph, reach, slot.module, false, seen, order);
             }
         }
         order.push(id);
     }
-    walk(graph, reach, entry, &mut seen, &mut order);
+    walk(graph, reach, entry, force_entry, &mut seen, &mut order);
     order
 }
 
-fn emit(graph: &Graph, reach: &Reach, entry: usize) -> String {
-    let order = live_order(graph, reach, entry);
+fn emit(graph: &Graph, reach: &Reach, entry: usize, call_main: bool) -> String {
+    let order = live_order(graph, reach, entry, !call_main);
     let prefix = fresh_prefix(graph);
     let mut vars = HashMap::new();
     for (index, id) in order.iter().enumerate() {
@@ -439,8 +474,10 @@ fn emit(graph: &Graph, reach: &Reach, entry: usize) -> String {
         }
         out.push_str("  };\n})();\n");
     }
-    let entry_var = &vars[&entry];
-    out.push_str(&format!("{entry_var}.main();\n"));
+    if call_main {
+        let entry_var = &vars[&entry];
+        out.push_str(&format!("{entry_var}.main();\n"));
+    }
     hide_script_close(&out)
 }
 

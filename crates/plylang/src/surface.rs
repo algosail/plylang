@@ -148,11 +148,14 @@ pub(crate) fn public_names(module: &Module) -> Vec<String> {
     }
 }
 
+/// Instances written in this module and in the modules it imports.
+/// A module is entered once. Its instances do not depend on the caller, and
+/// dropping it from the path afterwards walked every import path again.
 pub(crate) fn instances(module: &Module, from: &Path, load: &mut Load<'_>) -> Vec<Instance> {
     let mut found = Vec::new();
     let mut seen = HashSet::new();
-    let mut stack = HashSet::new();
-    collect_instances(module, from, load, &mut found, &mut seen, &mut stack);
+    let mut entered = HashSet::new();
+    collect_instances(module, from, load, &mut found, &mut seen, &mut entered);
     found
 }
 
@@ -162,10 +165,9 @@ fn collect_instances(
     load: &mut Load<'_>,
     found: &mut Vec<Instance>,
     seen: &mut HashSet<String>,
-    stack: &mut HashSet<String>,
+    entered: &mut HashSet<String>,
 ) {
-    let key = from.to_string_lossy().to_string();
-    if !stack.insert(key.clone()) {
+    if !entered.insert(from.to_string_lossy().to_string()) {
         return;
     }
     for instance in own_instances(module) {
@@ -178,9 +180,8 @@ fn collect_instances(
         let Some((file, provider)) = load(from, &import.path) else {
             continue;
         };
-        collect_instances(&provider, &file, load, found, seen, stack);
+        collect_instances(&provider, &file, load, found, seen, entered);
     }
-    stack.remove(&key);
 }
 
 /// The file that publishes `name`. An unlisted definition is not a result.
@@ -280,5 +281,53 @@ fn def_published(module: &Module, def: &Def) -> bool {
     match &module.exports {
         Exports::List(list) => list.has(&def.name),
         Exports::Closed => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::path::Path;
+
+    use crate::parser::parse;
+    use crate::paths::ParseMode;
+
+    use super::instances;
+
+    fn module(source: &str) -> crate::ast::Module {
+        parse(source, ParseMode::Source).unwrap_or_else(|error| panic!("{}", error.message))
+    }
+
+    #[test]
+    fn a_shared_import_is_entered_once() {
+        let loads = Cell::new(0u32);
+        let mut load = |from: &Path, path: &str| {
+            loads.set(loads.get() + 1);
+            let source = match (from.to_str().unwrap(), path) {
+                ("Door.ply", "Left" | "Right") => "~ \"Mid\"\n",
+                ("Left.ply" | "Right.ply", "Mid") => "~ \"A\"\n~ \"B\"\n",
+                ("Mid.ply", "A" | "B") => "~ \"Shared\"\n",
+                ("A.ply" | "B.ply", "Shared") => "# Show Num\n  show = showNum\n",
+                _ => return None,
+            };
+            let file = match path {
+                "Left" => "Left.ply",
+                "Right" => "Right.ply",
+                "Mid" => "Mid.ply",
+                "A" => "A.ply",
+                "B" => "B.ply",
+                "Shared" => "Shared.ply",
+                _ => return None,
+            };
+            Some((std::path::PathBuf::from(file), module(source)))
+        };
+        let found = instances(
+            &module("~ \"Left\"\n~ \"Right\"\n"),
+            Path::new("Door.ply"),
+            &mut load,
+        );
+        assert_eq!(loads.get(), 8);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].class_names, ["Show"]);
     }
 }

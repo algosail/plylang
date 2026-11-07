@@ -1061,11 +1061,11 @@ This code is not produced. The `@` list may stand anywhere in the file. A second
 
 ## PL0129
 
-`plylang compile needs ply.entry and a main of scheme ( -- Unit )`
+`plylang compile needs ply.entry and a main of scheme ( -- Unit ) or a place`
 
-`plylang compile` writes one page script. `ply.entry` names that module, and the module defines `main` with scheme `( -- Unit )`.
+`plylang compile` writes one page script. `ply.entry` names that module, or `--entry` names it for one run. A `main` of scheme `( -- Unit )` is the root, and the script calls it. A module with no `main` and at least one place roots the script at those places and does not call `main`. A module with neither is this error.
 
-Fix: set `ply.entry` to that module and give it a `main` of scheme `( -- Unit )`. A `main` with another scheme is PL0115.
+Fix: set `ply.entry` to that module, or pass `--entry`. Give the module a `main` of scheme `( -- Unit )`, or a place. A `main` with another scheme is PL0115.
 
 ## PL0130
 
@@ -1130,3 +1130,11 @@ Fix: keep the value with `Page`, spill every field with `(Page ..)`, or name the
 `(Some (Option Num) value)` asks whether the field is `(Option Num)`. A number, an integer, a string, a boolean, or an array of those is a check the runtime can make. `TYPE` is not one of those, and the field is not already `TYPE`.
 
 Fix: test a shape the runtime can see, `(Some (Array Num) items)`. When the field is already `TYPE`, the name is that value and there is nothing to test.
+
+## PL0138
+
+`path "PATH" must stay inside the package`
+
+`--out` and `--foreign` are paths relative to the package root. `PATH` is absolute, empty, or contains `..`.
+
+Fix: pass a relative path that stays inside the package. `plylang compile --out` is the script file. `plylang build --out` is the module directory.

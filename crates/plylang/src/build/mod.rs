@@ -5,8 +5,11 @@
 //! `ply.entry` names one, and a key this tool does not own stays.
 //! `--exports` calls the same alignment. `plylang check` writes nothing.
 //! A word named `main` with scheme `( -- Unit )` is called at the bottom of its
-//! module when Node starts that file. `plylang compile` writes `script.js`
-//! beside those modules: the same graph, with only the bindings `main` reaches.
+//! module when Node starts that file. `plylang compile` writes one page script
+//! from the same graph. `main` is the root when the entry module defines it.
+//! A module with no `main` and at least one place roots the script at those
+//! places. `--entry`, `--out`, and `--foreign` override that one run and are
+//! not written back.
 //!
 //! A local import is a module path such as `Data/Either`. A package import is
 //! `@scope/name/...` or an unscoped `name/...`. `plylang check --js` prints the
@@ -153,39 +156,69 @@ enum Spec {
 }
 
 
+/// One `plylang build`. Absent fields keep the package values. Nothing is written back
+/// except `exports` when [`BuildFlags::exports`] is set.
+#[derive(Debug, Clone, Default)]
+pub struct BuildFlags {
+    /// Module path, the same shape as `ply.entry`. The `exports` key `.` uses it.
+    pub entry: Option<String>,
+    /// Module directory, relative to the package root. Overrides `ply.out`.
+    pub out: Option<String>,
+    /// Hand-written JavaScript directory, relative to the package root.
+    pub foreign: Option<String>,
+    /// Replace `package.json` `exports` with one entry per built module.
+    pub exports: bool,
+}
+
+/// One `plylang compile`. Absent fields keep the package values. Nothing is written
+/// back into `package.json`.
+#[derive(Debug, Clone, Default)]
+pub struct CompileFlags {
+    /// Module path, the same shape as `ply.entry`.
+    pub entry: Option<String>,
+    /// The page script file, relative to the package root.
+    /// Absent writes `<ply.out>/script.js`.
+    pub out: Option<String>,
+    /// Hand-written JavaScript directory, relative to the package root.
+    pub foreign: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionOver {
+    entry: Option<String>,
+    out_rel: Option<String>,
+    foreign: Option<String>,
+}
+
 pub fn build(dir: &Path) -> Result<(), BuildError> {
-    run_build(dir, false)
+    build_with(dir, &BuildFlags::default())
 }
 
 /// Build the package, then replace `package.json` `exports` with one entry per built module.
 pub fn build_exports(dir: &Path) -> Result<(), BuildError> {
-    run_build(dir, true)
+    let mut flags = BuildFlags::default();
+    flags.exports = true;
+    build_with(dir, &flags)
 }
 
-/// Write the Node modules, then `script.js`: one classic page script.
-/// Does not rewrite `package.json` `exports`.
-pub fn compile(dir: &Path) -> Result<(), BuildError> {
-    let mut session = open_session(dir)?;
-    session.prepare_page()?;
-    session.check_all()?;
-    session.write_outputs()?;
-    let entry = session
-        .package
-        .entry
-        .clone()
-        .expect("compile package has ply.entry");
-    crate::bundle::write_page(&session.package.out, &entry)?;
-    Ok(())
-}
-
-fn run_build(dir: &Path, write_exports: bool) -> Result<(), BuildError> {
-    let mut session = open_session(dir)?;
+/// Build the package. [`BuildFlags`] override `ply.entry`, `ply.out`, and `ply.foreign`
+/// for this run and are not written back. `exports` is rewritten only when
+/// [`BuildFlags::exports`] is set.
+pub fn build_with(dir: &Path, flags: &BuildFlags) -> Result<(), BuildError> {
+    let mut session = open_session_over(
+        dir,
+        &SessionOver {
+            entry: flags.entry.clone(),
+            out_rel: flags.out.clone(),
+            foreign: flags.foreign.clone(),
+        },
+    )?;
     let entries = export_entries(
         &session.units,
         &session.package.out_rel,
         session.package.entry.as_deref(),
     );
-    if write_exports {
+    if flags.exports {
         session.package.exports = entries
             .iter()
             .map(|entry| (entry.key.clone(), entry.ply.clone()))
@@ -193,10 +226,41 @@ fn run_build(dir: &Path, write_exports: bool) -> Result<(), BuildError> {
     }
     session.check_all()?;
     session.write_outputs()?;
-    if write_exports {
+    if flags.exports {
         write_package_exports(&session.package.root, &entries)?;
     }
     Ok(())
+}
+
+/// Write the Node modules, then one classic page script.
+/// Does not rewrite `package.json`.
+pub fn compile(dir: &Path) -> Result<(), BuildError> {
+    compile_with(dir, &CompileFlags::default())
+}
+
+/// [`compile`] with [`CompileFlags`]. `--out` is the script file, not the module directory.
+pub fn compile_with(dir: &Path, flags: &CompileFlags) -> Result<(), BuildError> {
+    let mut session = open_session_over(
+        dir,
+        &SessionOver {
+            entry: flags.entry.clone(),
+            out_rel: None,
+            foreign: flags.foreign.clone(),
+        },
+    )?;
+    let script = match &flags.out {
+        Some(raw) => session.package.root.join(kept_rel(&session.package, raw)?),
+        None => session.package.out.join("script.js"),
+    };
+    let call_main = session.prepare_page()?;
+    session.check_all()?;
+    session.write_outputs()?;
+    let entry = session
+        .package
+        .entry
+        .clone()
+        .expect("compile package has ply.entry");
+    crate::bundle::write_page(&session.package.out, &entry, &script, call_main)
 }
 
 /// Package check: the same work as [`build`], without writing `.js` or `.d.ply`.
@@ -215,8 +279,13 @@ pub fn javascript_file(path: &Path) -> Result<String, BuildError> {
 }
 
 fn open_session(dir: &Path) -> Result<Session, BuildError> {
+    open_session_over(dir, &SessionOver::default())
+}
+
+fn open_session_over(dir: &Path, over: &SessionOver) -> Result<Session, BuildError> {
     let root = fs::canonicalize(dir).map_err(|error| os_error(dir, error))?;
-    let package = read_package(&root)?;
+    let mut package = read_package(&root)?;
+    apply_over(&mut package, over)?;
     let mut session = Session {
         package,
         units: Vec::new(),
@@ -656,21 +725,27 @@ impl Session {
         Ok(())
     }
 
-    /// `plylang compile` writes one page. `ply.entry` names its module, and
-    /// that module defines `main` with scheme `( -- Unit )`. A `main` of
-    /// another scheme stays PL0115 from the module check.
-    fn prepare_page(&self) -> Result<(), BuildError> {
+    /// `plylang compile` writes one page. `ply.entry` names its module.
+    /// A `main` of scheme `( -- Unit )` is the root and the script calls it.
+    /// A module with no `main` and at least one place roots the script at
+    /// those places and does not call `main`. Anything else is PL0129.
+    /// A `main` of another scheme stays PL0115 from the module check.
+    /// The bool is whether the script calls `main`.
+    fn prepare_page(&self) -> Result<bool, BuildError> {
         let Some(name) = &self.package.entry else {
             let path = self.package.root.join("package.json");
             let text = fs::read_to_string(&path).unwrap_or_default();
             return Err(pkg_error(&path, &text, Error::BrowserEntry));
         };
         let id = *self.by_module.get(name).expect("entry module");
-        match entry_def(&self.units[id].module) {
-            Some(def) if accepts_entry(def) => Ok(()),
-            Some(_) => Ok(()),
-            None => Err(self.fail(id, Span::new(0, 0), Error::BrowserEntry)),
+        let module = &self.units[id].module;
+        if entry_def(module).is_some() {
+            return Ok(true);
         }
+        if has_place(module) {
+            return Ok(false);
+        }
+        Err(self.fail(id, Span::new(0, 0), Error::BrowserEntry))
     }
 
     fn write_outputs(&self) -> Result<(), BuildError> {
@@ -2134,6 +2209,93 @@ fn clean_rel(path: &str) -> String {
     path.trim_matches('/').to_string()
 }
 
+fn has_place(module: &Module) -> bool {
+    module
+        .items
+        .iter()
+        .any(|item| matches!(item, Item::Place(_)))
+}
+
+/// Apply one run's `--entry`, `--out`, and `--foreign`. The package file stays as it was.
+fn apply_over(package: &mut Package, over: &SessionOver) -> Result<(), BuildError> {
+    if over.entry.is_none() && over.out_rel.is_none() && over.foreign.is_none() {
+        return Ok(());
+    }
+    let manifest = package.root.join("package.json");
+    let text = fs::read_to_string(&manifest).unwrap_or_default();
+    if let Some(entry) = &over.entry {
+        let name = clean_rel(entry);
+        module_name_from_path(&format!("{name}.ply"))
+            .map_err(|error| pkg_error(&manifest, &text, error))?;
+        package.entry = Some(name);
+    }
+    if let Some(out) = &over.out_rel {
+        let rel = kept_text(&manifest, &text, out)?;
+        package.out_rel = rel.clone();
+        package.out = package.root.join(rel);
+    }
+    if let Some(foreign) = &over.foreign {
+        let rel = kept_text(&manifest, &text, foreign)?;
+        package.foreign = Some(package.root.join(rel));
+    }
+    if over.out_rel.is_some() || over.foreign.is_some() {
+        check_directories(package, &manifest, &text)?;
+    }
+    Ok(())
+}
+
+fn kept_rel(package: &Package, raw: &str) -> Result<String, BuildError> {
+    let manifest = package.root.join("package.json");
+    let text = fs::read_to_string(&manifest).unwrap_or_default();
+    kept_text(&manifest, &text, raw)
+}
+
+fn kept_text(manifest: &Path, text: &str, raw: &str) -> Result<String, BuildError> {
+    if path_leaves(raw) {
+        return Err(pkg_error(
+            manifest,
+            text,
+            Error::PathLeavesPackage(raw.to_string()),
+        ));
+    }
+    Ok(clean_rel(raw))
+}
+
+fn path_leaves(raw: &str) -> bool {
+    if raw.is_empty() || Path::new(raw).is_absolute() {
+        return true;
+    }
+    let cleaned = clean_rel(raw);
+    cleaned.is_empty() || cleaned.split('/').any(|part| part.is_empty() || part == "..")
+}
+
+fn check_directories(package: &Package, manifest: &Path, text: &str) -> Result<(), BuildError> {
+    let source_rel = package_rel(&package.root, &package.source);
+    let out_rel = &package.out_rel;
+    if source_rel.is_empty() || out_rel.is_empty() || source_rel == *out_rel || nests(&source_rel, out_rel)
+    {
+        return Err(pkg_error(manifest, text, Error::OutSameAsSource));
+    }
+    if let Some(foreign) = &package.foreign {
+        let rel = package_rel(&package.root, foreign);
+        if rel.is_empty()
+            || rel == source_rel
+            || rel == *out_rel
+            || nests(&rel, &source_rel)
+            || nests(&rel, out_rel)
+        {
+            return Err(pkg_error(manifest, text, Error::ForeignSameDirectory));
+        }
+    }
+    Ok(())
+}
+
+fn package_rel(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
+}
+
 fn import_cycle(names: Vec<String>) -> Error {
     Error::ImportCycle(names.join(", "))
 }
@@ -2203,7 +2365,10 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{build, build_exports, check_buffer, check_package, compile, relative_specifier};
+    use super::{
+        build, build_exports, build_with, check_buffer, check_package, compile, compile_with,
+        relative_specifier, BuildFlags, CompileFlags,
+    };
 
     struct Temp(PathBuf);
 
@@ -3916,6 +4081,285 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&app_mark).unwrap(), "ran\n");
         assert!(!boom_mark.exists());
+    }
+
+    #[test]
+    fn compile_flags_choose_the_entry_and_the_script() {
+        let temp = Temp::new("page-flags");
+        let original = "{\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1, \"entry\": \"App\", \"foreign\": \"foreign\" }\n}\n";
+        temp.write("package.json", original);
+        let boom = temp.0.join("boom.txt");
+        let ping = temp.0.join("ping.txt");
+        let boom_lit = serde_json::to_string(&boom.to_string_lossy().into_owned()).unwrap();
+        let ping_lit = serde_json::to_string(&ping.to_string_lossy().into_owned()).unwrap();
+        temp.write(
+            "src/App.ply",
+            "@\n\n: foreign boom ( -- Unit )\n\n: spare ( -- Unit )\n  Unit\n\n: main ( -- Unit )\n  boom\n",
+        );
+        temp.write(
+            "src/Data/Ping.ply",
+            "@\n\n: foreign ping ( -- Unit )\n\n: spare ( -- Unit )\n  Unit\n\n: main ( -- Unit )\n  ping\n",
+        );
+        temp.write(
+            "foreign/App.js",
+            &format!(
+                "export function boom() {{\n  globalThis.process.getBuiltinModule(\"fs\").appendFileSync({boom_lit}, \"boom\\n\");\n}}\n"
+            ),
+        );
+        temp.write(
+            "foreign/Data/Ping.js",
+            &format!(
+                "export function ping() {{\n  globalThis.process.getBuiltinModule(\"fs\").appendFileSync({ping_lit}, \"ping\\n\");\n}}\n"
+            ),
+        );
+        compile_with(
+            &temp.0,
+            &CompileFlags {
+                entry: Some("Data/Ping".to_string()),
+                out: Some("page/Ping.js".to_string()),
+                foreign: None,
+            },
+        )
+        .unwrap_or_else(|error| panic!("{}", error.render()));
+        assert_eq!(fs::read_to_string(temp.0.join("package.json")).unwrap(), original);
+        assert!(!temp.0.join("dist/script.js").exists());
+        assert!(temp.0.join("dist/App.js").is_file());
+        assert!(temp.0.join("dist/Data/Ping.js").is_file());
+        let script = fs::read_to_string(temp.0.join("page/Ping.js")).unwrap();
+        assert!(script.contains("function ping"), "{script}");
+        assert!(!script.contains("function boom"), "{script}");
+        assert!(!script.contains("function spare"), "{script}");
+        assert!(script.trim_end().ends_with(".main();"), "{script}");
+        assert!(!script.contains("\nimport ") && !script.contains("\nexport "), "{script}");
+        let ran = Command::new("node")
+            .arg(temp.0.join("page/Ping.js"))
+            .current_dir(&temp.0)
+            .output()
+            .unwrap();
+        assert!(
+            ran.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        assert_eq!(fs::read_to_string(&ping).unwrap(), "ping\n");
+        assert!(!boom.exists());
+
+        compile(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let page = fs::read_to_string(temp.0.join("dist/script.js")).unwrap();
+        assert!(page.contains("function boom"), "{page}");
+        assert!(!page.contains("function ping"), "{page}");
+        assert_eq!(fs::read_to_string(temp.0.join("package.json")).unwrap(), original);
+
+        let missing = compile_with(
+            &temp.0,
+            &CompileFlags {
+                entry: Some("Missing".to_string()),
+                ..CompileFlags::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(missing.code, "PL0124", "{}", missing.render());
+        let escaped = compile_with(
+            &temp.0,
+            &CompileFlags {
+                out: Some("../page.js".to_string()),
+                ..CompileFlags::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(escaped.code, "PL0138", "{}", escaped.message);
+        let absolute = compile_with(
+            &temp.0,
+            &CompileFlags {
+                out: Some("/tmp/page.js".to_string()),
+                ..CompileFlags::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(absolute.code, "PL0138");
+        let overlap = compile_with(
+            &temp.0,
+            &CompileFlags {
+                foreign: Some("src".to_string()),
+                ..CompileFlags::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(overlap.code, "PL0106", "{}", overlap.message);
+        assert_eq!(fs::read_to_string(temp.0.join("package.json")).unwrap(), original);
+    }
+
+    #[test]
+    fn compile_roots_a_place_when_the_module_has_no_main() {
+        let temp = Temp::new("page-place");
+        let mark = temp.0.join("ran.txt");
+        let lit = serde_json::to_string(&mark.to_string_lossy().into_owned()).unwrap();
+        temp.write(
+            "package.json",
+            "{\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1, \"entry\": \"Isle\", \"foreign\": \"foreign\" }\n}\n",
+        );
+        temp.write(
+            "src/Face.ply",
+            "@ ping\n\n: foreign ping ( -- Unit )\n\n: hidden ( -- Unit )\n  Unit\n",
+        );
+        temp.write(
+            "src/Isle.ply",
+            "@\n~ \"Face\" ping\n\n: foreign boom ( -- Unit )\n\n: spare ( -- Unit )\n  boom\n\n= offered Unit\n  ping\n",
+        );
+        temp.write(
+            "foreign/Face.js",
+            &format!(
+                "import {{ inner }} from \"./Inner.js\"\nexport function ping() {{\n  inner();\n  globalThis.process.getBuiltinModule(\"fs\").appendFileSync({lit}, \"ran\\n\");\n}}\n"
+            ),
+        );
+        temp.write("foreign/Inner.js", "export function inner() {}\n");
+        temp.write(
+            "foreign/Isle.js",
+            "export function boom() {}\n",
+        );
+        compile(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let script = fs::read_to_string(temp.0.join("dist/script.js")).unwrap();
+        assert!(script.contains("function ping"), "{script}");
+        assert!(script.contains("function inner"), "{script}");
+        assert!(script.contains("ply$init$offered"), "{script}");
+        assert!(!script.contains("function hidden"), "{script}");
+        assert!(!script.contains("function spare"), "{script}");
+        assert!(!script.contains("function boom"), "{script}");
+        assert!(!script.contains(".main("), "{script}");
+        assert!(!script.contains("from \"node:"), "{script}");
+        assert!(!script.contains("\nimport ") && !script.contains("\nexport "), "{script}");
+        let ran = Command::new("node")
+            .arg(temp.0.join("dist/script.js"))
+            .current_dir(&temp.0)
+            .output()
+            .unwrap();
+        assert!(
+            ran.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        assert_eq!(fs::read_to_string(&mark).unwrap(), "ran\n");
+
+        temp.write(
+            "src/Isle.ply",
+            "@\n~ \"Face\" ping\n\n: main ( -- Unit )\n  Unit\n\n= offered Unit\n  ping\n",
+        );
+        fs::remove_file(&mark).unwrap();
+        compile(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let both = fs::read_to_string(temp.0.join("dist/script.js")).unwrap();
+        assert!(both.trim_end().ends_with(".main();"), "{both}");
+        assert!(both.contains("ply$init$offered"), "{both}");
+        assert!(both.contains("function ping"), "{both}");
+        let again = Command::new("node")
+            .arg(temp.0.join("dist/script.js"))
+            .current_dir(&temp.0)
+            .output()
+            .unwrap();
+        assert!(
+            again.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&again.stderr)
+        );
+        assert_eq!(fs::read_to_string(&mark).unwrap(), "ran\n");
+    }
+
+    #[test]
+    fn build_flags_override_one_run() {
+        let temp = Temp::new("build-flags");
+        let original = "{\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1, \"entry\": \"App\", \"foreign\": \"foreign\" },\n  \"exports\": {\n    \"./keep\": \"./keep.js\"\n  }\n}\n";
+        temp.write("package.json", original);
+        temp.write(
+            "src/App.ply",
+            "@ add\n\n: foreign add ( Num Num -- Num )\n",
+        );
+        temp.write("src/Data/Num.ply", "@ id\n\n: id ( Num -- Num )\n  dup drop\n");
+        temp.write("foreign/App.js", "export function other() { return 0; }\n");
+        temp.write("host/App.js", "export function add(a, b) { return a + b; }\n");
+        let missing = build(&temp.0).unwrap_err();
+        assert_eq!(missing.code, "PL0108", "{}", missing.message);
+        build_with(
+            &temp.0,
+            &BuildFlags {
+                foreign: Some("host".to_string()),
+                out: Some("built".to_string()),
+                ..BuildFlags::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{}", error.render()));
+        assert_eq!(fs::read_to_string(temp.0.join("package.json")).unwrap(), original);
+        assert!(!temp.0.join("dist").exists());
+        let js = fs::read_to_string(temp.0.join("built/App.js")).unwrap();
+        assert!(js.contains("host/App.js"), "{js}");
+        assert!(!js.contains("foreign/App.js"), "{js}");
+        node(
+            &temp.0,
+            "import { add } from \"./built/App.js\";\nif (add(1, 2) !== 3) throw new Error(String(add(1, 2)));\n",
+        );
+
+        let same = build_with(
+            &temp.0,
+            &BuildFlags {
+                out: Some("src".to_string()),
+                ..BuildFlags::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(same.code, "PL0104", "{}", same.message);
+        let nested = build_with(
+            &temp.0,
+            &BuildFlags {
+                out: Some("foreign".to_string()),
+                ..BuildFlags::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(nested.code, "PL0106", "{}", nested.message);
+        let left = build_with(
+            &temp.0,
+            &BuildFlags {
+                foreign: Some("../host".to_string()),
+                ..BuildFlags::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(left.code, "PL0138", "{}", left.message);
+        assert_eq!(fs::read_to_string(temp.0.join("package.json")).unwrap(), original);
+
+        build_with(
+            &temp.0,
+            &BuildFlags {
+                entry: Some("Data/Num".to_string()),
+                out: Some("built".to_string()),
+                foreign: Some("host".to_string()),
+                exports: true,
+            },
+        )
+        .unwrap_or_else(|error| panic!("{}", error.render()));
+        let written = fs::read_to_string(temp.0.join("package.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(
+            value.get("ply").and_then(|ply| ply.get("entry")).and_then(|item| item.as_str()),
+            Some("App"),
+            "{written}"
+        );
+        assert_eq!(
+            value.get("ply").and_then(|ply| ply.get("out")).and_then(|item| item.as_str()),
+            None,
+            "{written}"
+        );
+        assert_eq!(
+            value.get("ply").and_then(|ply| ply.get("foreign")).and_then(|item| item.as_str()),
+            Some("foreign"),
+            "{written}"
+        );
+        let exports = value.get("exports").unwrap();
+        assert_eq!(exports.get("./keep").and_then(|item| item.as_str()), Some("./keep.js"));
+        assert_eq!(
+            exports.get(".").and_then(|item| item.get("ply")).and_then(|item| item.as_str()),
+            Some("./built/Data/Num.d.ply"),
+            "{written}"
+        );
+        assert!(temp.0.join("built/Data/Num.js").is_file());
     }
 
     #[test]

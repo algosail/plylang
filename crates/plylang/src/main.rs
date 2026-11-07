@@ -6,16 +6,16 @@ use std::process::ExitCode;
 use std::io::IsTerminal;
 
 use plylang::{
-    build_exports, check_package, compile, javascript_file, mode_from_path, parse, test_package,
-    write_docs,
+    build_with, check_package, compile_with, javascript_file, mode_from_path, parse, test_package,
+    write_docs, BuildFlags, CompileFlags,
 };
 
 const USAGE: &[&str] = &[
     "usage: plylang check [dir]",
     "       plylang check --js <file>",
     "       plylang check --parse <file>",
-    "       plylang build [dir] [--exports]",
-    "       plylang compile [dir]",
+    "       plylang build [dir] [--exports] [--entry <module>] [--out <dir>] [--foreign <dir>]",
+    "       plylang compile [dir] [--entry <module>] [--out <file>] [--foreign <dir>]",
     "       plylang test [pattern]",
     "       plylang docs [dir] [--out <file>]",
 ];
@@ -111,49 +111,97 @@ fn test_command(mut args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
-fn compile_command(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let mut dir = None;
-    while let Some(arg) = args.next() {
-        if is_help(&arg) {
-            usage(false);
-            return ExitCode::SUCCESS;
-        }
-        if arg.starts_with('-') || dir.is_some() {
-            usage(true);
-            return ExitCode::from(2);
-        }
-        dir = Some(arg);
-    }
-    let dir = dir.unwrap_or_else(|| ".".to_string());
-    finish_package(compile(Path::new(&dir)))
+fn compile_command(args: impl Iterator<Item = String>) -> ExitCode {
+    let run = match read_run_args(args, false) {
+        Ok(run) => run,
+        Err(code) => return code,
+    };
+    finish_package(compile_with(
+        Path::new(&run.dir),
+        &CompileFlags {
+            entry: run.entry,
+            out: run.out,
+            foreign: run.foreign,
+        },
+    ))
 }
 
-fn build_command(mut args: impl Iterator<Item = String>) -> ExitCode {
+fn build_command(args: impl Iterator<Item = String>) -> ExitCode {
+    let run = match read_run_args(args, true) {
+        Ok(run) => run,
+        Err(code) => return code,
+    };
+    finish_package(build_with(
+        Path::new(&run.dir),
+        &BuildFlags {
+            entry: run.entry,
+            out: run.out,
+            foreign: run.foreign,
+            exports: run.exports,
+        },
+    ))
+}
+
+struct RunArgs {
+    dir: String,
+    entry: Option<String>,
+    out: Option<String>,
+    foreign: Option<String>,
+    exports: bool,
+}
+
+fn read_run_args(
+    mut args: impl Iterator<Item = String>,
+    allow_exports: bool,
+) -> Result<RunArgs, ExitCode> {
     let mut dir = None;
+    let mut entry = None;
+    let mut out = None;
+    let mut foreign = None;
     let mut exports = false;
     while let Some(arg) = args.next() {
         if is_help(&arg) {
             usage(false);
-            return ExitCode::SUCCESS;
+            return Err(ExitCode::SUCCESS);
         }
         if arg == "--exports" {
-            if exports {
+            if !allow_exports || exports {
                 usage(true);
-                return ExitCode::from(2);
+                return Err(ExitCode::from(2));
             }
             exports = true;
             continue;
         }
-        if arg.starts_with('-') || dir.is_some() {
+        let slot = match arg.as_str() {
+            "--entry" => &mut entry,
+            "--out" => &mut out,
+            "--foreign" => &mut foreign,
+            _ => {
+                if arg.starts_with('-') || dir.is_some() {
+                    usage(true);
+                    return Err(ExitCode::from(2));
+                }
+                dir = Some(arg);
+                continue;
+            }
+        };
+        let Some(value) = args.next() else {
             usage(true);
-            return ExitCode::from(2);
+            return Err(ExitCode::from(2));
+        };
+        if slot.is_some() || value.starts_with('-') {
+            usage(true);
+            return Err(ExitCode::from(2));
         }
-        dir = Some(arg);
+        *slot = Some(value);
     }
-    let dir = dir.unwrap_or_else(|| ".".to_string());
-    let dir = Path::new(&dir);
-    let _ = exports;
-    finish_package(build_exports(dir))
+    Ok(RunArgs {
+        dir: dir.unwrap_or_else(|| ".".to_string()),
+        entry,
+        out,
+        foreign,
+        exports,
+    })
 }
 
 fn check_command(mut args: impl Iterator<Item = String>) -> ExitCode {

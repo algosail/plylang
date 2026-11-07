@@ -155,8 +155,10 @@ pub enum Error {
     PackageJsonTarget,
     /// Not produced. The `@` list may stand anywhere. A second `@` is a duplicate definition.
     PublicNotHere,
-    /// `plylang compile` has no `ply.entry`, or the entry module has no `main`.
+    /// `plylang compile` has no `ply.entry`, or the entry module has neither `main` nor a place.
     BrowserEntry,
+    /// `--out` or `--foreign` is absolute, empty, or contains `..`.
+    PathLeavesPackage(String),
     /// The page script cannot inline this import or this JavaScript form.
     BrowserLoad(String),
     /// A public scheme, constructor field, synonym, or class method names a type this module did not list.
@@ -422,7 +424,11 @@ impl Error {
             PublicNotHere => static_text("PL0128", "@ is the module's name list"),
             BrowserEntry => static_text(
                 "PL0129",
-                "plylang compile needs ply.entry and a main of scheme ( -- Unit )",
+                "plylang compile needs ply.entry and a main of scheme ( -- Unit ) or a place",
+            ),
+            PathLeavesPackage(path) => (
+                "PL0138",
+                format!("path \"{path}\" must stay inside the package"),
             ),
             BrowserLoad(spec) => ("PL0130", format!("compile cannot load \"{spec}\"")),
             PrivateInScheme(name) => (
@@ -752,8 +758,13 @@ mod tests {
             ),
             (
                 Error::BrowserEntry,
-                "plylang compile needs ply.entry and a main of scheme ( -- Unit )",
+                "plylang compile needs ply.entry and a main of scheme ( -- Unit ) or a place",
                 "PL0129",
+            ),
+            (
+                Error::PathLeavesPackage("../x".into()),
+                "path \"../x\" must stay inside the package",
+                "PL0138",
             ),
             (
                 Error::BrowserLoad("node:fs".into()),
@@ -796,7 +807,7 @@ mod tests {
                 "PL0137",
             ),
         ];
-        assert_eq!(samples.len(), 137);
+        assert_eq!(samples.len(), 138);
         for (error, message, code) in samples {
             assert_eq!(error.code(), code, "{message}");
             assert_eq!(error.message(), message);

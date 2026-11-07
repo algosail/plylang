@@ -288,9 +288,7 @@ fn parse_import(scan: &mut Scan<'_>) -> Result<SpecNames, String> {
     scan.skip_space();
     let spec = scan.string()?;
     scan.skip_space();
-    if !scan.eat(';') {
-        return Err(spec);
-    }
+    let _ = scan.eat(';');
     Ok(SpecNames { spec, names })
 }
 
@@ -307,9 +305,7 @@ fn parse_export(scan: &mut Scan<'_>) -> Result<ExportKind, String> {
             scan.skip_space();
             let spec = scan.string()?;
             scan.skip_space();
-            if !scan.eat(';') {
-                return Err(spec);
-            }
+            let _ = scan.eat(';');
             return Ok(ExportKind::Reexport(SpecNames { spec, names }));
         }
         scan.skip_space();
@@ -1150,5 +1146,31 @@ const made = { tag: \"Effect\", value: n };
         assert!(made.contains(&"n".to_string()), "{made:?}");
         assert!(!made.contains(&"tag".to_string()), "{made:?}");
         assert!(!made.contains(&"value".to_string()), "{made:?}");
+    }
+
+    #[test]
+    fn import_and_export_from_may_omit_the_semicolon() {
+        let src = "\
+import { mountFaces } from \"@plylang/dom\"
+import { perform } from \"@plylang/prelude/Data/Effect\"
+export { ping } from \"./ping.js\"
+export function begin() {}
+";
+        let parsed = super::parse_module(src).unwrap();
+        assert_eq!(parsed.imports.len(), 2);
+        assert_eq!(parsed.imports[0].spec, "@plylang/dom");
+        assert_eq!(parsed.imports[1].spec, "@plylang/prelude/Data/Effect");
+        assert_eq!(parsed.reexports.len(), 1);
+        assert_eq!(parsed.reexports[0].spec, "./ping.js");
+        assert!(parsed.body.contains("function begin"), "{}", parsed.body);
+        assert!(!parsed.body.contains("import "), "{}", parsed.body);
+
+        let kept = super::parse_module(
+            "import { a } from \"./a.js\";\nexport function a() {}\n",
+        )
+        .unwrap();
+        assert_eq!(kept.imports.len(), 1);
+        assert_eq!(kept.imports[0].spec, "./a.js");
+        assert!(kept.body.contains("function a"), "{}", kept.body);
     }
 }

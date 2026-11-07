@@ -22,9 +22,9 @@ pub const LANGUAGE_VERSION: u32 = 1;
 
 pub use ast::Module;
 pub use build::{
-    build, buffer_notes, buffer_notes_open, build_exports, check_buffer, check_package, compile,
-    javascript_file, stack_sites,
-    BufferNotes, BuildError,
+    build, buffer_notes, buffer_notes_open, build_exports, build_with, check_buffer, check_package,
+    compile, compile_with, javascript_file, stack_sites, BufferNotes, BuildError, BuildFlags,
+    CompileFlags,
 };
 pub use check::{check, javascript, StackAt};
 pub use codes::Error;
