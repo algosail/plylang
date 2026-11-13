@@ -374,9 +374,16 @@ fn execute(root: &Path, out: &Path, compiled: &CompiledTest) -> Result<Vec<Check
     let result = std::env::temp_dir().join(format!(
         "plylang-test-result-{}-{}.json",
         std::process::id(),
-        harness.file_name().and_then(|name| name.to_str()).unwrap_or("run")
+        harness
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("run")
     ));
-    let names: Vec<&str> = compiled.words.iter().map(|word| word.name.as_str()).collect();
+    let names: Vec<&str> = compiled
+        .words
+        .iter()
+        .map(|word| word.name.as_str())
+        .collect();
     let words = serde_json::to_string(&names).map_err(|error| error.to_string())?;
     let output = Command::new("node")
         .arg(&harness)
@@ -475,7 +482,10 @@ fn read_checks(bytes: &[u8]) -> Result<Vec<Check>, String> {
     Ok(rows
         .iter()
         .map(|row| Check {
-            ok: row.get("ok").and_then(|value| value.as_bool()).unwrap_or(false),
+            ok: row
+                .get("ok")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
             name: row
                 .get("name")
                 .and_then(|value| value.as_str())
@@ -689,10 +699,8 @@ Time   12ms
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "plylang-{label}-{}-{nanos}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("plylang-{label}-{}-{nanos}", std::process::id()));
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
         }

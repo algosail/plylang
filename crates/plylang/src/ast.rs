@@ -690,7 +690,13 @@ fn write_ctor_fields(formatter: &mut fmt::Formatter<'_>, fields: &[CtorField]) -
         }
         return Ok(());
     }
-    write_slots(formatter, &fields.iter().map(|field| field.ty.clone()).collect::<Vec<_>>())
+    write_slots(
+        formatter,
+        &fields
+            .iter()
+            .map(|field| field.ty.clone())
+            .collect::<Vec<_>>(),
+    )
 }
 
 pub(crate) fn type_string(ty: &Type) -> String {

@@ -7,8 +7,8 @@ use std::rc::Rc;
 
 use crate::anf::ShapeTest;
 use crate::ast::{Clause, Def, Lit, Pattern};
-use crate::diagnostic::Diagnostic;
 use crate::codes::Error;
+use crate::diagnostic::Diagnostic;
 use crate::span::Span;
 
 use super::{Checker, RowId, StackId, StackNode, TyId, TyNode};
@@ -45,7 +45,10 @@ pub(super) struct CtorShape {
 pub(super) enum SlotPat<'a> {
     Plain(&'a Pattern),
     /// A parenthesized type, then a name, `_`, or `..`.
-    Test { ty: &'a Pattern, bind: &'a Pattern },
+    Test {
+        ty: &'a Pattern,
+        bind: &'a Pattern,
+    },
 }
 
 /// The type the binder has, and the witness to emit. `test` is absent when the
@@ -71,16 +74,26 @@ enum Need {
     Any,
     /// The walk stopped. A wildcard or a binding covers the slot.
     Deep,
-    Bool { yes: bool, no: bool },
-    Open { name: String, excluded: Vec<Lit> },
+    Bool {
+        yes: bool,
+        no: bool,
+    },
+    Open {
+        name: String,
+        excluded: Vec<Lit>,
+    },
     Exact(Lit),
-    Data { ctors: Vec<CtorNeed> },
+    Data {
+        ctors: Vec<CtorNeed>,
+    },
     Array {
         elem: Rc<Need>,
         open: bool,
         apart: Vec<Apart>,
     },
-    Record { fields: Vec<FieldNeed> },
+    Record {
+        fields: Vec<FieldNeed>,
+    },
 }
 
 /// One label of a record that is still in play. Order is alphabetical.
@@ -271,7 +284,13 @@ impl Checker {
                     }
                     FieldMatch::Named(indexes) => {
                         for (pattern, index) in patterns.iter().zip(&indexes) {
-                            self.pattern_effect(pattern, shape.fields[*index], span, binds, pushes)?;
+                            self.pattern_effect(
+                                pattern,
+                                shape.fields[*index],
+                                span,
+                                binds,
+                                pushes,
+                            )?;
                         }
                     }
                 }
@@ -344,30 +363,24 @@ impl Checker {
         let (data_name, args) = match self.tys[ty.0 as usize].clone() {
             TyNode::Ctor(data_name, args) => (data_name, args),
             _ => {
-                return Err(self.error(
-                    span,
-                    Error::ExpectedDataType(self.show_ty(ty)),
-                ));
+                return Err(self.error(span, Error::ExpectedDataType(self.show_ty(ty))));
             }
         };
         let Some(data) = self.datas.get(&data_name).cloned() else {
-            return Err(self.error(
-                span,
-                Error::ExpectedDataType(self.show_ty(ty)),
-            ));
+            return Err(self.error(span, Error::ExpectedDataType(self.show_ty(ty))));
         };
         if args.len() != data.params.len() {
-            return Err(self.error(
-                span,
-                Error::ExpectedDataType(self.show_ty(ty)),
-            ));
+            return Err(self.error(span, Error::ExpectedDataType(self.show_ty(ty))));
         }
         let written = name.to_string();
         let name = self.canonical(name).to_string();
         let Some(ctor) = data.ctors.iter().find(|ctor| ctor.name == name) else {
             return Err(self.error(
                 span,
-                Error::ConstructorNotOf { name: written, type_name: data_name.to_string() },
+                Error::ConstructorNotOf {
+                    name: written,
+                    type_name: data_name.to_string(),
+                },
             ));
         };
         if let Err(error) = self.constructor_open(&data_name, &written) {
@@ -400,10 +413,15 @@ impl Checker {
             return Err(self.error(span, Error::PatternForm(name.to_string())));
         }
         // `..` here was not the binder of a type test. `(Pair (Num) ..)` is this.
-        if patterns.iter().any(|pattern| matches!(pattern, Pattern::Spill)) {
+        if patterns
+            .iter()
+            .any(|pattern| matches!(pattern, Pattern::Spill))
+        {
             return Err(self.error(span, Error::PatternForm(name.to_string())));
         }
-        let all_binds = patterns.iter().all(|pattern| matches!(pattern, Pattern::Bind(..)));
+        let all_binds = patterns
+            .iter()
+            .all(|pattern| matches!(pattern, Pattern::Bind(..)));
         let all_named = shape.names.iter().all(|field| field.is_some());
         let by_name = all_binds
             && all_named
@@ -438,7 +456,10 @@ impl Checker {
             let count = shape.fields.len();
             return Err(self.error(
                 span,
-                Error::PatternArity { name: name.to_string(), count },
+                Error::PatternArity {
+                    name: name.to_string(),
+                    count,
+                },
             ));
         }
         Err(self.error(span, Error::PatternForm(name.to_string())))
@@ -484,7 +505,10 @@ impl Checker {
             return Ok(TypeWitness { ty, test: None });
         }
         match self.shape_of_ty(ty) {
-            Some(test) => Ok(TypeWitness { ty, test: Some(test) }),
+            Some(test) => Ok(TypeWitness {
+                ty,
+                test: Some(test),
+            }),
             None => Err(self.error(span, Error::PatternCannotTest(self.show_ty(ty)))),
         }
     }
@@ -631,7 +655,9 @@ impl Checker {
 
     fn ground_stack(&self, stack: StackId, seen: &mut HashSet<u32>) -> bool {
         match &self.stacks[self.find_stack(stack).0 as usize] {
-            StackNode::Cons(rest, ty) => self.ground_ty(*ty, seen) && self.ground_stack(*rest, seen),
+            StackNode::Cons(rest, ty) => {
+                self.ground_ty(*ty, seen) && self.ground_stack(*rest, seen)
+            }
             StackNode::Empty => true,
             StackNode::Var | StackNode::Rigid { .. } | StackNode::Template | StackNode::Link(_) => {
                 false
@@ -800,7 +826,12 @@ impl Checker {
         };
         if args.is_empty() {
             match name.as_str() {
-                "Bool" => return Need::Bool { yes: true, no: true },
+                "Bool" => {
+                    return Need::Bool {
+                        yes: true,
+                        no: true,
+                    }
+                }
                 "Int" => {
                     return Need::Open {
                         name: "Int".to_string(),
@@ -868,12 +899,18 @@ impl Checker {
 /// `(Some (Array Num) items)` is two patterns for one field: a parenthesized
 /// type, then a name, `_`, or `..`. Grouping runs only when the counts differ, so
 /// `(Person (Some name) age)` stays two positional fields.
-pub(super) fn group_type_tests<'a>(patterns: &'a [Pattern], slots: usize) -> Option<Vec<SlotPat<'a>>> {
+pub(super) fn group_type_tests<'a>(
+    patterns: &'a [Pattern],
+    slots: usize,
+) -> Option<Vec<SlotPat<'a>>> {
     if patterns.len() == slots {
         return None;
     }
     let grouped = partition_slots(patterns, slots)?;
-    if grouped.iter().any(|slot| matches!(slot, SlotPat::Test { .. })) {
+    if grouped
+        .iter()
+        .any(|slot| matches!(slot, SlotPat::Test { .. }))
+    {
         Some(grouped)
     } else {
         None
@@ -882,7 +919,11 @@ pub(super) fn group_type_tests<'a>(patterns: &'a [Pattern], slots: usize) -> Opt
 
 fn partition_slots<'a>(patterns: &'a [Pattern], slots: usize) -> Option<Vec<SlotPat<'a>>> {
     if slots == 0 {
-        return if patterns.is_empty() { Some(Vec::new()) } else { None };
+        return if patterns.is_empty() {
+            Some(Vec::new())
+        } else {
+            None
+        };
     }
     if patterns.len() < slots {
         return None;
@@ -920,7 +961,10 @@ fn binds_name_fields(patterns: &[Pattern], names: &[Option<String>]) -> bool {
         let Pattern::Bind(_, name) = pattern else {
             return false;
         };
-        if !names.iter().any(|field| field.as_deref() == Some(name.as_str())) {
+        if !names
+            .iter()
+            .any(|field| field.as_deref() == Some(name.as_str()))
+        {
             return false;
         }
         if !seen.insert(name.as_str()) {
@@ -1046,11 +1090,17 @@ fn subtract_slot(need: &Need, pattern: &Pattern) -> Vec<Need> {
         Pattern::Spill => vec![need.clone()],
         _ if matches!(need, Need::Any) => vec![Need::Any],
         Pattern::Lit(Lit::Bool(true)) => match need {
-            Need::Bool { no: true, .. } => vec![Need::Bool { yes: false, no: true }],
+            Need::Bool { no: true, .. } => vec![Need::Bool {
+                yes: false,
+                no: true,
+            }],
             _ => Vec::new(),
         },
         Pattern::Lit(Lit::Bool(false)) => match need {
-            Need::Bool { yes: true, .. } => vec![Need::Bool { yes: true, no: false }],
+            Need::Bool { yes: true, .. } => vec![Need::Bool {
+                yes: true,
+                no: false,
+            }],
             _ => Vec::new(),
         },
         Pattern::Lit(lit) => match need {
@@ -1121,7 +1171,9 @@ fn shape_of_pattern(pattern: &Pattern) -> Option<ShapeTest> {
             if matches!(args[0], Pattern::Bind(..) | Pattern::Wild) {
                 Some(ShapeTest::Array(None))
             } else {
-                Some(ShapeTest::Array(Some(Box::new(shape_of_pattern(&args[0])?))))
+                Some(ShapeTest::Array(Some(Box::new(shape_of_pattern(
+                    &args[0],
+                )?))))
             }
         }
         Pattern::Ctor(name, args) if args.is_empty() => scalar_shape(name),
@@ -1152,9 +1204,12 @@ fn shape_rel(shape: &ShapeTest, need: &Need) -> Rel {
         (ShapeTest::Str, Need::Exact(Lit::String(_))) => Rel::Hit,
         (ShapeTest::Bool, Need::Bool { .. } | Need::Exact(Lit::Bool(_))) => Rel::Hit,
         (ShapeTest::Array(None), Need::Array { .. }) => Rel::Hit,
-        (ShapeTest::Array(Some(elem)), Need::Array { elem: need_elem, .. }) => {
-            shape_rel(elem, need_elem)
-        }
+        (
+            ShapeTest::Array(Some(elem)),
+            Need::Array {
+                elem: need_elem, ..
+            },
+        ) => shape_rel(elem, need_elem),
         _ => Rel::Miss,
     }
 }
@@ -1260,7 +1315,9 @@ fn covered_ctor(need: &Need, name: &str) -> Option<Need> {
     let Need::Data { ctors } = need else {
         return None;
     };
-    let ctor = ctors.iter().find(|ctor| ctor.name == name && ctor.fields.is_some())?;
+    let ctor = ctors
+        .iter()
+        .find(|ctor| ctor.name == name && ctor.fields.is_some())?;
     Some(Need::Data {
         ctors: vec![ctor.clone()],
     })
@@ -1319,18 +1376,25 @@ fn covered_slot(pattern: &Pattern, need: &Need) -> Option<Need> {
         Pattern::Spill => None,
         _ if matches!(need, Need::Any) => None,
         Pattern::Lit(Lit::Bool(true)) => match need {
-            Need::Bool { yes: true, .. } => Some(Need::Bool { yes: true, no: false }),
+            Need::Bool { yes: true, .. } => Some(Need::Bool {
+                yes: true,
+                no: false,
+            }),
             Need::Exact(Lit::Bool(true)) => Some(need.clone()),
             _ => None,
         },
         Pattern::Lit(Lit::Bool(false)) => match need {
-            Need::Bool { no: true, .. } => Some(Need::Bool { yes: false, no: true }),
+            Need::Bool { no: true, .. } => Some(Need::Bool {
+                yes: false,
+                no: true,
+            }),
             Need::Exact(Lit::Bool(false)) => Some(need.clone()),
             _ => None,
         },
         Pattern::Lit(lit) => match need {
             Need::Open { name, excluded }
-                if lit_name(lit) == Some(name.as_str()) && !excluded.iter().any(|item| item == lit) =>
+                if lit_name(lit) == Some(name.as_str())
+                    && !excluded.iter().any(|item| item == lit) =>
             {
                 Some(Need::Exact(lit.clone()))
             }
@@ -1342,7 +1406,9 @@ fn covered_slot(pattern: &Pattern, need: &Need) -> Option<Need> {
             let Need::Data { ctors } = need else {
                 return None;
             };
-            let ctor = ctors.iter().find(|ctor| ctor.name == *name && ctor.fields.is_some())?;
+            let ctor = ctors
+                .iter()
+                .find(|ctor| ctor.name == *name && ctor.fields.is_some())?;
             let fields = ctor.fields.as_ref()?;
             if let Some(groups) = group_type_tests(patterns, fields.len()) {
                 if groups
@@ -1447,7 +1513,10 @@ fn covered_record(need: &Need, fields: &[(String, Pattern)]) -> Option<Need> {
 }
 
 /// Mentioned fields in pattern order, paired with their index in `have`.
-fn project_fields(have: &[FieldNeed], fields: &[(String, Pattern)]) -> Option<(Vec<usize>, Vec<Need>)> {
+fn project_fields(
+    have: &[FieldNeed],
+    fields: &[(String, Pattern)],
+) -> Option<(Vec<usize>, Vec<Need>)> {
     let mut indexes = Vec::with_capacity(fields.len());
     let mut row = Vec::with_capacity(fields.len());
     for (name, _) in fields {
@@ -1556,11 +1625,12 @@ fn render_record(fields: &[FieldNeed]) -> Vec<String> {
                 if next.len() == EXAMPLE_CAP {
                     break;
                 }
-                let shown = if part.contains(' ') && !part.starts_with('{') && !part.starts_with('(') {
-                    format!("({part})")
-                } else {
-                    part.clone()
-                };
+                let shown =
+                    if part.contains(' ') && !part.starts_with('{') && !part.starts_with('(') {
+                        format!("({part})")
+                    } else {
+                        part.clone()
+                    };
                 let text = if index == 0 {
                     format!("{} : {shown}", field.name)
                 } else {
@@ -1571,7 +1641,9 @@ fn render_record(fields: &[FieldNeed]) -> Vec<String> {
         }
         acc = next;
     }
-    acc.into_iter().map(|text| format!("{{ {text} }}")).collect()
+    acc.into_iter()
+        .map(|text| format!("{{ {text} }}"))
+        .collect()
 }
 
 fn render_ctor(name: &str, fields: &[Rc<Need>]) -> Vec<String> {
@@ -1599,11 +1671,7 @@ fn render_ctor(name: &str, fields: &[Rc<Need>]) -> Vec<String> {
         acc = next;
     }
     acc.into_iter()
-        .map(|text| {
-            text.strip_suffix(" _")
-                .unwrap_or(&text)
-                .to_string()
-        })
+        .map(|text| text.strip_suffix(" _").unwrap_or(&text).to_string())
         .collect()
 }
 

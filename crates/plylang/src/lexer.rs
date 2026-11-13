@@ -1,5 +1,5 @@
-use crate::diagnostic::Diagnostic;
 use crate::codes::Error;
+use crate::diagnostic::Diagnostic;
 use crate::span::Span;
 use crate::token::{keyword, Token, TokenKind};
 
@@ -34,12 +34,12 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, Diagnostic> {
             let previous_break = tokens
                 .last()
                 .is_some_and(|token| token.kind == TokenKind::Newline);
-            let doc_before = tokens.iter().rev().find(|token| token.kind != TokenKind::Newline).is_some_and(|token| {
-                matches!(token.kind, TokenKind::Doc(_))
-            });
-            if !only_breaks && !previous_break
-                || (previous_break && doc_before && line_blank)
-            {
+            let doc_before = tokens
+                .iter()
+                .rev()
+                .find(|token| token.kind != TokenKind::Newline)
+                .is_some_and(|token| matches!(token.kind, TokenKind::Doc(_)));
+            if !only_breaks && !previous_break || (previous_break && doc_before && line_blank) {
                 tokens.push(lexer.make(TokenKind::Newline, start, lexer.index));
             }
             continue;
@@ -223,7 +223,10 @@ impl<'a> Lexer<'a> {
             self.bump();
         }
         let mut name = self.source[name_at..self.index].to_string();
-        let upper = name.chars().next().is_some_and(|ch| ch.is_ascii_uppercase());
+        let upper = name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_uppercase());
         if upper && self.peek() == Some(':') && self.peek_at(1).is_some_and(is_ident_start) {
             self.bump();
             name.push(':');
@@ -259,14 +262,20 @@ impl<'a> Lexer<'a> {
         let mut value = String::new();
         loop {
             let Some(ch) = self.peek() else {
-                return Err(Diagnostic::new(Span::new(start, self.index), Error::UnterminatedString));
+                return Err(Diagnostic::new(
+                    Span::new(start, self.index),
+                    Error::UnterminatedString,
+                ));
             };
             self.bump();
             match ch {
                 '"' => break,
                 '\\' => {
                     let Some(escaped) = self.peek() else {
-                        return Err(Diagnostic::new(Span::new(start, self.index), Error::UnterminatedString));
+                        return Err(Diagnostic::new(
+                            Span::new(start, self.index),
+                            Error::UnterminatedString,
+                        ));
                     };
                     self.bump();
                     let mapped = match escaped {
@@ -415,7 +424,11 @@ mod tests {
         assert_eq!(error.message, "unexpected character");
         assert_eq!(
             spell("; Maybe\n"),
-            vec!["Data".to_string(), "Ident(\"Maybe\")".to_string(), "Newline".to_string(),]
+            vec![
+                "Data".to_string(),
+                "Ident(\"Maybe\")".to_string(),
+                "Newline".to_string(),
+            ]
         );
         assert_eq!(
             spell(".. Copy the top.\n. note\n"),
@@ -470,7 +483,17 @@ mod tests {
                 "Field(\"name\")".to_string(),
             ]
         );
-        for source in ["+city", "+ city", "+", "+1", "+=", "++", "{ name: 1 }", "}", "*"] {
+        for source in [
+            "+city",
+            "+ city",
+            "+",
+            "+1",
+            "+=",
+            "++",
+            "{ name: 1 }",
+            "}",
+            "*",
+        ] {
             let error = tokenize(source).unwrap_err();
             assert_eq!(error.message, "unexpected character", "{source}");
         }
@@ -478,12 +501,20 @@ mod tests {
         assert!(kinds.iter().any(|kind| kind == "All"));
         let commented = spell("~ \"Data/Bus\" ..\n");
         assert!(
-            !commented.iter().any(|kind| kind == "All" || kind.starts_with("Doc")),
+            !commented
+                .iter()
+                .any(|kind| kind == "All" || kind.starts_with("Doc")),
             "{commented:?}"
         );
         let inside = spell("(\n..s\n)");
-        assert!(inside.iter().any(|kind| kind == "Tail(\"s\")"), "{inside:?}");
-        assert!(!inside.iter().any(|kind| kind.starts_with("Doc")), "{inside:?}");
+        assert!(
+            inside.iter().any(|kind| kind == "Tail(\"s\")"),
+            "{inside:?}"
+        );
+        assert!(
+            !inside.iter().any(|kind| kind.starts_with("Doc")),
+            "{inside:?}"
+        );
         assert_eq!(
             spell("< < dup > > <= => >>age name>> eq = eqInt"),
             vec![
@@ -526,13 +557,14 @@ mod tests {
                 "Ident(\"y\")".to_string(),
             ]
         );
-        assert_eq!(
-            spell("::"),
-            vec!["Colon".to_string(), "Colon".to_string(),]
-        );
+        assert_eq!(spell("::"), vec!["Colon".to_string(), "Colon".to_string(),]);
         assert_eq!(
             spell("- Age\n"),
-            vec!["Type".to_string(), "Ident(\"Age\")".to_string(), "Newline".to_string(),]
+            vec![
+                "Type".to_string(),
+                "Ident(\"Age\")".to_string(),
+                "Newline".to_string(),
+            ]
         );
     }
 }

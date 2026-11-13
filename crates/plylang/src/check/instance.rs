@@ -90,7 +90,10 @@ impl Checker {
     ) -> Result<Vec<ClassMethod>, Diagnostic> {
         let mut methods = Vec::new();
         for method in &class.methods {
-            if methods.iter().any(|have: &ClassMethod| have.name == method.name) {
+            if methods
+                .iter()
+                .any(|have: &ClassMethod| have.name == method.name)
+            {
                 return Err(self.error(
                     method.name_span,
                     Error::DuplicateDefinition(method.name.to_string()),
@@ -102,7 +105,8 @@ impl Checker {
                 scope.quantified_tys.push((name.clone(), *id));
             }
             let preset = scope.quantified_tys.len();
-            let mut scheme = self.elaborate_with(&method.scheme, method.name_span, scope, preset)?;
+            let mut scheme =
+                self.elaborate_with(&method.scheme, method.name_span, scope, preset)?;
             scheme.constraints.insert(
                 0,
                 SemConstraint {
@@ -204,14 +208,19 @@ impl Checker {
             return Err(self.error(span, Error::UndefinedClass(written)));
         }
         let canon = self.canonical(&written).to_string();
-        let class = self.classes.get(&canon).cloned().ok_or_else(|| {
-            self.error(span, Error::UndefinedClass(written.clone()))
-        })?;
+        let class = self
+            .classes
+            .get(&canon)
+            .cloned()
+            .ok_or_else(|| self.error(span, Error::UndefinedClass(written.clone())))?;
         if constraint.args.len() != class.params.len() {
             let count = class.params.len();
             return Err(self.error(
                 span,
-                Error::ClassArity { name: written, count },
+                Error::ClassArity {
+                    name: written,
+                    count,
+                },
             ));
         }
         let mut args = Vec::new();
@@ -326,7 +335,12 @@ impl Checker {
                 .class_names
                 .iter()
                 .zip(&classes)
-                .filter(|(_, class)| class.methods.iter().any(|method| method.name == binding.name))
+                .filter(|(_, class)| {
+                    class
+                        .methods
+                        .iter()
+                        .any(|method| method.name == binding.name)
+                })
                 .map(|(name, _)| name.as_str())
                 .collect();
             if owners.len() != 1 {
@@ -368,7 +382,10 @@ impl Checker {
             let count = class.params.len();
             return Err(self.error(
                 instance.span,
-                Error::ClassArity { name: class_name.to_string(), count },
+                Error::ClassArity {
+                    name: class_name.to_string(),
+                    count,
+                },
             ));
         }
         let mut names = Vec::new();
@@ -405,7 +422,9 @@ impl Checker {
             .collect();
         for method in &class.methods {
             if !bound.contains(method.name.as_str()) {
-                return Err(self.error(instance.span, Error::MissingMethod(method.name.to_string())));
+                return Err(
+                    self.error(instance.span, Error::MissingMethod(method.name.to_string()))
+                );
             }
         }
         let mut methods = Vec::new();
@@ -515,14 +534,12 @@ impl Checker {
                 self.defines_type_seen(head, seen)
                     || args.iter().any(|arg| self.defines_type_seen(arg, seen))
             }
-            Type::Fun(effect) => {
-                effect
-                    .input
-                    .items
-                    .iter()
-                    .chain(&effect.output.items)
-                    .any(|ty| self.defines_type_seen(ty, seen))
-            }
+            Type::Fun(effect) => effect
+                .input
+                .items
+                .iter()
+                .chain(&effect.output.items)
+                .any(|ty| self.defines_type_seen(ty, seen)),
             Type::Record(row) => {
                 row.fields
                     .iter()
@@ -687,8 +704,7 @@ impl Checker {
         }
         match self.stacks[stack.0 as usize].clone() {
             StackNode::Cons(rest, ty) => {
-                self.stack_has_skolem(rest, skolems, seen)
-                    || self.ty_has_skolem(ty, skolems, seen)
+                self.stack_has_skolem(rest, skolems, seen) || self.ty_has_skolem(ty, skolems, seen)
             }
             StackNode::Link(next) => self.stack_has_skolem(next, skolems, seen),
             _ => false,
@@ -864,9 +880,12 @@ impl Checker {
     }
 
     fn constraints_flexible(&self, constraints: &[SemConstraint]) -> bool {
-        constraints
-            .iter()
-            .any(|constraint| constraint.args.iter().any(|ty| self.flexible(*ty, &mut Seen::default())))
+        constraints.iter().any(|constraint| {
+            constraint
+                .args
+                .iter()
+                .any(|ty| self.flexible(*ty, &mut Seen::default()))
+        })
     }
 
     pub(super) fn dicts_for_use(
@@ -891,7 +910,10 @@ impl Checker {
         let pending = std::mem::take(&mut self.deferred);
         for item in pending {
             if let Some(constraint) = item.constraints.iter().find(|constraint| {
-                constraint.args.iter().any(|ty| self.flexible(*ty, &mut Seen::default()))
+                constraint
+                    .args
+                    .iter()
+                    .any(|ty| self.flexible(*ty, &mut Seen::default()))
             }) {
                 let shown = self.show_constraint(constraint);
                 return Err(self.error(item.span, Error::AmbiguousConstraint(shown)));
@@ -1010,12 +1032,7 @@ impl Checker {
         if let Some(error) = failure {
             return Err(error);
         }
-        found.ok_or_else(|| {
-            self.error(
-                span,
-                Error::NoInstance(self.show_constraint(constraint)),
-            )
-        })
+        found.ok_or_else(|| self.error(span, Error::NoInstance(self.show_constraint(constraint))))
     }
 
     fn match_assumption(&mut self, wanted: &SemConstraint) -> Option<usize> {
@@ -1030,7 +1047,7 @@ impl Checker {
                 self.frozen_ty.clone(),
                 self.frozen_stack.clone(),
                 self.frozen_row.clone(),
-            self.frozen_effect.clone(),
+                self.frozen_effect.clone(),
             );
             for arg in assumption.args.iter().chain(&wanted.args) {
                 self.freeze_ty(*arg);
@@ -1046,7 +1063,7 @@ impl Checker {
             self.frozen_ty = saved.0;
             self.frozen_stack = saved.1;
             self.frozen_row = saved.2;
-        self.frozen_effect = saved.3;
+            self.frozen_effect = saved.3;
             if ok {
                 return Some(index);
             }
@@ -1100,10 +1117,7 @@ impl Checker {
                     && self.instance_head_matches(inst, &constraint.args)
             });
             if !matched {
-                return Err(self.error(
-                    span,
-                    Error::NoInstance(self.show_constraint(constraint)),
-                ));
+                return Err(self.error(span, Error::NoInstance(self.show_constraint(constraint))));
             }
         }
         Ok(())
@@ -1146,11 +1160,7 @@ impl Checker {
     /// of fields. Several paths from one assumption are the same dictionary, so
     /// the shortest chain is enough. A second assumption that also covers
     /// `wanted` is incoherent.
-    fn entail(
-        &mut self,
-        wanted: &SemConstraint,
-        span: Span,
-    ) -> Result<Option<Dict>, Diagnostic> {
+    fn entail(&mut self, wanted: &SemConstraint, span: Span) -> Result<Option<Dict>, Diagnostic> {
         let assumptions = self.assumptions.clone();
         let mut found = None;
         for (index, assumption) in assumptions.iter().enumerate() {

@@ -18,7 +18,10 @@ pub(super) struct ExportEntry {
 }
 
 /// Replace the top-level `exports` value. Every other byte of `package.json` stays.
-pub(super) fn write_package_exports(root: &Path, entries: &[ExportEntry]) -> Result<(), BuildError> {
+pub(super) fn write_package_exports(
+    root: &Path,
+    entries: &[ExportEntry],
+) -> Result<(), BuildError> {
     let path = root.join("package.json");
     let text = fs::read_to_string(&path).map_err(|error| os_error(&path, error))?;
     let updated = match find_exports(&text) {
@@ -35,9 +38,7 @@ pub(super) fn write_package_exports(root: &Path, entries: &[ExportEntry]) -> Res
         Err(JsonError::NotObject) => {
             return Err(pkg_error(&path, &text, Error::PackageJsonNotObject))
         }
-        Err(JsonError::Invalid) => {
-            return Err(pkg_error(&path, &text, Error::PackageJsonInvalid))
-        }
+        Err(JsonError::Invalid) => return Err(pkg_error(&path, &text, Error::PackageJsonInvalid)),
     };
     fs::write(&path, updated).map_err(|error| os_error(&path, error))
 }
@@ -444,12 +445,17 @@ mod tests {
             panic!("expected the exports value");
         };
         assert_eq!(&pair[start..end], r#"{ "b": 2 }"#);
-        assert!(matches!(super::find_exports("[]"), Err(super::JsonError::NotObject)));
+        assert!(matches!(
+            super::find_exports("[]"),
+            Err(super::JsonError::NotObject)
+        ));
         assert!(matches!(
             super::find_exports(r#"{ "name": "\ud800" }"#),
             Err(super::JsonError::Invalid)
         ));
-        assert!(matches!(super::find_exports("{"), Err(super::JsonError::Invalid)));
+        assert!(matches!(
+            super::find_exports("{"),
+            Err(super::JsonError::Invalid)
+        ));
     }
-
 }

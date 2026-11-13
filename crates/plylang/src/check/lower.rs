@@ -16,10 +16,10 @@ use crate::anf::{
     js_ident, Access, AnfCtor, AnfData, AnfDef, AnfModule, AnfPlace, Choice, Cond, DictField,
     DictValue, Expr, Let, LocalId, MethodHome, PatTest, QuoteForm, Value,
 };
-use crate::builtin::{self, Lowering};
 use crate::ast::{Item, Lit, Module, Pattern, Term, TermNode};
-use crate::diagnostic::Diagnostic;
+use crate::builtin::{self, Lowering};
 use crate::codes::Error;
+use crate::diagnostic::Diagnostic;
 use crate::span::Span;
 
 use super::clauses::{group_type_tests, FieldMatch, SlotPat};
@@ -105,11 +105,7 @@ impl Frame {
         self.pop_n(checker, 1).pop().expect("pop one")
     }
 
-    fn force(
-        &mut self,
-        checker: &mut Checker,
-        operand: Operand,
-    ) -> Result<LocalId, Diagnostic> {
+    fn force(&mut self, checker: &mut Checker, operand: Operand) -> Result<LocalId, Diagnostic> {
         match operand {
             Operand::Local(id) => Ok(id),
             Operand::Pending(pending) => {
@@ -139,10 +135,10 @@ impl Checker {
     }
 
     pub(crate) fn lower_prepared(&mut self, module: &Module) -> Result<AnfModule, Diagnostic> {
-        let added_show = self.inline_show_cat
-            && self.install_derive_word("ply_show_cat", "( Str Str -- Str )");
-        let added_hash = self.inline_hash_mix
-            && self.install_derive_word("ply_hash_mix", "( Int Int -- Int )");
+        let added_show =
+            self.inline_show_cat && self.install_derive_word("ply_show_cat", "( Str Str -- Str )");
+        let added_hash =
+            self.inline_hash_mix && self.install_derive_word("ply_hash_mix", "( Int Int -- Int )");
         let result = self.lower_prepared_body(module);
         if added_show {
             self.words.remove("ply_show_cat");
@@ -375,7 +371,9 @@ impl Checker {
                 output
             }
             TermNode::FieldSet(name) => self.lower_set_field(term.span, name, stack, frame)?,
-            TermNode::FieldInsert(name) => self.lower_insert_field(term.span, name, stack, frame)?,
+            TermNode::FieldInsert(name) => {
+                self.lower_insert_field(term.span, name, stack, frame)?
+            }
             TermNode::PlaceSet(name) => self.lower_place_set(term.span, name, stack, frame)?,
             TermNode::PlaceBind(name) => self.lower_place_bind(term.span, name, stack, frame)?,
             TermNode::Array(elements) => self.lower_array(elements, stack, frame)?,
@@ -479,11 +477,7 @@ impl Checker {
                 args: vec![value, thunk],
             },
         });
-        frame.stack = below
-            .into_iter()
-            .chain(outer)
-            .map(Operand::Local)
-            .collect();
+        frame.stack = below.into_iter().chain(outer).map(Operand::Local).collect();
         self.note_produced(output, produced, frame);
         Ok(output)
     }
@@ -1258,7 +1252,9 @@ impl Checker {
         let quote = self.realize_operand(quote)?;
         let saved = frame.pop_n(self, keep);
         let saved = force_all(self, frame, saved)?;
-        frame.stack.extend(saved.iter().copied().map(Operand::Local));
+        frame
+            .stack
+            .extend(saved.iter().copied().map(Operand::Local));
         let (arity, _) = self.quote_arity(&quote);
         let base = take_base(self, frame, arity)?;
         let expr = self.reduce_quote(quote, base);
@@ -1518,15 +1514,7 @@ impl Checker {
                 if let Some(groups) = group_type_tests(patterns, shape.fields.len()) {
                     if self.type_test_heads(&groups) {
                         return self.lower_type_tests(
-                            &shape,
-                            &groups,
-                            root,
-                            steps,
-                            conds,
-                            binds,
-                            schemes,
-                            arm_stack,
-                            arm,
+                            &shape, &groups, root, steps, conds, binds, schemes, arm_stack, arm,
                             span,
                         );
                     }
@@ -1543,12 +1531,7 @@ impl Checker {
                 let width = shape.fields.len();
                 let names = shape.names.clone();
                 let paired: Vec<(usize, TyId)> = match mode {
-                    FieldMatch::Positional => shape
-                        .fields
-                        .iter()
-                        .copied()
-                        .enumerate()
-                        .collect(),
+                    FieldMatch::Positional => shape.fields.iter().copied().enumerate().collect(),
                     FieldMatch::Named(indexes) => indexes
                         .into_iter()
                         .map(|index| (index, shape.fields[index]))
@@ -1560,16 +1543,7 @@ impl Checker {
                         child.push(Self::field_step(index, width, names.get(index)));
                     }
                     self.lower_pattern(
-                        pattern,
-                        field,
-                        root,
-                        &child,
-                        conds,
-                        binds,
-                        schemes,
-                        arm_stack,
-                        arm,
-                        span,
+                        pattern, field, root, &child, conds, binds, schemes, arm_stack, arm, span,
                     )?;
                 }
                 Ok(())
@@ -1585,16 +1559,7 @@ impl Checker {
                     let mut child = steps.to_vec();
                     child.push(Access::Index(index));
                     self.lower_pattern(
-                        pattern,
-                        elem,
-                        root,
-                        &child,
-                        conds,
-                        binds,
-                        schemes,
-                        arm_stack,
-                        arm,
-                        span,
+                        pattern, elem, root, &child, conds, binds, schemes, arm_stack, arm, span,
                     )?;
                 }
                 Ok(())
@@ -1605,15 +1570,7 @@ impl Checker {
                     let mut child = steps.to_vec();
                     child.push(Access::Prop(name.clone()));
                     self.lower_pattern(
-                        pattern,
-                        field_ty,
-                        root,
-                        &child,
-                        conds,
-                        binds,
-                        schemes,
-                        arm_stack,
-                        arm,
+                        pattern, field_ty, root, &child, conds, binds, schemes, arm_stack, arm,
                         span,
                     )?;
                 }
@@ -1677,10 +1634,9 @@ impl Checker {
                     match bind {
                         Pattern::Bind(_, name) => {
                             if binds.contains_key(name) {
-                                return Err(self.error(
-                                    span,
-                                    Error::DuplicateDefinition(name.clone()),
-                                ));
+                                return Err(
+                                    self.error(span, Error::DuplicateDefinition(name.clone()))
+                                );
                             }
                             let id = self.materialize(arm, root, &child);
                             self.note_fn(id, witness.ty);
@@ -1938,7 +1894,11 @@ impl Checker {
                         value: match &field.value {
                             DictValue::Word(word) => DictValue::Word(word.clone()),
                             DictValue::Local(id) => DictValue::Local(local(id)),
-                            DictValue::Closure { params, dicts, word } => DictValue::Closure {
+                            DictValue::Closure {
+                                params,
+                                dicts,
+                                word,
+                            } => DictValue::Closure {
                                 params: params.iter().map(|_| self.fresh_local()).collect(),
                                 dicts: dicts.iter().map(local).collect(),
                                 word: word.clone(),
@@ -2206,10 +2166,7 @@ fn restore(frame: &mut Frame, below: Vec<LocalId>, outputs: Vec<LocalId>) {
     frame.stack.extend(outputs.into_iter().map(Operand::Local));
 }
 
-fn drain_results(
-    checker: &mut Checker,
-    frame: &mut Frame,
-) -> Result<Vec<LocalId>, Diagnostic> {
+fn drain_results(checker: &mut Checker, frame: &mut Frame) -> Result<Vec<LocalId>, Diagnostic> {
     let operands: Vec<_> = frame.stack.drain(..).collect();
     force_all(checker, frame, operands)
 }
@@ -2255,7 +2212,10 @@ fn place_is_exported(module: &crate::ast::Module, name: &str) -> bool {
 
 fn module_uses_unit(module: &AnfModule) -> bool {
     module.defs.iter().any(|def| expr_uses_unit(&def.body))
-        || module.places.iter().any(|place| expr_uses_unit(&place.init.body))
+        || module
+            .places
+            .iter()
+            .any(|place| expr_uses_unit(&place.init.body))
 }
 
 fn expr_uses_unit(expr: &Expr) -> bool {
@@ -2393,13 +2353,23 @@ mod tests {
             assert!(!code.contains("=>"), "{body}\n{code}");
         };
 
-        identity("( Int Int -- Int Int )", "swap swap", "(v0, v1)", "  return [v0, v1];\n");
+        identity(
+            "( Int Int -- Int Int )",
+            "swap swap",
+            "(v0, v1)",
+            "  return [v0, v1];\n",
+        );
         identity("( Int -- Int )", "dup drop", "(v0)", "  return v0;\n");
         identity("( Int -- Int )", "quote call", "(v0)", "  return v0;\n");
         identity("( Int -- Int )", "[ ] call", "(v0)", "  return v0;\n");
         identity("( Int -- Int )", "[ ] dip", "(v0)", "  return v0;\n");
         identity("( Int -- Int )", "[ drop ] keep", "(v0)", "  return v0;\n");
-        identity("( Int -- Int )", "dup [ drop ] dip", "(v0)", "  return v0;\n");
+        identity(
+            "( Int -- Int )",
+            "dup [ drop ] dip",
+            "(v0)",
+            "  return v0;\n",
+        );
         identity(
             "( Int Int Int -- Int Int Int )",
             "rot unrot",
@@ -2428,17 +2398,26 @@ mod tests {
         let top = "export function restored(v0, v1) {\n  return v1;\n}\n";
         assert_eq!(canonical(": restored ( Int Int -- Int )\n  nip"), top);
         assert_eq!(canonical(": restored ( Int Int -- Int )\n  swap drop"), top);
-        assert_eq!(canonical(": restored ( Int Int -- Int )\n  [ drop ] dip"), top);
+        assert_eq!(
+            canonical(": restored ( Int Int -- Int )\n  [ drop ] dip"),
+            top
+        );
 
         let copied = "export function restored(v0, v1) {\n  return [v0, v1, v0];\n}\n";
-        assert_eq!(canonical(": restored ( Int Int -- Int Int Int )\n  over"), copied);
+        assert_eq!(
+            canonical(": restored ( Int Int -- Int Int Int )\n  over"),
+            copied
+        );
         assert_eq!(
             canonical(": restored ( Int Int -- Int Int Int )\n  dupd swap"),
             copied
         );
 
         let tucked = "export function restored(v0, v1) {\n  return [v1, v0, v1];\n}\n";
-        assert_eq!(canonical(": restored ( Int Int -- Int Int Int )\n  tuck"), tucked);
+        assert_eq!(
+            canonical(": restored ( Int Int -- Int Int Int )\n  tuck"),
+            tucked
+        );
         assert_eq!(
             canonical(": restored ( Int Int -- Int Int Int )\n  swap over"),
             tucked
@@ -2466,9 +2445,18 @@ mod tests {
 
         let next = ": foreign next ( -- Int )\n";
         let once = format!("{next}: restored ( -- Int )\n  next");
-        same(&once, &format!("{next}: restored ( -- Int )\n  next dup drop"));
-        same(&once, &format!("{next}: restored ( -- Int )\n  next quote call"));
-        same(&once, &format!("{next}: restored ( -- Int )\n  [ next ] call"));
+        same(
+            &once,
+            &format!("{next}: restored ( -- Int )\n  next dup drop"),
+        );
+        same(
+            &once,
+            &format!("{next}: restored ( -- Int )\n  next quote call"),
+        );
+        same(
+            &once,
+            &format!("{next}: restored ( -- Int )\n  [ next ] call"),
+        );
         assert_eq!(canonical(&once).matches("next(").count(), 1);
 
         let ordered = ": foreign left ( -- Int )\n: foreign right ( -- Int )\n";
@@ -2717,10 +2705,7 @@ console.log("ok");
   [ drop ] [ nip ] [ if ] cons cons call
 "#;
         let code = js(source);
-        assert!(
-            !code.contains("rot("),
-            "shuffle became a call:\n{code}"
-        );
+        assert!(!code.contains("rot("), "shuffle became a call:\n{code}");
         assert!(!code.contains("cons("), "cons became a call:\n{code}");
         assert_eq!(
             js(": rotated ( Int Int Int -- Int Int Int )\n  rot"),
@@ -2807,29 +2792,25 @@ if (mapped.tag !== "Just" || mapped.value !== 42n) throw new Error("map just " +
 
     #[test]
     fn javascript_runs_a_type_test() {
-        let code = js(
-            r#"
+        let code = js(r#"
 ; Option a = None | Some a
 
 : take ( (Option (Array Num)) -- (Array Num) )
   (Some (Array Num) items) -> items
   (None ..) -> < >
-"#,
-        );
+"#);
         assert!(
             !code.contains("Array.isArray") && !code.contains("typeof"),
             "{code}"
         );
-        let code = js(
-            r#"
+        let code = js(r#"
 ; Option a = None | Some a
 
 : normalized ( (Option a) -- (Array Num) )
   (Some (Array Num) items) -> items
   (Some (Array (Array Num)) _) -> < >
   _ -> < >
-"#,
-        );
+"#);
         assert!(
             code.contains("Array.isArray(v0.value)")
                 && code.contains("typeof e0 === \"number\"")
@@ -2883,8 +2864,7 @@ if (kind(None) !== 0) throw new Error("kind none");
 
     #[test]
     fn javascript_runs_a_spilled_type_test() {
-        let concrete = js(
-            r#"
+        let concrete = js(r#"
 ; Option a = None | Some a
 ; Age == Age Num
 
@@ -2894,8 +2874,7 @@ if (kind(None) !== 0) throw new Error("kind none");
 
 : years ( Age -- Num )
   (Age (Num) ..) ->
-"#,
-        );
+"#);
         assert!(!concrete.contains("typeof"), "{concrete}");
         run(
             r#"
@@ -3743,7 +3722,8 @@ if (pair[0] !== 21 || pair[1] !== 5) throw new Error("dip " + pair);
 
     #[test]
     fn javascript_rejects_a_record() {
-        let braces = parse(": bad ( -- Str )\n  { name: \"Ada\" }\n", ParseMode::Source).unwrap_err();
+        let braces =
+            parse(": bad ( -- Str )\n  { name: \"Ada\" }\n", ParseMode::Source).unwrap_err();
         assert_eq!(braces.message, "unexpected character");
         let plus = parse(": bad ( Int -- Int )\n  +city\n", ParseMode::Source).unwrap_err();
         assert_eq!(plus.message, "unexpected character");
@@ -3751,7 +3731,8 @@ if (pair[0] !== 21 || pair[1] !== 5) throw new Error("dip " + pair);
 
     #[test]
     fn at_is_an_ordinary_call() {
-        let indexed = js(": foreign at ( (Array a) Num -- a )\n\n: second ( (Array Num) -- Num )\n  1 at\n");
+        let indexed =
+            js(": foreign at ( (Array a) Num -- a )\n\n: second ( (Array Num) -- Num )\n  1 at\n");
         assert!(indexed.contains("at(v"));
         assert!(!indexed.contains("function at"));
         assert!(!indexed.contains("array index out of range"));
@@ -3759,9 +3740,8 @@ if (pair[0] !== 21 || pair[1] !== 5) throw new Error("dip " + pair);
 
     #[test]
     fn a_foreign_type_emits_nothing() {
-        let code = js(
-            "; foreign Hub a\n; Box = Box\n\n: pass ( (Hub a) -- (Hub a) )\n  hub -> hub\n",
-        );
+        let code =
+            js("; foreign Hub a\n; Box = Box\n\n: pass ( (Hub a) -- (Hub a) )\n  hub -> hub\n");
         assert_eq!(
             code,
             "export const Box = { tag: \"Box\" };\n\nexport function pass(v0) {\n  let v1;\n  v1 = v0;\n  return v1;\n}\n"
@@ -3786,9 +3766,7 @@ if (round(7) !== 7) throw new Error("round");
 
     #[test]
     fn javascript_erases_a_newtype_and_expands_a_synonym() {
-        let code = js(
-            "; Age == Age Num\n\n: older ( Age -- Age )\n  (Age ..) -> Age\n",
-        );
+        let code = js("; Age == Age Num\n\n: older ( Age -- Age )\n  (Age ..) -> Age\n");
         assert!(code.contains("export const Age = (value) => value;"));
         assert!(!code.contains("tag: \"Age\""));
         run(

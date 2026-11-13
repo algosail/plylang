@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 
 use crate::ast::{Clause, Item, Module, Term, TermNode};
 use crate::build::{load_surface, provider_file, read_module};
-use crate::surface::{self, Found};
 use crate::complete::{is_import_path, name_space_at, NameSpace};
 use crate::lexer::tokenize;
 use crate::parser::{is_lower, is_upper, parse};
 use crate::paths::mode_from_path;
 use crate::span::{byte_offset, Span};
+use crate::surface::{self, Found};
 use crate::token::{Token, TokenKind};
 
 pub struct Definition {
@@ -375,15 +375,30 @@ mod tests {
         assert_eq!(declared.span, used.span);
         assert_eq!(declared.path, PathBuf::from("M.ply"));
         assert_eq!(slice(source, declared.span), "double");
-        assert!(definition(source, Path::new("M.ply"), at(source, "dup").0, at(source, "dup").1).is_none());
-        assert!(definition(source, Path::new("M.ply"), at(source, "Int").0, at(source, "Int").1).is_none());
+        assert!(definition(
+            source,
+            Path::new("M.ply"),
+            at(source, "dup").0,
+            at(source, "dup").1
+        )
+        .is_none());
+        assert!(definition(
+            source,
+            Path::new("M.ply"),
+            at(source, "Int").0,
+            at(source, "Int").1
+        )
+        .is_none());
     }
 
     #[test]
     fn splits_a_type_and_its_constructor() {
         let source = "; Maybe a = Nothing | Just a\n\n: none ( -- (Maybe Int) )\n  Nothing\n";
         let declared = jump(source, at(source, "Maybe"));
-        let scheme = jump(source, at_offset(source, source.find("(Maybe").unwrap() + 1));
+        let scheme = jump(
+            source,
+            at_offset(source, source.find("(Maybe").unwrap() + 1),
+        );
         assert_eq!(declared.span, scheme.span);
         assert_eq!(slice(source, scheme.span), "Maybe");
         let ctor = jump(source, at(source, "Nothing"));
@@ -490,7 +505,10 @@ mod tests {
     fn an_instance_binding_jumps_to_the_method() {
         let source = "& Eq a\n  eq ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  drop drop true\n\n# Eq Int\n  eq = eqInt\n\n: use ( Int Int -- Bool )\n  eq\n";
         let method = source.find("eq (").unwrap();
-        let used = jump(source, at_offset(source, source.rfind("\n  eq").unwrap() + 3));
+        let used = jump(
+            source,
+            at_offset(source, source.rfind("\n  eq").unwrap() + 3),
+        );
         let bound = jump(source, at(source, "eq ="));
         assert_eq!(used.span.start as usize, method);
         assert_eq!(bound.span.start as usize, method);
@@ -589,11 +607,9 @@ mod tests {
         );
         let source_text = "@ add\n\n: add ( Int Int -- Int )\n  drop\n";
         temp.write("node_modules/@algosail/nums/src/Data/Num.ply", source_text);
-        let interface = "language 1\n\n@ add\n\n.. From the interface.\n\n: add ( Int Int -- Int )\n";
-        temp.write(
-            "node_modules/@algosail/nums/dist/Data/Num.d.ply",
-            interface,
-        );
+        let interface =
+            "language 1\n\n@ add\n\n.. From the interface.\n\n: add ( Int Int -- Int )\n";
+        temp.write("node_modules/@algosail/nums/dist/Data/Num.d.ply", interface);
         let from = temp.0.join("App.ply");
         let source = "~ \"@algosail/nums/Data/Num\" add\n\n: twice ( Int -- Int )\n  dup add\n";
         let found = definition(&source, &from, 3, 6).unwrap();
@@ -621,8 +637,14 @@ mod tests {
     }
 
     fn at_offset(source: &str, offset: usize) -> (u32, u32) {
-        let line = source[..offset].bytes().filter(|byte| *byte == b'\n').count() as u32;
-        let line_start = source[..offset].rfind('\n').map(|index| index + 1).unwrap_or(0);
+        let line = source[..offset]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count() as u32;
+        let line_start = source[..offset]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
         let character = source[line_start..offset].encode_utf16().count() as u32;
         (line, character)
     }
@@ -635,10 +657,8 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "plylang-{label}-{}-{nanos}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("plylang-{label}-{}-{nanos}", std::process::id()));
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }

@@ -97,7 +97,9 @@ fn guard_matches_long(text: &str) -> bool {
     let Some(text) = text.strip_prefix(" = import.meta.main === true;\n") else {
         return false;
     };
-    let Some(text) = text.strip_prefix("if (import.meta.main === undefined && process.argv[1]) {\n  try {\n    ") else {
+    let Some(text) = text
+        .strip_prefix("if (import.meta.main === undefined && process.argv[1]) {\n  try {\n    ")
+    else {
         return false;
     };
     let Some(text) = text.strip_prefix(&flag) else {
@@ -294,7 +296,12 @@ pub(super) fn parse_module(src: &str) -> Result<Parsed, String> {
             None => break,
         }
     }
-    Ok(Parsed { imports, reexports, exports, body })
+    Ok(Parsed {
+        imports,
+        reexports,
+        exports,
+        body,
+    })
 }
 
 fn parse_import(scan: &mut Scan<'_>) -> Result<SpecNames, String> {
@@ -622,7 +629,11 @@ fn end_of_number(src: &str, start: usize) -> usize {
     while index < bytes.len() && bytes[index].is_ascii_digit() {
         index += 1;
     }
-    if bytes.get(index) == Some(&b'.') && bytes.get(index + 1).is_some_and(|byte| byte.is_ascii_digit()) {
+    if bytes.get(index) == Some(&b'.')
+        && bytes
+            .get(index + 1)
+            .is_some_and(|byte| byte.is_ascii_digit())
+    {
         index += 1;
         while index < bytes.len() && bytes[index].is_ascii_digit() {
             index += 1;
@@ -726,7 +737,11 @@ fn take_declared(src: &str, start: usize) -> Option<(usize, Option<String>)> {
     if !class && !at_word(src, index, "function") {
         return None;
     }
-    index += if class { "class".len() } else { "function".len() };
+    index += if class {
+        "class".len()
+    } else {
+        "function".len()
+    };
     index = skip_gap(src, index);
     if !class && src[index..].starts_with('*') {
         index = skip_gap(src, index + 1);
@@ -750,7 +765,11 @@ fn take_lexical(src: &str, start: usize) -> (usize, Option<String>) {
     }
     let name = word_at(src, index);
     let (end, comma) = statement_end(src, start);
-    if comma { (end, None) } else { (end, name) }
+    if comma {
+        (end, None)
+    } else {
+        (end, name)
+    }
 }
 
 fn body_end(src: &str, start: usize) -> Option<usize> {
@@ -803,7 +822,10 @@ fn statement_end(src: &str, start: usize) -> (usize, bool) {
             return (src.len(), root_comma);
         }
         let depth_zero = paren == 0 && bracket == 0 && brace == 0;
-        if depth_zero && started && src[before_gap..index].contains('\n') && is_stmt_word(src, index)
+        if depth_zero
+            && started
+            && src[before_gap..index].contains('\n')
+            && is_stmt_word(src, index)
         {
             return (before_gap, root_comma);
         }
@@ -910,7 +932,11 @@ fn collect_template(src: &str, start: usize, names: &mut Vec<String>) -> usize {
                 index = (close + 1).min(bytes.len());
             }
             _ => {
-                index += src[index..].chars().next().map(|ch| ch.len_utf8()).unwrap_or(1);
+                index += src[index..]
+                    .chars()
+                    .next()
+                    .map(|ch| ch.len_utf8())
+                    .unwrap_or(1);
             }
         }
     }
@@ -971,15 +997,22 @@ fn token_at(src: &str, index: usize, value: bool) -> Option<(usize, Tok, bool)> 
     }
     let ch = src[index..].chars().next()?;
     if ch == '"' || ch == '\'' {
-        return Some((end_of_string(src, index).unwrap_or(src.len()), Tok::Lit, true));
+        return Some((
+            end_of_string(src, index).unwrap_or(src.len()),
+            Tok::Lit,
+            true,
+        ));
     }
     if ch == '`' {
-        return Some((end_of_template(src, index).unwrap_or(src.len()), Tok::Lit, true));
+        return Some((
+            end_of_template(src, index).unwrap_or(src.len()),
+            Tok::Lit,
+            true,
+        ));
     }
     if ch.is_ascii_digit() {
         let mut end = end_of_number(src, index);
-        if src[end..].starts_with('n')
-            && !src[end + 1..].chars().next().is_some_and(is_ident_cont)
+        if src[end..].starts_with('n') && !src[end + 1..].chars().next().is_some_and(is_ident_cont)
         {
             end += 1;
         }
@@ -1046,14 +1079,22 @@ fn skip_gap(src: &str, mut index: usize) -> usize {
         if src[index..].starts_with("//") {
             index += 2;
             while index < src.len() && !src[index..].starts_with('\n') {
-                index += src[index..].chars().next().map(|ch| ch.len_utf8()).unwrap_or(1);
+                index += src[index..]
+                    .chars()
+                    .next()
+                    .map(|ch| ch.len_utf8())
+                    .unwrap_or(1);
             }
             continue;
         }
         if src[index..].starts_with("/*") {
             index += 2;
             while index + 1 < src.len() && !src[index..].starts_with("*/") {
-                index += src[index..].chars().next().map(|ch| ch.len_utf8()).unwrap_or(1);
+                index += src[index..]
+                    .chars()
+                    .next()
+                    .map(|ch| ch.len_utf8())
+                    .unwrap_or(1);
             }
             if src[index..].starts_with("*/") {
                 index += 2;
@@ -1065,7 +1106,12 @@ fn skip_gap(src: &str, mut index: usize) -> usize {
 }
 
 fn next_index(src: &str, index: usize) -> usize {
-    index + src[index..].chars().next().map(|ch| ch.len_utf8()).unwrap_or(0)
+    index
+        + src[index..]
+            .chars()
+            .next()
+            .map(|ch| ch.len_utf8())
+            .unwrap_or(0)
 }
 
 fn is_js_keyword(name: &str) -> bool {
@@ -1118,8 +1164,8 @@ fn is_js_keyword(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{references, split_items, strip_entry_guard};
     use super::super::Item;
+    use super::{references, split_items, strip_entry_guard};
 
     #[test]
     fn strips_the_node_entry_guard() {
@@ -1150,7 +1196,8 @@ if (plyIsEntry) main();
         );
         let bare = "export function ping() { return 1; }\n";
         assert_eq!(strip_entry_guard(bare).unwrap(), bare);
-        let leftover = "import { realpathSync as plyRealpath } from \"node:fs\";\nexport function ping() {}\n";
+        let leftover =
+            "import { realpathSync as plyRealpath } from \"node:fs\";\nexport function ping() {}\n";
         assert!(strip_entry_guard(leftover).is_err());
     }
 
@@ -1203,10 +1250,8 @@ export function begin() {}
         assert!(parsed.body.contains("function begin"), "{}", parsed.body);
         assert!(!parsed.body.contains("import "), "{}", parsed.body);
 
-        let kept = super::parse_module(
-            "import { a } from \"./a.js\";\nexport function a() {}\n",
-        )
-        .unwrap();
+        let kept =
+            super::parse_module("import { a } from \"./a.js\";\nexport function a() {}\n").unwrap();
         assert_eq!(kept.imports.len(), 1);
         assert_eq!(kept.imports[0].spec, "./a.js");
         assert!(kept.body.contains("function a"), "{}", kept.body);

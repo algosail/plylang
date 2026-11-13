@@ -74,10 +74,7 @@ fn interface_data(module: &Module, data: &Data) -> String {
 }
 
 fn instance_mentions_unlisted(module: &Module, instance: &Instance) -> bool {
-    instance
-        .args
-        .iter()
-        .any(|ty| type_is_unlisted(module, ty))
+    instance.args.iter().any(|ty| type_is_unlisted(module, ty))
 }
 
 fn type_is_unlisted(module: &Module, ty: &Type) -> bool {
@@ -94,7 +91,9 @@ fn type_is_unlisted(module: &Module, ty: &Type) -> bool {
             .chain(&effect.output.items)
             .any(|ty| type_is_unlisted(module, ty)),
         Type::Record(row) => {
-            row.fields.iter().any(|(_, ty)| type_is_unlisted(module, ty))
+            row.fields
+                .iter()
+                .any(|(_, ty)| type_is_unlisted(module, ty))
                 || row.tail_ty().is_some_and(|ty| type_is_unlisted(module, ty))
         }
     }
@@ -200,5 +199,4 @@ mod tests {
         assert!(text.contains("Nothing"), "{text}");
         assert!(!text.contains("Just"), "{text}");
     }
-
 }

@@ -10,13 +10,13 @@ use crate::ast::{
     StackEffect, StackTail, Synonym, Type,
 };
 use crate::build::{load_surface, stack_sites};
-use crate::surface::{self, Found};
 use crate::builtin;
 use crate::check::StackAt;
 use crate::lexer::tokenize;
 use crate::parser::{is_upper, parse};
 use crate::paths::mode_from_path;
 use crate::span::Span;
+use crate::surface::{self, Found};
 use crate::token::{Token, TokenKind};
 
 pub struct Hover {
@@ -131,12 +131,14 @@ fn blocks(parts: &[String]) -> String {
 }
 
 fn declared_line(path: &Path, module: &Module, name: &str) -> Option<Declared> {
-    local_scheme(module, name).or_else(|| imported_scheme(path, module, name)).or_else(|| {
-        builtin::word(name).map(|word| Declared {
-            line: format!(": {name} ( {} )", word.scheme),
-            doc: word.doc.to_string(),
+    local_scheme(module, name)
+        .or_else(|| imported_scheme(path, module, name))
+        .or_else(|| {
+            builtin::word(name).map(|word| Declared {
+                line: format!(": {name} ( {} )", word.scheme),
+                doc: word.doc.to_string(),
+            })
         })
-    })
 }
 
 fn gap_hover(source: &str, module: &Module, offset: u32, sites: &[StackAt]) -> Option<String> {
@@ -165,7 +167,8 @@ fn gap_hover(source: &str, module: &Module, offset: u32, sites: &[StackAt]) -> O
     let def = module.items.iter().find_map(|item| match item {
         Item::Def(def)
             if (!def.body.is_empty() || !def.clauses.is_empty())
-                && def.span.start <= offset && offset <= def.span.end =>
+                && def.span.start <= offset
+                && offset <= def.span.end =>
         {
             Some(def)
         }
@@ -196,9 +199,11 @@ fn body_window(source: &str, def: &Def) -> Option<(u32, u32)> {
 }
 
 fn stack_at_gap(sites: &[&StackAt], offset: u32) -> Option<String> {
-    if let Some(leaf) = sites.iter().copied().find(|site| {
-        site.span.start <= offset && offset < site.span.end && is_leaf(site, sites)
-    }) {
+    if let Some(leaf) = sites
+        .iter()
+        .copied()
+        .find(|site| site.span.start <= offset && offset < site.span.end && is_leaf(site, sites))
+    {
         return Some(leaf.before.clone());
     }
     let container = sites
@@ -243,7 +248,10 @@ fn is_leaf(site: &StackAt, sites: &[&StackAt]) -> bool {
 
 fn line_start(source: &str, offset: u32) -> u32 {
     let offset = (offset as usize).min(source.len());
-    source[..offset].rfind('\n').map(|index| index + 1).unwrap_or(0) as u32
+    source[..offset]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0) as u32
 }
 
 fn line_end(source: &str, offset: u32) -> u32 {
@@ -329,12 +337,16 @@ fn declared_found(found: &Found, name: &str) -> Option<Declared> {
             line: format!("& {} {}", class.name, class.params.join(" ")),
             doc: class.doc.clone(),
         }),
-        Found::Class(class) => class.methods.iter().find(|method| method.name == name).map(|method| {
-            Declared {
-                line: method_line(class, method),
-                doc: class.doc.clone(),
-            }
-        }),
+        Found::Class(class) => {
+            class
+                .methods
+                .iter()
+                .find(|method| method.name == name)
+                .map(|method| Declared {
+                    line: method_line(class, method),
+                    doc: class.doc.clone(),
+                })
+        }
         Found::Def(_) | Found::Synonym(_) | Found::Place(_) => None,
     }
 }
@@ -500,10 +512,7 @@ mod tests {
     fn hovers_a_class_method_with_its_constraint() {
         let source = "& Eq a\n  eq ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  drop drop true\n\n# Eq Int\n  eq = eqInt\n\n: use ( Int Int -- Bool )\n  eq\n";
         let declared = hover(source, Path::new("M.ply"), 1, 2).unwrap();
-        assert_eq!(
-            declared.contents,
-            "```ply\neq ( Eq a => a a -- Bool )\n```"
-        );
+        assert_eq!(declared.contents, "```ply\neq ( Eq a => a a -- Bool )\n```");
         let use_at = at_offset(source, source.rfind("\n  eq").unwrap() + 3);
         let used = hover(source, Path::new("M.ply"), use_at.0, use_at.1).unwrap();
         assert_eq!(
@@ -537,20 +546,28 @@ mod tests {
         let source = "; Person = Person name : Str, age : Num\n.. A person.\n- Human Person\n\n: older ( Human -- Human )\n  37 >>age\n";
         let at = at(source, "Human --");
         let hovered = hover(source, Path::new("M.ply"), at.0, at.1).unwrap();
-        assert_eq!(
-            hovered.contents,
-            "```ply\n- Human Person\n```\n\nA person."
-        );
+        assert_eq!(hovered.contents, "```ply\n- Human Person\n```\n\nA person.");
     }
 
     #[test]
     fn hovers_a_constructor_from_its_data_declaration() {
         let source = "; Maybe a = Nothing | Just a\n";
         let line = source.lines().next().unwrap();
-        let nothing = hover(source, Path::new("M.ply"), 0, line.find("Nothing").unwrap() as u32)
-            .unwrap();
+        let nothing = hover(
+            source,
+            Path::new("M.ply"),
+            0,
+            line.find("Nothing").unwrap() as u32,
+        )
+        .unwrap();
         assert_eq!(nothing.contents, "```ply\nNothing : -- (Maybe a)\n```");
-        let just = hover(source, Path::new("M.ply"), 0, line.find("Just").unwrap() as u32).unwrap();
+        let just = hover(
+            source,
+            Path::new("M.ply"),
+            0,
+            line.find("Just").unwrap() as u32,
+        )
+        .unwrap();
         assert_eq!(just.contents, "```ply\nJust : a -- (Maybe a)\n```");
     }
 
@@ -609,7 +626,8 @@ mod tests {
 
     #[test]
     fn hovers_a_foreign_type() {
-        let source = ".. A listener list.\n; foreign Hub a\n\n: keep ( (Hub a) -- (Hub a) )\n  hub -> hub\n";
+        let source =
+            ".. A listener list.\n; foreign Hub a\n\n: keep ( (Hub a) -- (Hub a) )\n  hub -> hub\n";
         let declared = at(source, "Hub a");
         let hovered = hover(source, Path::new("M.ply"), declared.0, declared.1).unwrap();
         assert_eq!(
@@ -829,9 +847,9 @@ mod tests {
         let (line, character) = at_offset(source, dup);
         let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
         assert!(
-            hovered.contents.ends_with(
-                "```ply\n(Pair Int Str) -- (Pair Int Str) (Pair Int Str)\n```"
-            ),
+            hovered
+                .contents
+                .ends_with("```ply\n(Pair Int Str) -- (Pair Int Str) (Pair Int Str)\n```"),
             "{}",
             hovered.contents
         );
@@ -878,8 +896,14 @@ mod tests {
     }
 
     fn at_offset(source: &str, offset: usize) -> (u32, u32) {
-        let line = source[..offset].bytes().filter(|byte| *byte == b'\n').count() as u32;
-        let line_start = source[..offset].rfind('\n').map(|index| index + 1).unwrap_or(0);
+        let line = source[..offset]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count() as u32;
+        let line_start = source[..offset]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
         let character = source[line_start..offset].encode_utf16().count() as u32;
         (line, character)
     }

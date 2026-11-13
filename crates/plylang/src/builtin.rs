@@ -8,18 +8,32 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lowering {
     /// Pop `take` values, bottom to top, and push `put` indexes. `0` is the deepest.
-    Shuffle { take: u8, put: &'static [u8] },
+    Shuffle {
+        take: u8,
+        put: &'static [u8],
+    },
     Call,
     /// Hide the top `under` values, run the quotation, then restore them.
-    Dip { under: u8 },
+    Dip {
+        under: u8,
+    },
     /// Run the quotation on the top `keep` values, then push those values again.
-    Keep { keep: u8 },
+    Keep {
+        keep: u8,
+    },
     /// Apply each quotation to the same `vals` values. Each returns one value.
-    Cleave { vals: u8, quots: u8 },
+    Cleave {
+        vals: u8,
+        quots: u8,
+    },
     /// Apply quotation `i` to value `i`. The deepest value is first.
-    Spread { n: u8 },
+    Spread {
+        n: u8,
+    },
     /// Apply one quotation to each of `n` values of the same type.
-    Each { n: u8 },
+    Each {
+        n: u8,
+    },
     If,
     Quote,
     /// Push the value under the quotation, then run the quotation.
@@ -55,13 +69,34 @@ const fn w(
 }
 
 pub const TYPES: &[Type] = &[
-    Type { name: "Int", arity: 0 },
-    Type { name: "Num", arity: 0 },
-    Type { name: "Str", arity: 0 },
-    Type { name: "Bool", arity: 0 },
-    Type { name: "Unit", arity: 0 },
-    Type { name: "Array", arity: 1 },
-    Type { name: "StrMap", arity: 1 },
+    Type {
+        name: "Int",
+        arity: 0,
+    },
+    Type {
+        name: "Num",
+        arity: 0,
+    },
+    Type {
+        name: "Str",
+        arity: 0,
+    },
+    Type {
+        name: "Bool",
+        arity: 0,
+    },
+    Type {
+        name: "Unit",
+        arity: 0,
+    },
+    Type {
+        name: "Array",
+        arity: 1,
+    },
+    Type {
+        name: "StrMap",
+        arity: 1,
+    },
 ];
 
 pub const WORDS: &[Word] = &[
@@ -273,11 +308,7 @@ mod tests {
             assert!(!word.doc.is_empty(), "builtin {} has no doc", word.name);
             if let Lowering::Shuffle { take, put } = word.lowering {
                 for index in put {
-                    assert!(
-                        *index < take,
-                        "{} puts index {index} of {take}",
-                        word.name
-                    );
+                    assert!(*index < take, "{} puts index {index} of {take}", word.name);
                 }
             }
         }

@@ -20,7 +20,10 @@ pub enum Error {
     ExpectedLanguageDirective,
     LanguageDirectiveInSource,
     ExpectedLanguageVersion,
-    LanguageTooNew { version: u32, compiler: u32 },
+    LanguageTooNew {
+        version: u32,
+        compiler: u32,
+    },
     DocNotOnDeclaration,
     ImportAfterDeclaration,
     DeclarationColumn,
@@ -69,31 +72,60 @@ pub enum Error {
     CannotRedefineBuiltin(String),
     CyclicType(String),
     TypeVariableNotQuantified(String),
-    TypeConstructorArity { name: String, count: usize },
+    TypeConstructorArity {
+        name: String,
+        count: usize,
+    },
     DuplicateField(String),
-    TypeMismatch { expected: String, found: String },
+    TypeMismatch {
+        expected: String,
+        found: String,
+    },
     ExpectedRecord(String),
     ExpectedDataType(String),
     StackUnderflow,
     OccursCheck,
-    KindMismatch { expected: String, found: String },
+    KindMismatch {
+        expected: String,
+        found: String,
+    },
     DuplicateEffect(String),
-    EffectMismatch { expected: String, found: String },
-    EffectNotOpen { found: String },
+    EffectMismatch {
+        expected: String,
+        found: String,
+    },
+    EffectNotOpen {
+        found: String,
+    },
     RecordHasNoField(String),
     RecordTailOpen,
     QuotationArityUnknown,
     RedundantPattern,
     NonExhaustive,
     NonExhaustiveExamples(String),
-    PatternArity { name: String, count: usize },
-    ConstructorNotOf { name: String, type_name: String },
+    PatternArity {
+        name: String,
+        count: usize,
+    },
+    ConstructorNotOf {
+        name: String,
+        type_name: String,
+    },
     UndefinedClass(String),
     ClassNeedsParameter(String),
-    ClassArity { name: String, count: usize },
+    ClassArity {
+        name: String,
+        count: usize,
+    },
     CyclicSuperclass(String),
-    MethodNotOf { name: String, classes: String },
-    MethodOfSeveral { name: String, owners: String },
+    MethodNotOf {
+        name: String,
+        classes: String,
+    },
+    MethodOfSeveral {
+        name: String,
+        owners: String,
+    },
     OrphanInstance,
     MissingMethod(String),
     InstanceWordPrivate(String),
@@ -101,7 +133,10 @@ pub enum Error {
     NoInstance(String),
     AmbiguousConstraint(String),
     CyclicInstance(String),
-    ImportNotExported { path: String, name: String },
+    ImportNotExported {
+        path: String,
+        name: String,
+    },
     CannotResolveImport(String),
     ImportCycle(String),
     ModuleNotExported(String),
@@ -139,7 +174,10 @@ pub enum Error {
     /// `name>>` or `>>name` when the field is not the same on every constructor.
     FieldOfSeveralConstructors(String),
     /// The single constructor does not have this field.
-    NoSuchField { type_name: String, name: String },
+    NoSuchField {
+        type_name: String,
+        name: String,
+    },
     /// A source module imported a package listed only in `devDependencies`.
     DevDependency(String),
     /// A utility under `test/` uses the module path of a source module.
@@ -252,9 +290,10 @@ impl Error {
             ExpectedName => static_text("PL0049", "expected name"),
             UnterminatedArray => static_text("PL0050", "unterminated array"),
             UnterminatedQuotation => static_text("PL0051", "unterminated quotation"),
-            TypeConstructorCase => {
-                static_text("PL0052", "type constructor must start with an uppercase letter")
-            }
+            TypeConstructorCase => static_text(
+                "PL0052",
+                "type constructor must start with an uppercase letter",
+            ),
             DuplicateDefinition(name) => ("PL0053", format!("duplicate definition {name}")),
             UndefinedWord(name) => ("PL0054", format!("undefined word {name}")),
             UndefinedType(name) => ("PL0055", format!("undefined type {name}")),
@@ -343,10 +382,9 @@ impl Error {
                 ("PL0089", format!("ambiguous constraint {constraint}"))
             }
             CyclicInstance(key) => ("PL0090", format!("cyclic instance: {key}")),
-            ImportNotExported { path, name } => (
-                "PL0091",
-                format!("~ \"{path}\" does not export {name}"),
-            ),
+            ImportNotExported { path, name } => {
+                ("PL0091", format!("~ \"{path}\" does not export {name}"))
+            }
             CannotResolveImport(path) => ("PL0092", format!("cannot resolve ~ \"{path}\"")),
             ImportCycle(names) => ("PL0093", format!("import cycle: {names}")),
             ModuleNotExported(name) => ("PL0094", format!("module {name} is not exported")),
@@ -364,9 +402,10 @@ impl Error {
             PackageJsonLanguage => {
                 static_text("PL0103", "package.json ply.language must be a number")
             }
-            OutSameAsSource => {
-                static_text("PL0104", "ply.out must be a different directory from ply.source")
-            }
+            OutSameAsSource => static_text(
+                "PL0104",
+                "ply.out must be a different directory from ply.source",
+            ),
             PackageJsonForeign => {
                 static_text("PL0105", "package.json ply.foreign must be a string")
             }
@@ -409,18 +448,14 @@ impl Error {
                 "PL0122",
                 format!("test module {path} is already a source module"),
             ),
-            PackageJsonEntry => {
-                static_text("PL0123", "package.json ply.entry must be a string")
-            }
+            PackageJsonEntry => static_text("PL0123", "package.json ply.entry must be a string"),
             EntryModule(name) => (
                 "PL0124",
                 format!("ply.entry module {name} is not in the source"),
             ),
             MissingPublicList => static_text("PL0125", "module has no name list"),
             PublicName(name) => ("PL0126", format!("listed name {name} is not defined")),
-            PackageJsonTarget => {
-                static_text("PL0127", "package.json ply.target is not a field")
-            }
+            PackageJsonTarget => static_text("PL0127", "package.json ply.target is not a field"),
             PublicNotHere => static_text("PL0128", "@ is the module's name list"),
             BrowserEntry => static_text(
                 "PL0129",
@@ -431,18 +466,12 @@ impl Error {
                 format!("path \"{path}\" must stay inside the package"),
             ),
             BrowserLoad(spec) => ("PL0130", format!("compile cannot load \"{spec}\"")),
-            PrivateInScheme(name) => (
-                "PL0131",
-                format!("public scheme mentions private {name}"),
-            ),
+            PrivateInScheme(name) => ("PL0131", format!("public scheme mentions private {name}")),
             FieldsPrivate(name) => ("PL0132", format!("fields of {name} are private")),
             ImportClosed => static_text("PL0133", "import is already complete"),
             PlaceNotReady(name) => ("PL0134", format!("place {name} is not ready")),
             UndefinedPlace(name) => ("PL0135", format!("no place {name}")),
-            PatternForm(name) => (
-                "PL0136",
-                format!("pattern {name} needs a field name or .."),
-            ),
+            PatternForm(name) => ("PL0136", format!("pattern {name} needs a field name or ..")),
             PatternCannotTest(ty) => ("PL0137", format!("pattern cannot test {ty}")),
         }
     }
@@ -453,7 +482,11 @@ fn static_text(code: &'static str, message: &'static str) -> (&'static str, Stri
 }
 
 fn noun(count: usize, one: &'static str, many: &'static str) -> &'static str {
-    if count == 1 { one } else { many }
+    if count == 1 {
+        one
+    } else {
+        many
+    }
 }
 
 #[cfg(test)]
@@ -466,23 +499,42 @@ mod tests {
         let samples = [
             (Error::UnexpectedCharacter, "unexpected character", "PL0001"),
             (Error::UnterminatedString, "unterminated string", "PL0002"),
-            (Error::UnknownStringEscape, "unknown string escape", "PL0003"),
+            (
+                Error::UnknownStringEscape,
+                "unknown string escape",
+                "PL0003",
+            ),
             (Error::StrayDash, "stray '-'", "PL0004"),
-            (Error::ExpectedExponentDigits, "expected exponent digits", "PL0005"),
+            (
+                Error::ExpectedExponentDigits,
+                "expected exponent digits",
+                "PL0005",
+            ),
             (
                 Error::TypeVariableCase,
                 "type variable must start with a lowercase letter",
                 "PL0006",
             ),
-            (Error::ExpectedLanguageDirective, "expected language directive", "PL0007"),
+            (
+                Error::ExpectedLanguageDirective,
+                "expected language directive",
+                "PL0007",
+            ),
             (
                 Error::LanguageDirectiveInSource,
                 "language directive is only valid in an interface",
                 "PL0008",
             ),
-            (Error::ExpectedLanguageVersion, "expected language version", "PL0009"),
             (
-                Error::LanguageTooNew { version: 2, compiler: 1 },
+                Error::ExpectedLanguageVersion,
+                "expected language version",
+                "PL0009",
+            ),
+            (
+                Error::LanguageTooNew {
+                    version: 2,
+                    compiler: 1,
+                },
                 "language version 2 is newer than this compiler (1)",
                 "PL0010",
             ),
@@ -491,55 +543,131 @@ mod tests {
                 "doc comment must sit above a declaration",
                 "PL0011",
             ),
-            (Error::ImportAfterDeclaration, "import must come before declarations", "PL0012"),
-            (Error::DeclarationColumn, "declaration must start at column 0", "PL0013"),
+            (
+                Error::ImportAfterDeclaration,
+                "import must come before declarations",
+                "PL0012",
+            ),
+            (
+                Error::DeclarationColumn,
+                "declaration must start at column 0",
+                "PL0013",
+            ),
             (Error::ExpectedDeclaration, "expected declaration", "PL0014"),
             (Error::ExpectedImportPath, "expected import path", "PL0015"),
-            (Error::ExpectedImportedName, "expected imported name", "PL0016"),
+            (
+                Error::ExpectedImportedName,
+                "expected imported name",
+                "PL0016",
+            ),
             (Error::ExpectedLParen, "expected '('", "PL0017"),
             (Error::ExpectedRParen, "expected ')'", "PL0018"),
             (Error::ExpectedTypeName, "expected type name", "PL0019"),
-            (Error::ExpectedTypeVariable, "expected type variable", "PL0020"),
+            (
+                Error::ExpectedTypeVariable,
+                "expected type variable",
+                "PL0020",
+            ),
             (Error::ExpectedEq, "expected '='", "PL0021"),
             (Error::ExpectedConstructor, "expected constructor", "PL0022"),
-            (Error::NewtypeOneConstructor, "newtype expects one constructor", "PL0023"),
-            (Error::NewtypeOneField, "newtype expects one field", "PL0024"),
-            (Error::DuplicateTypeVariable("a".into()), "duplicate type variable a", "PL0025"),
-            (Error::ExpectedDefinitionName, "expected definition name", "PL0026"),
+            (
+                Error::NewtypeOneConstructor,
+                "newtype expects one constructor",
+                "PL0023",
+            ),
+            (
+                Error::NewtypeOneField,
+                "newtype expects one field",
+                "PL0024",
+            ),
+            (
+                Error::DuplicateTypeVariable("a".into()),
+                "duplicate type variable a",
+                "PL0025",
+            ),
+            (
+                Error::ExpectedDefinitionName,
+                "expected definition name",
+                "PL0026",
+            ),
             (Error::ExpectedColon, "expected ':'", "PL0027"),
-            (Error::ForeignHasBody, "foreign declaration has a body", "PL0028"),
-            (Error::InterfaceHasBody, "interface declaration has a body", "PL0029"),
+            (
+                Error::ForeignHasBody,
+                "foreign declaration has a body",
+                "PL0028",
+            ),
+            (
+                Error::InterfaceHasBody,
+                "interface declaration has a body",
+                "PL0029",
+            ),
             (Error::MissingBody, "missing body", "PL0030"),
             (Error::ExpectedTerm, "expected term", "PL0031"),
             (Error::ExpectedArrow, "expected '->'", "PL0032"),
             (Error::ExpectedPattern, "expected pattern", "PL0033"),
-            (Error::ExpectedPatternCount(2), "expected 2 patterns", "PL0034"),
+            (
+                Error::ExpectedPatternCount(2),
+                "expected 2 patterns",
+                "PL0034",
+            ),
             (Error::ExpectedFieldName, "expected field name", "PL0035"),
             (Error::ExpectedRBrace, "expected '}'", "PL0036"),
             (Error::DuplicateFieldName, "duplicate field name", "PL0037"),
-            (Error::ExpectedClassArgument, "expected class argument", "PL0038"),
+            (
+                Error::ExpectedClassArgument,
+                "expected class argument",
+                "PL0038",
+            ),
             (Error::ExpectedClassName, "expected class name", "PL0039"),
             (Error::ExpectedMethodName, "expected method name", "PL0040"),
             (Error::ExpectedWord, "expected word", "PL0041"),
             (Error::ExpectedFatArrow, "expected '=>'", "PL0042"),
             (Error::ExpectedDot, "expected '.'", "PL0043"),
             (Error::ExpectedStackArrow, "expected '--'", "PL0044"),
-            (Error::StackTailNotBottom, "stack tail must be the bottom", "PL0045"),
+            (
+                Error::StackTailNotBottom,
+                "stack tail must be the bottom",
+                "PL0045",
+            ),
             (Error::ExpectedType, "expected type", "PL0046"),
-            (Error::ExpectedRowVariable, "expected row variable", "PL0047"),
+            (
+                Error::ExpectedRowVariable,
+                "expected row variable",
+                "PL0047",
+            ),
             (Error::ExpectedElement, "expected element", "PL0048"),
             (Error::ExpectedName, "expected name", "PL0049"),
             (Error::UnterminatedArray, "unterminated array", "PL0050"),
-            (Error::UnterminatedQuotation, "unterminated quotation", "PL0051"),
+            (
+                Error::UnterminatedQuotation,
+                "unterminated quotation",
+                "PL0051",
+            ),
             (
                 Error::TypeConstructorCase,
                 "type constructor must start with an uppercase letter",
                 "PL0052",
             ),
-            (Error::DuplicateDefinition("f".into()), "duplicate definition f", "PL0053"),
-            (Error::UndefinedWord("nope".into()), "undefined word nope", "PL0054"),
-            (Error::UndefinedType("Maybe".into()), "undefined type Maybe", "PL0055"),
-            (Error::CannotRedefineBuiltin("dup".into()), "cannot redefine builtin dup", "PL0056"),
+            (
+                Error::DuplicateDefinition("f".into()),
+                "duplicate definition f",
+                "PL0053",
+            ),
+            (
+                Error::UndefinedWord("nope".into()),
+                "undefined word nope",
+                "PL0054",
+            ),
+            (
+                Error::UndefinedType("Maybe".into()),
+                "undefined type Maybe",
+                "PL0055",
+            ),
+            (
+                Error::CannotRedefineBuiltin("dup".into()),
+                "cannot redefine builtin dup",
+                "PL0056",
+            ),
             (Error::CyclicType("A".into()), "cyclic type A", "PL0057"),
             (
                 Error::TypeVariableNotQuantified("a".into()),
@@ -547,13 +675,23 @@ mod tests {
                 "PL0058",
             ),
             (
-                Error::TypeConstructorArity { name: "Maybe".into(), count: 1 },
+                Error::TypeConstructorArity {
+                    name: "Maybe".into(),
+                    count: 1,
+                },
                 "type constructor Maybe expects 1 argument",
                 "PL0059",
             ),
-            (Error::DuplicateField("city".into()), "duplicate field city", "PL0060"),
             (
-                Error::TypeMismatch { expected: "Int".into(), found: "Str".into() },
+                Error::DuplicateField("city".into()),
+                "duplicate field city",
+                "PL0060",
+            ),
+            (
+                Error::TypeMismatch {
+                    expected: "Int".into(),
+                    found: "Str".into(),
+                },
                 "type mismatch: expected Int, found Str",
                 "PL0061",
             ),
@@ -570,72 +708,142 @@ mod tests {
             (Error::StackUnderflow, "stack underflow", "PL0064"),
             (Error::OccursCheck, "occurs check failed", "PL0065"),
             (
-                Error::KindMismatch { expected: "Type".into(), found: "Type -> Type".into() },
+                Error::KindMismatch {
+                    expected: "Type".into(),
+                    found: "Type -> Type".into(),
+                },
                 "kind mismatch: expected Type, found Type -> Type",
                 "PL0066",
             ),
-            (Error::DuplicateEffect("io".into()), "duplicate effect io", "PL0067"),
             (
-                Error::EffectMismatch { expected: "{ io }".into(), found: "{ console }".into() },
+                Error::DuplicateEffect("io".into()),
+                "duplicate effect io",
+                "PL0067",
+            ),
+            (
+                Error::EffectMismatch {
+                    expected: "{ io }".into(),
+                    found: "{ console }".into(),
+                },
                 "effect mismatch: expected { io }, found { console }",
                 "PL0068",
             ),
             (
-                Error::EffectNotOpen { found: "{ console }".into() },
+                Error::EffectNotOpen {
+                    found: "{ console }".into(),
+                },
                 "effect mismatch: expected { | _ }, found { console }",
                 "PL0069",
             ),
-            (Error::RecordHasNoField("age".into()), "record has no field age", "PL0070"),
-            (Error::RecordTailOpen, "record tail must be closed", "PL0071"),
-            (Error::QuotationArityUnknown, "quotation arity is not known", "PL0072"),
+            (
+                Error::RecordHasNoField("age".into()),
+                "record has no field age",
+                "PL0070",
+            ),
+            (
+                Error::RecordTailOpen,
+                "record tail must be closed",
+                "PL0071",
+            ),
+            (
+                Error::QuotationArityUnknown,
+                "quotation arity is not known",
+                "PL0072",
+            ),
             (Error::RedundantPattern, "redundant pattern", "PL0073"),
             (Error::NonExhaustive, "non-exhaustive match", "PL0074"),
-            (Error::NonExhaustiveExamples("Just".into()), "non-exhaustive match: Just", "PL0075"),
             (
-                Error::PatternArity { name: "Just".into(), count: 1 },
+                Error::NonExhaustiveExamples("Just".into()),
+                "non-exhaustive match: Just",
+                "PL0075",
+            ),
+            (
+                Error::PatternArity {
+                    name: "Just".into(),
+                    count: 1,
+                },
                 "pattern Just expects 1 field",
                 "PL0076",
             ),
             (
-                Error::ConstructorNotOf { name: "Left".into(), type_name: "Maybe".into() },
+                Error::ConstructorNotOf {
+                    name: "Left".into(),
+                    type_name: "Maybe".into(),
+                },
                 "constructor Left is not a constructor of Maybe",
                 "PL0077",
             ),
-            (Error::UndefinedClass("Show".into()), "undefined class Show", "PL0078"),
-            (Error::ClassNeedsParameter("Eq".into()), "class Eq expects a parameter", "PL0079"),
             (
-                Error::ClassArity { name: "Eq".into(), count: 1 },
+                Error::UndefinedClass("Show".into()),
+                "undefined class Show",
+                "PL0078",
+            ),
+            (
+                Error::ClassNeedsParameter("Eq".into()),
+                "class Eq expects a parameter",
+                "PL0079",
+            ),
+            (
+                Error::ClassArity {
+                    name: "Eq".into(),
+                    count: 1,
+                },
                 "class Eq expects 1 argument",
                 "PL0080",
             ),
-            (Error::CyclicSuperclass("Eq".into()), "cyclic superclass: Eq", "PL0081"),
             (
-                Error::MethodNotOf { name: "eq".into(), classes: "Ord".into() },
+                Error::CyclicSuperclass("Eq".into()),
+                "cyclic superclass: Eq",
+                "PL0081",
+            ),
+            (
+                Error::MethodNotOf {
+                    name: "eq".into(),
+                    classes: "Ord".into(),
+                },
                 "method eq is not a method of Ord",
                 "PL0082",
             ),
             (
-                Error::MethodOfSeveral { name: "eq".into(), owners: "Eq and Also".into() },
+                Error::MethodOfSeveral {
+                    name: "eq".into(),
+                    owners: "Eq and Also".into(),
+                },
                 "method eq is a method of Eq and Also",
                 "PL0083",
             ),
             (Error::OrphanInstance, "orphan instance", "PL0084"),
-            (Error::MissingMethod("eq".into()), "missing method eq", "PL0085"),
+            (
+                Error::MissingMethod("eq".into()),
+                "missing method eq",
+                "PL0085",
+            ),
             (
                 Error::InstanceWordPrivate("eqInt".into()),
                 "instance word eqInt is private",
                 "PL0086",
             ),
             (Error::IncoherentInstance, "incoherent instance", "PL0087"),
-            (Error::NoInstance("Eq Int".into()), "no instance for Eq Int", "PL0088"),
-            (Error::AmbiguousConstraint("Eq _".into()), "ambiguous constraint Eq _", "PL0089"),
+            (
+                Error::NoInstance("Eq Int".into()),
+                "no instance for Eq Int",
+                "PL0088",
+            ),
+            (
+                Error::AmbiguousConstraint("Eq _".into()),
+                "ambiguous constraint Eq _",
+                "PL0089",
+            ),
             (
                 Error::CyclicInstance("Eq (Maybe Int)".into()),
                 "cyclic instance: Eq (Maybe Int)",
                 "PL0090",
             ),
             (
-                Error::ImportNotExported { path: "Data/Maybe".into(), name: "hidden".into() },
+                Error::ImportNotExported {
+                    path: "Data/Maybe".into(),
+                    name: "hidden".into(),
+                },
                 "~ \"Data/Maybe\" does not export hidden",
                 "PL0091",
             ),
@@ -661,32 +869,80 @@ mod tests {
             ),
             (Error::EmptyModulePath, "empty module path", "PL0096"),
             (Error::EmptyPathSegment, "empty path segment", "PL0097"),
-            (Error::ExpectedPlyPath, "expected a .ply or .d.ply path", "PL0098"),
-            (Error::PackageJsonInvalid, "package.json is not valid JSON", "PL0099"),
-            (Error::PackageJsonNoPly, "package.json has no \"ply\" field", "PL0100"),
-            (Error::PackageJsonSource, "package.json ply.source must be a string", "PL0101"),
-            (Error::PackageJsonOut, "package.json ply.out must be a string", "PL0102"),
-            (Error::PackageJsonLanguage, "package.json ply.language must be a number", "PL0103"),
+            (
+                Error::ExpectedPlyPath,
+                "expected a .ply or .d.ply path",
+                "PL0098",
+            ),
+            (
+                Error::PackageJsonInvalid,
+                "package.json is not valid JSON",
+                "PL0099",
+            ),
+            (
+                Error::PackageJsonNoPly,
+                "package.json has no \"ply\" field",
+                "PL0100",
+            ),
+            (
+                Error::PackageJsonSource,
+                "package.json ply.source must be a string",
+                "PL0101",
+            ),
+            (
+                Error::PackageJsonOut,
+                "package.json ply.out must be a string",
+                "PL0102",
+            ),
+            (
+                Error::PackageJsonLanguage,
+                "package.json ply.language must be a number",
+                "PL0103",
+            ),
             (
                 Error::OutSameAsSource,
                 "ply.out must be a different directory from ply.source",
                 "PL0104",
             ),
-            (Error::PackageJsonForeign, "package.json ply.foreign must be a string", "PL0105"),
+            (
+                Error::PackageJsonForeign,
+                "package.json ply.foreign must be a string",
+                "PL0105",
+            ),
             (
                 Error::ForeignSameDirectory,
                 "ply.foreign must be a different directory from ply.source and ply.out",
                 "PL0106",
             ),
-            (Error::PackageJsonNoForeign, "package.json has no \"ply.foreign\" field", "PL0107"),
-            (Error::ForeignNotExported("add".into()), "foreign word add is not exported", "PL0108"),
             (
-                Error::ForeignArity { name: "add".into(), expected: 2, found: 1 },
+                Error::PackageJsonNoForeign,
+                "package.json has no \"ply.foreign\" field",
+                "PL0107",
+            ),
+            (
+                Error::ForeignNotExported("add".into()),
+                "foreign word add is not exported",
+                "PL0108",
+            ),
+            (
+                Error::ForeignArity {
+                    name: "add".into(),
+                    expected: 2,
+                    found: 1,
+                },
                 "foreign word add expects 2 parameters, found 1",
                 "PL0109",
             ),
-            (Error::PackageJsonNotObject, "package.json must be an object", "PL0110"),
-            (Error::SourceDirectoryNotFound, "source directory not found", "PL0111"),
+            (
+                Error::PackageJsonNotObject,
+                "package.json must be an object",
+                "PL0110",
+            ),
+            (
+                Error::SourceDirectoryNotFound,
+                "source directory not found",
+                "PL0111",
+            ),
             (Error::Os("disk full".into()), "disk full", "PL0112"),
             (Error::Frozen, "frozen", "PL0113"),
             (Error::Arity, "arity", "PL0114"),
@@ -705,14 +961,21 @@ mod tests {
                 "a constructor with several fields names each one",
                 "PL0117",
             ),
-            (Error::SingleFieldUnnamed, "a single field has no name", "PL0118"),
+            (
+                Error::SingleFieldUnnamed,
+                "a single field has no name",
+                "PL0118",
+            ),
             (
                 Error::FieldOfSeveralConstructors("at".into()),
                 "field at is not the same on every constructor",
                 "PL0119",
             ),
             (
-                Error::NoSuchField { type_name: "Entry".into(), name: "city".into() },
+                Error::NoSuchField {
+                    type_name: "Entry".into(),
+                    name: "city".into(),
+                },
                 "Entry has no field city",
                 "PL0120",
             ),
@@ -781,11 +1044,7 @@ mod tests {
                 "fields of Box are private",
                 "PL0132",
             ),
-            (
-                Error::ImportClosed,
-                "import is already complete",
-                "PL0133",
-            ),
+            (Error::ImportClosed, "import is already complete", "PL0133"),
             (
                 Error::PlaceNotReady("base".into()),
                 "place base is not ready",
@@ -828,7 +1087,11 @@ mod tests {
             "expected 1 pattern"
         );
         assert_eq!(
-            Error::TypeConstructorArity { name: "Pair".into(), count: 2 }.message(),
+            Error::TypeConstructorArity {
+                name: "Pair".into(),
+                count: 2
+            }
+            .message(),
             "type constructor Pair expects 2 arguments"
         );
     }

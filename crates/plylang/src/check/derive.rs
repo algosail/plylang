@@ -175,9 +175,8 @@ impl Checker {
             return false;
         }
         let source = format!(": {name} {scheme}\n  drop\n");
-        let parsed = parse(&source, ParseMode::Source).unwrap_or_else(|error| {
-            panic!("derive helper {name}: {}\n{source}", error.message)
-        });
+        let parsed = parse(&source, ParseMode::Source)
+            .unwrap_or_else(|error| panic!("derive helper {name}: {}\n{source}", error.message));
         let Some(Item::Def(def)) = parsed.items.into_iter().next() else {
             panic!("derive helper {name} has no word\n{source}");
         };
@@ -185,7 +184,8 @@ impl Checker {
         self.relax_visibility = true;
         let registered = self.register_def(&def);
         self.relax_visibility = saved;
-        registered.unwrap_or_else(|error| panic!("derive helper {name}: {}\n{source}", error.message));
+        registered
+            .unwrap_or_else(|error| panic!("derive helper {name}: {}\n{source}", error.message));
         true
     }
 
@@ -238,7 +238,9 @@ impl Checker {
         }
         if prefix == "compare"
             && data.ctors.iter().any(|ctor| ctor.fields.len() > 1)
-            && self.words.contains_key(&format!("plyOrdering{}", data.name))
+            && self
+                .words
+                .contains_key(&format!("plyOrdering{}", data.name))
         {
             return false;
         }
@@ -267,7 +269,10 @@ impl Checker {
         source: &str,
     ) -> Result<Option<Vec<Item>>, Diagnostic> {
         let parsed = parse(source, ParseMode::Source).unwrap_or_else(|error| {
-            panic!("derived {} for {}: {}\n{source}", data.name, data.name, error.message)
+            panic!(
+                "derived {} for {}: {}\n{source}",
+                data.name, data.name, error.message
+            )
         });
         let mut defs = Vec::new();
         let mut instance = None;
@@ -331,7 +336,11 @@ impl Checker {
                 if error.code == "PL0088" {
                     return Ok(None);
                 }
-                return Err(Diagnostic::with_code(data.name_span, error.code, error.message));
+                return Err(Diagnostic::with_code(
+                    data.name_span,
+                    error.code,
+                    error.message,
+                ));
             }
         }
         self.sites.truncate(sites);
@@ -563,7 +572,10 @@ fn ctor_wild(name: &str, fields: usize) -> String {
     if fields == 0 {
         return format!("({name})");
     }
-    let names = std::iter::repeat("_").take(fields).collect::<Vec<_>>().join(" ");
+    let names = std::iter::repeat("_")
+        .take(fields)
+        .collect::<Vec<_>>()
+        .join(" ");
     format!("({name} {names})")
 }
 

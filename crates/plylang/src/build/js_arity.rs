@@ -254,9 +254,7 @@ fn comment_end(bytes: &[u8], index: usize) -> Option<usize> {
     }
     if bytes[index + 1] == b'*' {
         let mut index = index + 2;
-        while index + 1 < bytes.len()
-            && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
-        {
+        while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
             index += 1;
         }
         return Some((index + 2).min(bytes.len()));
@@ -418,7 +416,10 @@ mod tests {
             JsExport::Arity(1)
         ));
         assert!(matches!(
-            exported_arity("export const add = function add(a, b, c) { return a; }", "add"),
+            exported_arity(
+                "export const add = function add(a, b, c) { return a; }",
+                "add"
+            ),
             JsExport::Arity(3)
         ));
         assert!(matches!(
@@ -470,5 +471,4 @@ mod tests {
             JsExport::Arity(2)
         ));
     }
-
 }

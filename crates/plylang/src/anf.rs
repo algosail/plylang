@@ -204,7 +204,11 @@ pub fn local_name(id: LocalId) -> String {
 
 /// The discriminant owns the key `tag`. A field of that name is stored beside it.
 pub(crate) fn field_key(name: &str) -> &str {
-    if name == "tag" { "$tag" } else { name }
+    if name == "tag" {
+        "$tag"
+    } else {
+        name
+    }
 }
 
 /// The module that wrote the `#` whose word `local` calls.
@@ -518,7 +522,11 @@ fn render_conds(conds: &[Cond]) -> String {
     if conds.is_empty() {
         return "true".to_string();
     }
-    conds.iter().map(render_cond).collect::<Vec<_>>().join(" && ")
+    conds
+        .iter()
+        .map(render_cond)
+        .collect::<Vec<_>>()
+        .join(" && ")
 }
 
 fn render_cond(cond: &Cond) -> String {
@@ -597,16 +605,12 @@ fn render_value(value: &Value) -> String {
                 .join(", ");
             format!("{}({args})", js_ident(name))
         }
-        Value::Call { word, args } if word == "#show_cat" => format!(
-            "({} + {})",
-            local_name(args[0]),
-            local_name(args[1])
-        ),
-        Value::Call { word, args } if word == "#hash_mix" => format!(
-            "({} * 31n + {})",
-            local_name(args[0]),
-            local_name(args[1])
-        ),
+        Value::Call { word, args } if word == "#show_cat" => {
+            format!("({} + {})", local_name(args[0]), local_name(args[1]))
+        }
+        Value::Call { word, args } if word == "#hash_mix" => {
+            format!("({} * 31n + {})", local_name(args[0]), local_name(args[1]))
+        }
         Value::Call { word, args } => {
             let list = args
                 .iter()
@@ -722,11 +726,12 @@ fn render_dict(fields: &[DictField]) -> String {
         .map(|field| match &field.value {
             DictValue::Word(word) => format!("{}: {}", field.name, js_ident(word)),
             DictValue::Local(id) => format!("{}: {}", field.name, local_name(*id)),
-            DictValue::Closure { params, dicts, word } => {
-                let names = params
-                    .iter()
-                    .map(|id| local_name(*id))
-                    .collect::<Vec<_>>();
+            DictValue::Closure {
+                params,
+                dicts,
+                word,
+            } => {
+                let names = params.iter().map(|id| local_name(*id)).collect::<Vec<_>>();
                 let mut call = dicts.iter().map(|id| local_name(*id)).collect::<Vec<_>>();
                 call.extend(names.iter().cloned());
                 format!(
@@ -989,8 +994,14 @@ fn write_anf_value(
                 }
                 match &field.value {
                     DictValue::Word(word) => write!(formatter, "{}: {word}", field.name)?,
-                    DictValue::Local(id) => write!(formatter, "{}: {}", field.name, local_name(*id))?,
-                    DictValue::Closure { params, dicts, word } => {
+                    DictValue::Local(id) => {
+                        write!(formatter, "{}: {}", field.name, local_name(*id))?
+                    }
+                    DictValue::Closure {
+                        params,
+                        dicts,
+                        word,
+                    } => {
                         let names = params
                             .iter()
                             .map(|id| local_name(*id))

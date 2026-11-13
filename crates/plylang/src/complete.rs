@@ -8,14 +8,16 @@ use crate::ast::{
     method_line, scheme_string, type_string, Class, Ctor, Data, Def, Item, MethodSig, Module,
     Scheme, Stack, StackEffect, StackTail, Type,
 };
-use crate::build::{available_import_paths, load_provider, load_surface, provider_file, read_module, stack_sites};
-use crate::check::StackAt;
-use crate::surface::{self, Found};
+use crate::build::{
+    available_import_paths, load_provider, load_surface, provider_file, read_module, stack_sites,
+};
 use crate::builtin::{self, Lowering};
+use crate::check::StackAt;
 use crate::lexer::tokenize;
 use crate::parser::{is_lower, is_upper, parse};
 use crate::paths::mode_from_path;
 use crate::span::{byte_offset, Span};
+use crate::surface::{self, Found};
 use crate::token::{Token, TokenKind};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -72,9 +74,11 @@ pub fn complete(source: &str, path: &Path, line: u32, character: u32) -> Vec<Com
         Context::Keyword => keywords(path.to_string_lossy().ends_with(".d.ply"), replace),
         Context::Modifier { foreign } => modifiers(foreign, replace),
         Context::ImportPath { quoted } => import_paths(path, replace, quoted),
-        Context::ImportName { path: import, seen, closed } => {
-            import_names(path, &import, &seen, closed, replace)
-        }
+        Context::ImportName {
+            path: import,
+            seen,
+            closed,
+        } => import_names(path, &import, &seen, closed, replace),
         Context::Type { vars } => {
             let module = parsed_module(source, path, offset);
             type_names(path, module.as_ref(), &vars, replace)
@@ -86,7 +90,15 @@ pub fn complete(source: &str, path: &Path, line: u32, character: u32) -> Vec<Com
                 let label = format!("{name}>>");
                 push(
                     &mut items,
-                    entry(&label, &label, CompletionKind::Field, &detail, "", "1", replace),
+                    entry(
+                        &label,
+                        &label,
+                        CompletionKind::Field,
+                        &detail,
+                        "",
+                        "1",
+                        replace,
+                    ),
                 );
             }
             items
@@ -99,10 +111,20 @@ pub fn complete(source: &str, path: &Path, line: u32, character: u32) -> Vec<Com
 enum Context {
     None,
     Keyword,
-    Modifier { foreign: bool },
-    ImportPath { quoted: bool },
-    ImportName { path: String, seen: Vec<String>, closed: bool },
-    Type { vars: Vec<String> },
+    Modifier {
+        foreign: bool,
+    },
+    ImportPath {
+        quoted: bool,
+    },
+    ImportName {
+        path: String,
+        seen: Vec<String>,
+        closed: bool,
+    },
+    Type {
+        vars: Vec<String>,
+    },
     Word,
 }
 
@@ -119,9 +141,15 @@ fn context_of(walked: &Walk, partial: Option<&Token>, at_column_0: bool) -> Cont
             closed: walked.closed,
         },
         Place::Import => Context::ImportPath { quoted: false },
-        Place::Vis | Place::DefName => Context::Modifier { foreign: walked.saw_foreign },
-        Place::Signature => Context::Type { vars: walked.vars.clone() },
-        Place::DataFields => Context::Type { vars: walked.params.clone() },
+        Place::Vis | Place::DefName => Context::Modifier {
+            foreign: walked.saw_foreign,
+        },
+        Place::Signature => Context::Type {
+            vars: walked.vars.clone(),
+        },
+        Place::DataFields => Context::Type {
+            vars: walked.params.clone(),
+        },
         Place::Body if !at_column_0 => Context::Word,
         Place::Top | Place::Body | Place::DataGap if at_column_0 => Context::Keyword,
         _ => Context::None,
@@ -155,7 +183,11 @@ fn import_paths(from: &Path, replace: Span, quoted: bool) -> Vec<Completion> {
     available_import_paths(from)
         .into_iter()
         .map(|path| {
-            let insert = if quoted { path.clone() } else { format!("\"{path}\"") };
+            let insert = if quoted {
+                path.clone()
+            } else {
+                format!("\"{path}\"")
+            };
             entry(&path, &insert, CompletionKind::Module, "", "", "1", replace)
         })
         .collect()
@@ -184,7 +216,10 @@ fn import_names(
                     continue;
                 };
                 for (kind, detail, doc) in found_exports(&found, &name) {
-                    push(&mut items, entry(&name, &name, kind, &detail, &doc, "2", replace));
+                    push(
+                        &mut items,
+                        entry(&name, &name, kind, &detail, &doc, "2", replace),
+                    );
                 }
             }
         }
@@ -192,7 +227,12 @@ fn import_names(
     items
 }
 
-fn type_names(from: &Path, module: Option<&Module>, vars: &[String], replace: Span) -> Vec<Completion> {
+fn type_names(
+    from: &Path,
+    module: Option<&Module>,
+    vars: &[String],
+    replace: Span,
+) -> Vec<Completion> {
     let mut items = Vec::new();
     for var in vars {
         push(
@@ -205,7 +245,15 @@ fn type_names(from: &Path, module: Option<&Module>, vars: &[String], replace: Sp
             match item {
                 Item::Data(data) => push(
                     &mut items,
-                    entry(&data.name, &data.name, CompletionKind::Type, &type_detail(data), &data.doc, "1", replace),
+                    entry(
+                        &data.name,
+                        &data.name,
+                        CompletionKind::Type,
+                        &type_detail(data),
+                        &data.doc,
+                        "1",
+                        replace,
+                    ),
                 ),
                 Item::Synonym(synonym) => push(
                     &mut items,
@@ -283,7 +331,10 @@ fn word_names(from: &Path, module: Option<&Module>, replace: Span) -> Vec<Comple
         }
     }
     for (name, kind, detail, doc) in builtin_words() {
-        push(&mut items, entry(name, name, kind, detail, doc, "3", replace));
+        push(
+            &mut items,
+            entry(name, name, kind, detail, doc, "3", replace),
+        );
     }
     items
 }
@@ -367,13 +418,19 @@ fn alias_import_path(tokens: &[Token], offset: usize, alias: &str) -> Option<Str
             let mut next = index + 1;
             if let Some(TokenKind::String(path)) = tokens.get(next).map(|token| &token.kind) {
                 next += 1;
-                while matches!(tokens.get(next).map(|token| &token.kind), Some(TokenKind::Newline))
-                {
+                while matches!(
+                    tokens.get(next).map(|token| &token.kind),
+                    Some(TokenKind::Newline)
+                ) {
                     next += 1;
                 }
-                if matches!(tokens.get(next).map(|token| &token.kind), Some(TokenKind::Colon)) {
+                if matches!(
+                    tokens.get(next).map(|token| &token.kind),
+                    Some(TokenKind::Colon)
+                ) {
                     next += 1;
-                    if let Some(TokenKind::Ident(name)) = tokens.get(next).map(|token| &token.kind) {
+                    if let Some(TokenKind::Ident(name)) = tokens.get(next).map(|token| &token.kind)
+                    {
                         if name == alias {
                             found = Some(path.clone());
                         }
@@ -496,7 +553,8 @@ fn imported_words(from: &Path, module: &Module) -> Vec<Named> {
                     }
                 }
                 Found::Class(class) => {
-                    if let Some(method) = class.methods.iter().find(|method| method.name == remote) {
+                    if let Some(method) = class.methods.iter().find(|method| method.name == remote)
+                    {
                         names.push(Named {
                             label: local,
                             kind: CompletionKind::Word,
@@ -580,11 +638,7 @@ fn found_exports(found: &Found, name: &str) -> Vec<(CompletionKind, String, Stri
     match found {
         Found::Data(data) => {
             if data.name == name {
-                entries.push((
-                    CompletionKind::Type,
-                    type_detail(data),
-                    doc_text(&data.doc),
-                ));
+                entries.push((CompletionKind::Type, type_detail(data), doc_text(&data.doc)));
             }
             if let Some(ctor) = data.ctors.iter().find(|ctor| ctor.name == name) {
                 entries.push((
@@ -714,15 +768,24 @@ fn ctor_detail(data: &Data, ctor: &Ctor) -> String {
     } else {
         Type::App(
             Box::new(Type::Ctor(data.name.clone())),
-            data.params.iter().map(|param| Type::Var(param.clone())).collect(),
+            data.params
+                .iter()
+                .map(|param| Type::Var(param.clone()))
+                .collect(),
         )
     };
     scheme_string(&Scheme {
         vars: data.params.clone(),
         constraints: Vec::new(),
         effect: StackEffect {
-            input: Stack { tail: StackTail::Implicit, items: ctor.field_tys() },
-            output: Stack { tail: StackTail::Implicit, items: vec![result] },
+            input: Stack {
+                tail: StackTail::Implicit,
+                items: ctor.field_tys(),
+            },
+            output: Stack {
+                tail: StackTail::Implicit,
+                items: vec![result],
+            },
             effects: None,
         },
     })
@@ -1058,7 +1121,11 @@ fn is_partial(token: &Token, offset: usize) -> bool {
     }
 }
 
-fn tokens_before<'a>(tokens: &'a [Token], offset: usize, partial: Option<&Token>) -> Vec<&'a Token> {
+fn tokens_before<'a>(
+    tokens: &'a [Token],
+    offset: usize,
+    partial: Option<&Token>,
+) -> Vec<&'a Token> {
     let mut before = Vec::new();
     for token in tokens {
         if matches!(token.kind, TokenKind::Eof) {
@@ -1079,7 +1146,10 @@ fn at_decl_column(source: &str, offset: usize, partial: Option<&Token>) -> bool 
     if let Some(token) = partial {
         return token.col == 0 && token.line_start;
     }
-    let line_start = source[..offset].rfind('\n').map(|index| index + 1).unwrap_or(0);
+    let line_start = source[..offset]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
     offset == line_start
 }
 
@@ -1188,7 +1258,15 @@ fn complete_fields(source: &str, path: &Path, offset: usize) -> Option<Vec<Compl
     for (name, detail) in fields_at(path, source, &edit) {
         push(
             &mut items,
-            entry(&name, &name, CompletionKind::Field, &detail, "", "1", edit.replace),
+            entry(
+                &name,
+                &name,
+                CompletionKind::Field,
+                &detail,
+                "",
+                "1",
+                edit.replace,
+            ),
         );
     }
     Some(items)
@@ -1374,7 +1452,10 @@ fn module_around(path: &Path, source: &str, hash: usize) -> Option<Module> {
     if let Ok(module) = parse(source, mode) {
         return Some(module);
     }
-    let line_start = source[..hash].rfind('\n').map(|index| index + 1).unwrap_or(0);
+    let line_start = source[..hash]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
     let mut head = source[..line_start].to_string();
     if !head.ends_with('\n') {
         head.push('\n');
@@ -1450,9 +1531,15 @@ struct FieldEnv {
 /// Data and synonyms of this file and of the modules it imports.
 fn field_env(path: &Path, source: &str, hash: usize) -> FieldEnv {
     let Some(module) = module_around(path, source, hash) else {
-        return FieldEnv { products: Vec::new(), synonyms: Vec::new() };
+        return FieldEnv {
+            products: Vec::new(),
+            synonyms: Vec::new(),
+        };
     };
-    let mut env = FieldEnv { products: Vec::new(), synonyms: Vec::new() };
+    let mut env = FieldEnv {
+        products: Vec::new(),
+        synonyms: Vec::new(),
+    };
     add_fields(&mut env, &module);
     for import in &module.imports {
         if let Some(provider) = load_provider(path, &import.path) {
@@ -1643,7 +1730,9 @@ fn split_args(text: &str) -> Vec<String> {
 
 fn show_subst(ty: &Type, map: &HashMap<String, String>) -> String {
     match ty {
-        Type::Var(name) | Type::Ctor(name) => map.get(name).cloned().unwrap_or_else(|| name.clone()),
+        Type::Var(name) | Type::Ctor(name) => {
+            map.get(name).cloned().unwrap_or_else(|| name.clone())
+        }
         Type::App(head, args) => {
             let mut out = format!("({}", show_subst(head, map));
             for arg in args {
@@ -1876,8 +1965,14 @@ mod tests {
 
     fn at(source: &str, needle: &str) -> (u32, u32) {
         let offset = source.rfind(needle).unwrap() + needle.len();
-        let line = source[..offset].bytes().filter(|byte| *byte == b'\n').count() as u32;
-        let line_start = source[..offset].rfind('\n').map(|index| index + 1).unwrap_or(0);
+        let line = source[..offset]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count() as u32;
+        let line_start = source[..offset]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
         let character = source[line_start..offset].encode_utf16().count() as u32;
         (line, character)
     }
@@ -1939,11 +2034,17 @@ mod tests {
         let source = ".. Equality.\n& Eq a\n  eq ( a a -- Bool )\n\n: use ( E Int -- Bool )\n  e";
         let (line, character) = at(source, "( E");
         let types = complete(source, Path::new("M.ply"), line, character);
-        let eq_class = types.iter().find(|item| item.label == "Eq").expect("class Eq");
+        let eq_class = types
+            .iter()
+            .find(|item| item.label == "Eq")
+            .expect("class Eq");
         assert_eq!(eq_class.documentation, "Equality.");
         let (line, character) = at(source, "\n  e");
         let items = complete(source, Path::new("M.ply"), line, character);
-        let eq = items.iter().find(|item| item.label == "eq").expect("method eq");
+        let eq = items
+            .iter()
+            .find(|item| item.label == "eq")
+            .expect("method eq");
         assert_eq!(eq.detail, "Eq a => a a -- Bool");
         assert_eq!(eq.kind, CompletionKind::Word);
         assert_eq!(eq.documentation, "Equality.");
@@ -1959,28 +2060,67 @@ mod tests {
         assert!(keywords.iter().any(|label| label == "&"), "{keywords:?}");
         assert!(keywords.iter().any(|label| label == "#"), "{keywords:?}");
         assert!(keywords.iter().any(|label| label == ":"), "{keywords:?}");
-        assert!(!keywords.iter().any(|label| label == "foreign"), "{keywords:?}");
-        assert!(!keywords.iter().any(|label| label == "private"), "{keywords:?}");
-        assert!(!keywords.iter().any(|label| label == "class"), "{keywords:?}");
-        assert!(!keywords.iter().any(|label| label == "instance"), "{keywords:?}");
-        assert!(!keywords.iter().any(|label| label == "import"), "{keywords:?}");
+        assert!(
+            !keywords.iter().any(|label| label == "foreign"),
+            "{keywords:?}"
+        );
+        assert!(
+            !keywords.iter().any(|label| label == "private"),
+            "{keywords:?}"
+        );
+        assert!(
+            !keywords.iter().any(|label| label == "class"),
+            "{keywords:?}"
+        );
+        assert!(
+            !keywords.iter().any(|label| label == "instance"),
+            "{keywords:?}"
+        );
+        assert!(
+            !keywords.iter().any(|label| label == "import"),
+            "{keywords:?}"
+        );
         assert!(keywords.iter().any(|label| label == "@"), "{keywords:?}");
-        assert!(!keywords.iter().any(|label| label == "public"), "{keywords:?}");
+        assert!(
+            !keywords.iter().any(|label| label == "public"),
+            "{keywords:?}"
+        );
         let after_import = labels("~ ", "~ ");
-        assert!(!after_import.iter().any(|label| label == "public"), "{after_import:?}");
+        assert!(
+            !after_import.iter().any(|label| label == "public"),
+            "{after_import:?}"
+        );
         assert!(!keywords.iter().any(|label| label == "dup"), "{keywords:?}");
         let after_colon = labels(": ", ": ");
-        assert!(after_colon.iter().any(|label| label == "foreign"), "{after_colon:?}");
-        assert!(!after_colon.iter().any(|label| label == "private"), "{after_colon:?}");
+        assert!(
+            after_colon.iter().any(|label| label == "foreign"),
+            "{after_colon:?}"
+        );
+        assert!(
+            !after_colon.iter().any(|label| label == "private"),
+            "{after_colon:?}"
+        );
         assert!(labels(": foreign ", ": foreign ").is_empty());
         let again = ": foreign read ( -- Str )\n\n: ";
         let after_next = labels(again, "\n\n: ");
-        assert!(after_next.iter().any(|label| label == "foreign"), "{after_next:?}");
-        assert!(!after_next.iter().any(|label| label == "private"), "{after_next:?}");
+        assert!(
+            after_next.iter().any(|label| label == "foreign"),
+            "{after_next:?}"
+        );
+        assert!(
+            !after_next.iter().any(|label| label == "private"),
+            "{after_next:?}"
+        );
         let (line, character) = at(": ", ": ");
         let iface = complete(": ", Path::new("M.d.ply"), line, character);
-        assert!(iface.iter().any(|item| item.label == "foreign"), "{iface:?}");
-        assert!(!iface.iter().any(|item| item.label == "private"), "{iface:?}");
+        assert!(
+            iface.iter().any(|item| item.label == "foreign"),
+            "{iface:?}"
+        );
+        assert!(
+            !iface.iter().any(|item| item.label == "private"),
+            "{iface:?}"
+        );
         let (line, character) = at(": foreign ", ": foreign ");
         let iface_foreign = complete(": foreign ", Path::new("M.d.ply"), line, character);
         assert!(iface_foreign.is_empty(), "{iface_foreign:?}");
@@ -1989,7 +2129,10 @@ mod tests {
 
     #[test]
     fn completes_an_import_from_the_package() {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let root = std::env::temp_dir().join(format!("plylang-complete-import-{nanos}"));
         let _cleanup = Cleanup(root.clone());
         fs::create_dir_all(root.join("src/Data")).unwrap();
@@ -2011,22 +2154,42 @@ mod tests {
             "@ Maybe, Nothing, Just, fromMaybe, mapMaybe\n\n; Maybe a = Nothing | Just a\n\n: fromMaybe ( a (Maybe a) -- a )\n  (Nothing ..) ->\n  (Just ..) -> nip\n\n: mapMaybe ( (Maybe a) (a -- b) -- (Maybe b) )\n  (Nothing ..) q -> q drop Nothing\n  (Just x) q -> x q call Just\n",
         )
         .unwrap();
-        fs::write(root.join("src/Data/Extra.ply"), ": pass ( Int -- Int )\n  dup drop\n").unwrap();
+        fs::write(
+            root.join("src/Data/Extra.ply"),
+            ": pass ( Int -- Int )\n  dup drop\n",
+        )
+        .unwrap();
         let path = root.join("src/Try.ply");
         fs::write(&path, "").unwrap();
         let (line, character) = at("~ \"\"\n", "~ \"");
         let paths = complete("~ \"\"\n", &path, line, character);
-        assert!(paths.iter().any(|item| item.label == "Data/Maybe"), "{paths:?}");
-        assert!(paths.iter().any(|item| item.label == "Data/Extra"), "{paths:?}");
+        assert!(
+            paths.iter().any(|item| item.label == "Data/Maybe"),
+            "{paths:?}"
+        );
+        assert!(
+            paths.iter().any(|item| item.label == "Data/Extra"),
+            "{paths:?}"
+        );
         assert!(paths.iter().all(|item| item.label != "Try"), "{paths:?}");
         assert!(paths.iter().all(|item| item.label != "Ghost"), "{paths:?}");
-        assert_eq!(paths.iter().find(|item| item.label == "Data/Maybe").unwrap().insert, "Data/Maybe");
+        assert_eq!(
+            paths
+                .iter()
+                .find(|item| item.label == "Data/Maybe")
+                .unwrap()
+                .insert,
+            "Data/Maybe"
+        );
 
         let source = "~ \"Data/Maybe\" J\n";
         let (line, character) = at(source, "J");
         let names = complete(source, &path, line, character);
         assert!(names.iter().any(|item| item.label == "Just"), "{names:?}");
-        assert!(names.iter().any(|item| item.label == "fromMaybe"), "{names:?}");
+        assert!(
+            names.iter().any(|item| item.label == "fromMaybe"),
+            "{names:?}"
+        );
         assert!(names.iter().any(|item| item.label == "Maybe"), "{names:?}");
         assert!(!names.iter().any(|item| item.label == "*"), "{names:?}");
 
@@ -2034,7 +2197,10 @@ mod tests {
         let (line, character) = at(source, "\n  J");
         let words = complete(source, &path, line, character);
         assert!(words.iter().any(|item| item.label == "Just"), "{words:?}");
-        assert!(!words.iter().any(|item| item.label == "Nothing"), "{words:?}");
+        assert!(
+            !words.iter().any(|item| item.label == "Nothing"),
+            "{words:?}"
+        );
         assert!(words.iter().any(|item| item.label == "dup"), "{words:?}");
 
         let source = "~ \"Data/Maybe\" Maybe\n\n: use ( M\n  drop\n";
@@ -2045,7 +2211,10 @@ mod tests {
 
     #[test]
     fn completes_members_of_an_import_alias() {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let root = std::env::temp_dir().join(format!("plylang-complete-alias-{nanos}"));
         let _cleanup = Cleanup(root.clone());
         fs::create_dir_all(root.join("src/Data")).unwrap();
@@ -2073,7 +2242,10 @@ mod tests {
         let signature = "~ \"Data/Maybe\" : M\n\n: use ( M:";
         let (line, character) = at(signature, "M:");
         let types = complete(signature, &path, line, character);
-        let maybe = types.iter().find(|item| item.label == "Maybe").expect("type Maybe");
+        let maybe = types
+            .iter()
+            .find(|item| item.label == "Maybe")
+            .expect("type Maybe");
         assert_eq!(maybe.kind, CompletionKind::Type);
         assert_eq!(maybe.insert, "Maybe");
         assert_eq!(maybe.detail, "Maybe a");
@@ -2082,28 +2254,49 @@ mod tests {
             &signature[maybe.replace.start as usize..maybe.replace.end as usize],
             ""
         );
-        let class = types.iter().find(|item| item.label == "Box").expect("class Box");
+        let class = types
+            .iter()
+            .find(|item| item.label == "Box")
+            .expect("class Box");
         assert_eq!(class.kind, CompletionKind::Class);
         assert_eq!(class.detail, "& Box a");
         assert_eq!(class.documentation, "A box.");
         assert!(!types.iter().any(|item| item.label == "Just"), "{types:?}");
-        assert!(!types.iter().any(|item| item.label == "fromMaybe"), "{types:?}");
+        assert!(
+            !types.iter().any(|item| item.label == "fromMaybe"),
+            "{types:?}"
+        );
         assert!(!types.iter().any(|item| item.label == "dup"), "{types:?}");
-        assert!(!types.iter().any(|item| item.label == "M:Maybe"), "{types:?}");
+        assert!(
+            !types.iter().any(|item| item.label == "M:Maybe"),
+            "{types:?}"
+        );
 
         let body = "~ \"Data/Maybe\" : M\n\n: use ( Int -- Int )\n  M:";
         let (line, character) = at(body, "M:");
         let words = complete(body, &path, line, character);
-        let just = words.iter().find(|item| item.label == "Just").expect("Just");
+        let just = words
+            .iter()
+            .find(|item| item.label == "Just")
+            .expect("Just");
         assert_eq!(just.kind, CompletionKind::Constructor);
         assert_eq!(just.insert, "Just");
         assert_eq!(just.detail, "a. a -- (Maybe a)");
-        assert!(words.iter().any(|item| item.label == "Nothing"), "{words:?}");
-        let from = words.iter().find(|item| item.label == "fromMaybe").expect("fromMaybe");
+        assert!(
+            words.iter().any(|item| item.label == "Nothing"),
+            "{words:?}"
+        );
+        let from = words
+            .iter()
+            .find(|item| item.label == "fromMaybe")
+            .expect("fromMaybe");
         assert_eq!(from.kind, CompletionKind::Word);
         assert_eq!(from.detail, "a (Maybe a) -- a");
         assert_eq!(from.documentation, "The other value.");
-        let wrap = words.iter().find(|item| item.label == "wrap").expect("wrap");
+        let wrap = words
+            .iter()
+            .find(|item| item.label == "wrap")
+            .expect("wrap");
         assert_eq!(wrap.kind, CompletionKind::Word);
         assert!(!words.iter().any(|item| item.label == "Maybe"), "{words:?}");
         assert!(!words.iter().any(|item| item.label == "Box"), "{words:?}");
@@ -2112,14 +2305,23 @@ mod tests {
         let partial = "~ \"Data/Maybe\" : M\n\n: use ( Int -- Int )\n  M:fr";
         let (line, character) = at(partial, "M:fr");
         let words = complete(partial, &path, line, character);
-        let from = words.iter().find(|item| item.label == "fromMaybe").expect("fromMaybe");
+        let from = words
+            .iter()
+            .find(|item| item.label == "fromMaybe")
+            .expect("fromMaybe");
         assert_eq!(from.insert, "fromMaybe");
-        assert_eq!(&partial[from.replace.start as usize..from.replace.end as usize], "fr");
+        assert_eq!(
+            &partial[from.replace.start as usize..from.replace.end as usize],
+            "fr"
+        );
     }
 
     #[test]
     fn hides_an_unlisted_word_and_keeps_its_doc() {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let root = std::env::temp_dir().join(format!("plylang-complete-{nanos}"));
         let _cleanup = Cleanup(root.clone());
         fs::create_dir_all(root.join("src/Data")).unwrap();
@@ -2146,7 +2348,10 @@ mod tests {
         let add = names.iter().find(|item| item.label == "add").unwrap();
         assert_eq!(add.documentation, "Add two integers.");
         assert_eq!(add.detail, "Int Int -- Int");
-        assert!(!names.iter().any(|item| item.label == "hidden"), "{names:?}");
+        assert!(
+            !names.iter().any(|item| item.label == "hidden"),
+            "{names:?}"
+        );
     }
 
     #[test]
@@ -2159,14 +2364,20 @@ mod tests {
         let (line, character) = at(source, "1 >>");
         let items = complete(source, Path::new("M.ply"), line, character);
         assert_eq!(
-            items.iter().map(|item| item.label.clone()).collect::<Vec<_>>(),
+            items
+                .iter()
+                .map(|item| item.label.clone())
+                .collect::<Vec<_>>(),
             vec!["age".to_string(), "name".to_string()]
         );
         let name = items.iter().find(|item| item.label == "name").unwrap();
         assert_eq!(name.insert, "name");
         assert_eq!(name.detail, "Str");
         assert_eq!(name.kind, CompletionKind::Field);
-        assert_eq!(&source[name.replace.start as usize..name.replace.end as usize], "");
+        assert_eq!(
+            &source[name.replace.start as usize..name.replace.end as usize],
+            ""
+        );
 
         let source = "\
 ; Person = Person name : Str, age : Num
@@ -2176,7 +2387,10 @@ mod tests {
         let (line, character) = at(source, ">>na");
         let items = complete(source, Path::new("M.ply"), line, character);
         let name = items.iter().find(|item| item.label == "name").unwrap();
-        assert_eq!(&source[name.replace.start as usize..name.replace.end as usize], "na");
+        assert_eq!(
+            &source[name.replace.start as usize..name.replace.end as usize],
+            "na"
+        );
         assert_eq!(name.insert, "name");
 
         let pair = "\
@@ -2184,15 +2398,25 @@ mod tests {
 
 : get ( (Pair Int Str) -- (Pair Int Str) )
   1 >>";
-        let frs = complete(pair, Path::new("M.ply"), at(pair, "1 >>").0, at(pair, "1 >>").1)
-            .into_iter()
-            .find(|item| item.label == "frs")
-            .unwrap();
+        let frs = complete(
+            pair,
+            Path::new("M.ply"),
+            at(pair, "1 >>").0,
+            at(pair, "1 >>").1,
+        )
+        .into_iter()
+        .find(|item| item.label == "frs")
+        .unwrap();
         assert_eq!(frs.detail, "Int");
-        let snd = complete(pair, Path::new("M.ply"), at(pair, "1 >>").0, at(pair, "1 >>").1)
-            .into_iter()
-            .find(|item| item.label == "snd")
-            .unwrap();
+        let snd = complete(
+            pair,
+            Path::new("M.ply"),
+            at(pair, "1 >>").0,
+            at(pair, "1 >>").1,
+        )
+        .into_iter()
+        .find(|item| item.label == "snd")
+        .unwrap();
         assert_eq!(snd.detail, "Str");
 
         let human = "\
@@ -2201,10 +2425,15 @@ mod tests {
 
 : get ( Human -- Human )
   1 >>";
-        let name = complete(human, Path::new("M.ply"), at(human, "1 >>").0, at(human, "1 >>").1)
-            .into_iter()
-            .find(|item| item.label == "name")
-            .unwrap();
+        let name = complete(
+            human,
+            Path::new("M.ply"),
+            at(human, "1 >>").0,
+            at(human, "1 >>").1,
+        )
+        .into_iter()
+        .find(|item| item.label == "name")
+        .unwrap();
         assert_eq!(name.detail, "Str");
 
         let reading = "\
@@ -2212,10 +2441,15 @@ mod tests {
 
 : get ( Person -- Str )
   na";
-        let reader = complete(reading, Path::new("M.ply"), at(reading, "na").0, at(reading, "na").1)
-            .into_iter()
-            .find(|item| item.label == "name>>")
-            .unwrap();
+        let reader = complete(
+            reading,
+            Path::new("M.ply"),
+            at(reading, "na").0,
+            at(reading, "na").1,
+        )
+        .into_iter()
+        .find(|item| item.label == "name>>")
+        .unwrap();
         assert_eq!(reader.insert, "name>>");
         assert_eq!(reader.detail, "Str");
         assert_eq!(reader.kind, CompletionKind::Field);
@@ -2225,12 +2459,20 @@ mod tests {
 
 : get ( Person -- Str )
   na>>";
-        let reader = complete(slash, Path::new("M.ply"), at(slash, "na>>").0, at(slash, "na>>").1)
-            .into_iter()
-            .find(|item| item.label == "name>>")
-            .unwrap();
+        let reader = complete(
+            slash,
+            Path::new("M.ply"),
+            at(slash, "na>>").0,
+            at(slash, "na>>").1,
+        )
+        .into_iter()
+        .find(|item| item.label == "name>>")
+        .unwrap();
         assert_eq!(reader.insert, "name>>");
-        assert_eq!(&slash[reader.replace.start as usize..reader.replace.end as usize], "na>>");
+        assert_eq!(
+            &slash[reader.replace.start as usize..reader.replace.end as usize],
+            "na>>"
+        );
 
         assert!(labels(": bad ( Int -- Int )\n  1 >>", "1 >>").is_empty());
         assert!(labels(
@@ -2261,7 +2503,10 @@ mod tests {
         )
         .is_empty());
 
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let root = std::env::temp_dir().join(format!("plylang-complete-fields-{nanos}"));
         let _cleanup = Cleanup(root.clone());
         fs::create_dir_all(root.join("src/Data")).unwrap();
@@ -2278,11 +2523,22 @@ mod tests {
         let app = root.join("src/App.ply");
         fs::write(&app, "").unwrap();
         let imported = "~ \"Data/Entry\" Clock\n\n: get ( Clock -- Clock )\n  1 >>";
-        let items = complete(imported, &app, at(imported, "1 >>").0, at(imported, "1 >>").1);
+        let items = complete(
+            imported,
+            &app,
+            at(imported, "1 >>").0,
+            at(imported, "1 >>").1,
+        );
         assert_eq!(
-            items.iter().map(|item| item.label.clone()).collect::<Vec<_>>(),
+            items
+                .iter()
+                .map(|item| item.label.clone())
+                .collect::<Vec<_>>(),
             vec!["at".to_string(), "id".to_string()]
         );
-        assert_eq!(items.iter().find(|item| item.label == "at").unwrap().detail, "Num");
+        assert_eq!(
+            items.iter().find(|item| item.label == "at").unwrap().detail,
+            "Num"
+        );
     }
 }

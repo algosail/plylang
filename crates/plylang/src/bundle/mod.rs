@@ -78,7 +78,11 @@ struct Mod {
 
 enum Item {
     /// A top-level function, class, or single `const` / `let` / `var`.
-    Binding { name: String, text: String, uses: Vec<String> },
+    Binding {
+        name: String,
+        text: String,
+        uses: Vec<String>,
+    },
     /// A statement that is not one binding. Kept when the module is reached.
     Loose { text: String, uses: Vec<String> },
 }
@@ -121,12 +125,18 @@ impl Graph {
         let mut imports = Vec::new();
         for item in parsed.imports {
             let dep = self.depend(id, &item.spec, stack)?;
-            imports.push(Resolved { dep, names: item.names });
+            imports.push(Resolved {
+                dep,
+                names: item.names,
+            });
         }
         let mut reexports = Vec::new();
         for item in parsed.reexports {
             let dep = self.depend(id, &item.spec, stack)?;
-            reexports.push(Resolved { dep, names: item.names });
+            reexports.push(Resolved {
+                dep,
+                names: item.names,
+            });
         }
         stack.pop();
         let module = &mut self.mods[id];
@@ -137,7 +147,12 @@ impl Graph {
         Ok(id)
     }
 
-    fn depend(&mut self, id: usize, spec: &str, stack: &mut Vec<PathBuf>) -> Result<usize, BuildError> {
+    fn depend(
+        &mut self,
+        id: usize,
+        spec: &str,
+        stack: &mut Vec<PathBuf>,
+    ) -> Result<usize, BuildError> {
         let from = self.mods[id].path.clone();
         let dep_path = match resolve(&from, spec) {
             Ok(path) => path,
@@ -213,13 +228,8 @@ fn reachable(graph: &Graph, entry: usize, call_main: bool) -> Result<Reach, Buil
     let mut loose = vec![false; graph.mods.len()];
     let mut work = Vec::new();
     if call_main {
-        let slot = find_slot(graph, entry, "main").ok_or_else(|| {
-            fail(
-                &graph.mods[entry].path,
-                &graph.mods[entry].source,
-                "main",
-            )
-        })?;
+        let slot = find_slot(graph, entry, "main")
+            .ok_or_else(|| fail(&graph.mods[entry].path, &graph.mods[entry].source, "main"))?;
         work.push(slot);
     } else {
         follow_loose(graph, entry, &mut reach, &mut loose, &mut work)?;
@@ -261,7 +271,9 @@ fn binding_uses(graph: &Graph, module: usize, name: &str) -> Vec<String> {
         .items
         .iter()
         .find_map(|item| match item {
-            Item::Binding { name: have, uses, .. } if have == name => Some(uses.clone()),
+            Item::Binding {
+                name: have, uses, ..
+            } if have == name => Some(uses.clone()),
             _ => None,
         })
         .unwrap_or_default()
@@ -299,9 +311,10 @@ fn follow_uses(
 }
 
 fn has_binding(module: &Mod, name: &str) -> bool {
-    module.items.iter().any(|item| {
-        matches!(item, Item::Binding { name: have, .. } if have == name)
-    })
+    module
+        .items
+        .iter()
+        .any(|item| matches!(item, Item::Binding { name: have, .. } if have == name))
 }
 
 fn import_local(module: &Mod, local: &str) -> Option<(usize, String)> {
@@ -318,33 +331,42 @@ fn import_local(module: &Mod, local: &str) -> Option<(usize, String)> {
 /// The binding a public name refers to, following `export { name }` and
 /// `export { name } from`.
 fn find_slot(graph: &Graph, module: usize, public: &str) -> Option<Slot> {
-    fn walk(graph: &Graph, module: usize, public: &str, stack: &mut Vec<(usize, String)>) -> Option<Slot> {
-        if stack.iter().any(|(have, name)| *have == module && name == public) {
+    fn walk(
+        graph: &Graph,
+        module: usize,
+        public: &str,
+        stack: &mut Vec<(usize, String)>,
+    ) -> Option<Slot> {
+        if stack
+            .iter()
+            .any(|(have, name)| *have == module && name == public)
+        {
             return None;
         }
         stack.push((module, public.to_string()));
         let module_ref = &graph.mods[module];
-        let found = if let Some((_, local)) = module_ref.exports.iter().find(|(name, _)| name == public) {
-            if has_binding(module_ref, local) {
+        let found =
+            if let Some((_, local)) = module_ref.exports.iter().find(|(name, _)| name == public) {
+                if has_binding(module_ref, local) {
+                    Some(Slot {
+                        module,
+                        name: local.clone(),
+                    })
+                } else if let Some((dep, remote)) = import_local(module_ref, local) {
+                    walk(graph, dep, &remote, stack)
+                } else {
+                    None
+                }
+            } else if let Some((dep, remote)) = reexport_public(module_ref, public) {
+                walk(graph, dep, &remote, stack)
+            } else if has_binding(module_ref, public) {
                 Some(Slot {
                     module,
-                    name: local.clone(),
+                    name: public.to_string(),
                 })
-            } else if let Some((dep, remote)) = import_local(module_ref, local) {
-                walk(graph, dep, &remote, stack)
             } else {
                 None
-            }
-        } else if let Some((dep, remote)) = reexport_public(module_ref, public) {
-            walk(graph, dep, &remote, stack)
-        } else if has_binding(module_ref, public) {
-            Some(Slot {
-                module,
-                name: public.to_string(),
-            })
-        } else {
-            None
-        };
+            };
         stack.pop();
         found
     }
@@ -486,7 +508,9 @@ fn export_key(graph: &Graph, slot: &Slot) -> String {
     module
         .exports
         .iter()
-        .find(|(public, local)| local == &slot.name && has_binding(module, local) && is_ident(public))
+        .find(|(public, local)| {
+            local == &slot.name && has_binding(module, local) && is_ident(public)
+        })
         .map(|(public, _)| public.clone())
         .unwrap_or_else(|| slot.name.clone())
 }
@@ -494,7 +518,10 @@ fn export_key(graph: &Graph, slot: &Slot) -> String {
 fn fresh_prefix(graph: &Graph) -> String {
     let mut prefix = "ply$".to_string();
     for _ in 0..8 {
-        let used = graph.mods.iter().any(|module| module.source.contains(&prefix));
+        let used = graph
+            .mods
+            .iter()
+            .any(|module| module.source.contains(&prefix));
         if !used {
             break;
         }
@@ -556,7 +583,10 @@ fn cycle_spec(stack: &[PathBuf], again: &Path) -> String {
 }
 
 fn short_name(path: &Path) -> String {
-    let file = path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    let file = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
     match path.parent().and_then(|parent| parent.file_name()) {
         Some(parent) => format!("{}/{}", parent.to_string_lossy(), file),
         None => file,
@@ -680,7 +710,9 @@ fn inside_package(root: &Path, file: &Path) -> bool {
     let Ok(relative) = file.strip_prefix(root) else {
         return false;
     };
-    !relative.components().any(|component| component.as_os_str() == "node_modules")
+    !relative
+        .components()
+        .any(|component| component.as_os_str() == "node_modules")
 }
 
 fn import_path(root: &Path, subpath: &str) -> Option<String> {

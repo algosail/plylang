@@ -6,15 +6,15 @@ use std::process::ExitCode;
 use std::io::IsTerminal;
 
 use plylang::{
-    build_with, check_package, compile_with, javascript_file, mode_from_path, parse, test_package,
-    write_docs, BuildFlags, CompileFlags,
+    build_watch, build_with, check_package, compile_with, javascript_file, mode_from_path, parse,
+    test_package, write_docs, BuildFlags, CompileFlags,
 };
 
 const USAGE: &[&str] = &[
     "usage: plylang check [dir]",
     "       plylang check --js <file>",
     "       plylang check --parse <file>",
-    "       plylang build [dir] [--exports] [--entry <module>] [--out <dir>] [--foreign <dir>]",
+    "       plylang build [dir] [--exports] [--watch] [--entry <module>] [--out <dir>] [--foreign <dir>]",
     "       plylang compile [dir] [--entry <module>] [--out <file>] [--foreign <dir>]",
     "       plylang test [pattern]",
     "       plylang docs [dir] [--out <file>]",
@@ -74,10 +74,7 @@ fn docs_command(mut args: impl Iterator<Item = String>) -> ExitCode {
         dir = Some(arg);
     }
     let dir = dir.unwrap_or_else(|| ".".to_string());
-    finish_package(write_docs(
-        Path::new(&dir),
-        out.as_deref().map(Path::new),
-    ))
+    finish_package(write_docs(Path::new(&dir), out.as_deref().map(Path::new)))
 }
 
 fn test_command(mut args: impl Iterator<Item = String>) -> ExitCode {
@@ -131,15 +128,20 @@ fn build_command(args: impl Iterator<Item = String>) -> ExitCode {
         Ok(run) => run,
         Err(code) => return code,
     };
-    finish_package(build_with(
-        Path::new(&run.dir),
-        &BuildFlags {
-            entry: run.entry,
-            out: run.out,
-            foreign: run.foreign,
-            exports: run.exports,
-        },
-    ))
+    if run.watch && run.exports {
+        eprintln!("--watch cannot be combined with --exports");
+        return ExitCode::from(2);
+    }
+    let flags = BuildFlags {
+        entry: run.entry,
+        out: run.out,
+        foreign: run.foreign,
+        exports: run.exports,
+    };
+    if run.watch {
+        return finish_package(build_watch(Path::new(&run.dir), &flags));
+    }
+    finish_package(build_with(Path::new(&run.dir), &flags))
 }
 
 struct RunArgs {
@@ -148,6 +150,7 @@ struct RunArgs {
     out: Option<String>,
     foreign: Option<String>,
     exports: bool,
+    watch: bool,
 }
 
 fn read_run_args(
@@ -159,10 +162,19 @@ fn read_run_args(
     let mut out = None;
     let mut foreign = None;
     let mut exports = false;
+    let mut watch = false;
     while let Some(arg) = args.next() {
         if is_help(&arg) {
             usage(false);
             return Err(ExitCode::SUCCESS);
+        }
+        if arg == "--watch" {
+            if !allow_exports || watch {
+                usage(true);
+                return Err(ExitCode::from(2));
+            }
+            watch = true;
+            continue;
         }
         if arg == "--exports" {
             if !allow_exports || exports {
@@ -201,6 +213,7 @@ fn read_run_args(
         out,
         foreign,
         exports,
+        watch,
     })
 }
 

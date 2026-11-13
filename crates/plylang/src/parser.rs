@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use crate::ast::*;
-use crate::diagnostic::Diagnostic;
 use crate::codes::Error;
+use crate::diagnostic::Diagnostic;
 use crate::lexer::tokenize;
 use crate::paths::ParseMode;
 use crate::span::Span;
@@ -86,7 +86,10 @@ impl Parser {
             return Err(self.error(Error::ExpectedLanguageVersion));
         }
         if version > LANGUAGE_VERSION {
-            return Err(self.error(Error::LanguageTooNew { version, compiler: LANGUAGE_VERSION }));
+            return Err(self.error(Error::LanguageTooNew {
+                version,
+                compiler: LANGUAGE_VERSION,
+            }));
         }
         self.bump();
         Ok(version)
@@ -379,10 +382,7 @@ impl Parser {
         }
         if foreign {
             self.skip_newlines();
-            if self.is_eof()
-                || self.is_item_start()
-                || self.is(TokenKind::Doc(String::new()))
-            {
+            if self.is_eof() || self.is_item_start() || self.is(TokenKind::Doc(String::new())) {
                 return Ok(Data {
                     name_span,
                     name,
@@ -448,7 +448,10 @@ impl Parser {
         while self.is_lower_ident() && !self.cur().line_start {
             let param = self.expect_lower(Error::ExpectedTypeVariable)?;
             if !seen.insert(param.clone()) {
-                return Err(self.error_at(self.last_span, Error::DuplicateTypeVariable(param.to_string())));
+                return Err(self.error_at(
+                    self.last_span,
+                    Error::DuplicateTypeVariable(param.to_string()),
+                ));
             }
             params.push(param);
         }
@@ -504,12 +507,18 @@ impl Parser {
             }
             let name_span = self.cur().span;
             let name = self.expect_lower(Error::ExpectedFieldName)?;
-            if fields.iter().any(|field| field.name.as_deref() == Some(name.as_str())) {
+            if fields
+                .iter()
+                .any(|field| field.name.as_deref() == Some(name.as_str()))
+            {
                 return Err(self.error_at(name_span, Error::DuplicateFieldName));
             }
             self.expect(&TokenKind::Colon, Error::ExpectedColon)?;
             let ty = self.parse_type_item()?;
-            fields.push(CtorField { name: Some(name), ty });
+            fields.push(CtorField {
+                name: Some(name),
+                ty,
+            });
             self.skip_newlines();
             if self.eat(&TokenKind::Comma) {
                 continue;
@@ -685,9 +694,11 @@ impl Parser {
     /// One bare lowercase name counts: `n -> n`.
     fn clause_block_starts(&self) -> bool {
         let mut index = self.skip_newline_index(self.pos);
-        if self.tokens.get(index).is_none_or(|token| {
-            matches!(token.kind, TokenKind::Eof) || self.item_start_at(index)
-        }) {
+        if self
+            .tokens
+            .get(index)
+            .is_none_or(|token| matches!(token.kind, TokenKind::Eof) || self.item_start_at(index))
+        {
             return false;
         }
         let mut count = 0;
@@ -767,9 +778,11 @@ impl Parser {
         match &token.kind {
             TokenKind::Ident(name) if name == "_" || is_lower(name) => Some(index + 1),
             TokenKind::Ident(name) if is_upper(name) => Some(self.skip_qualifier(index)),
-            TokenKind::True | TokenKind::False | TokenKind::Int(_) | TokenKind::Number(_) | TokenKind::String(_) => {
-                Some(index + 1)
-            }
+            TokenKind::True
+            | TokenKind::False
+            | TokenKind::Int(_)
+            | TokenKind::Number(_)
+            | TokenKind::String(_) => Some(index + 1),
             TokenKind::LParen => self.skip_balanced(index, &TokenKind::LParen, &TokenKind::RParen),
             TokenKind::LAngle => self.skip_balanced(index, &TokenKind::LAngle, &TokenKind::RAngle),
             TokenKind::LBrace => self.skip_balanced(index, &TokenKind::LBrace, &TokenKind::RBrace),
@@ -1033,34 +1046,39 @@ impl Parser {
         let first_name = self.expect_qualified(Error::ExpectedClassName)?;
         let first_args = self.parse_class_args()?;
         self.skip_newlines();
-        let (name, name_span, params, supers) = if self.is(TokenKind::Comma) || self.is(TokenKind::FatArrow)
-        {
-            if first_args.is_empty() {
-                return Err(self.error(Error::ExpectedClassArgument));
-            }
-            let mut supers = vec![Constraint {
-                class_name: first_name,
-                args: first_args,
-            }];
-            while self.eat(&TokenKind::Comma) {
-                self.skip_newlines();
-                let class_name = self.expect_qualified(Error::ExpectedClassName)?;
-                let args = self.parse_class_args()?;
-                if args.is_empty() {
+        let (name, name_span, params, supers) =
+            if self.is(TokenKind::Comma) || self.is(TokenKind::FatArrow) {
+                if first_args.is_empty() {
                     return Err(self.error(Error::ExpectedClassArgument));
                 }
-                supers.push(Constraint { class_name, args });
+                let mut supers = vec![Constraint {
+                    class_name: first_name,
+                    args: first_args,
+                }];
+                while self.eat(&TokenKind::Comma) {
+                    self.skip_newlines();
+                    let class_name = self.expect_qualified(Error::ExpectedClassName)?;
+                    let args = self.parse_class_args()?;
+                    if args.is_empty() {
+                        return Err(self.error(Error::ExpectedClassArgument));
+                    }
+                    supers.push(Constraint { class_name, args });
+                    self.skip_newlines();
+                }
+                self.expect(&TokenKind::FatArrow, Error::ExpectedFatArrow)?;
                 self.skip_newlines();
-            }
-            self.expect(&TokenKind::FatArrow, Error::ExpectedFatArrow)?;
-            self.skip_newlines();
-            let name_span = self.cur().span;
-            let name = self.expect_upper(Error::ExpectedClassName)?;
-            let params = self.parse_class_params()?;
-            (name, name_span, params, supers)
-        } else {
-            (first_name, first_span, self.params_from_args(first_args)?, Vec::new())
-        };
+                let name_span = self.cur().span;
+                let name = self.expect_upper(Error::ExpectedClassName)?;
+                let params = self.parse_class_params()?;
+                (name, name_span, params, supers)
+            } else {
+                (
+                    first_name,
+                    first_span,
+                    self.params_from_args(first_args)?,
+                    Vec::new(),
+                )
+            };
         let mut methods = Vec::new();
         loop {
             self.skip_newlines();
@@ -1156,7 +1174,11 @@ impl Parser {
             let name = self.expect_ident(Error::ExpectedMethodName)?;
             self.expect(&TokenKind::Eq, Error::ExpectedEq)?;
             let word = self.expect_ident(Error::ExpectedWord)?;
-            let word = if is_upper(&word) { self.qualify(word) } else { word };
+            let word = if is_upper(&word) {
+                self.qualify(word)
+            } else {
+                word
+            };
             methods.push(MethodBind {
                 name,
                 name_span,
@@ -1459,7 +1481,9 @@ impl Parser {
     fn parse_record_tail(&mut self) -> Result<RecordTail, Diagnostic> {
         self.skip_newlines();
         if self.is_lower_ident() {
-            return Ok(RecordTail::Var(self.expect_lower(Error::ExpectedRowVariable)?));
+            return Ok(RecordTail::Var(
+                self.expect_lower(Error::ExpectedRowVariable)?,
+            ));
         }
         if self.starts_type_item() {
             return Ok(RecordTail::Type(Box::new(self.parse_type_item()?)));
@@ -1708,7 +1732,9 @@ impl Parser {
         while self.is_lower_ident() && (names.is_empty() || !self.cur().line_start) {
             let name = self.expect_ident(Error::ExpectedName)?;
             if !seen.insert(name.clone()) {
-                return Err(self.error_at(self.last_span, Error::DuplicateDefinition(name.to_string())));
+                return Err(
+                    self.error_at(self.last_span, Error::DuplicateDefinition(name.to_string()))
+                );
             }
             names.push(name);
         }
@@ -1958,7 +1984,10 @@ fn check_duplicates(module: &Module) -> Result<(), Diagnostic> {
 
 fn claim(seen: &mut HashSet<String>, name: &str, span: Span) -> Result<(), Diagnostic> {
     if !seen.insert(name.to_string()) {
-        Err(Diagnostic::new(span, Error::DuplicateDefinition(name.to_string())))
+        Err(Diagnostic::new(
+            span,
+            Error::DuplicateDefinition(name.to_string()),
+        ))
     } else {
         Ok(())
     }
@@ -2002,10 +2031,7 @@ mod tests {
         let module = parse(source, ParseMode::Source)
             .unwrap_or_else(|error| panic!("{}", error.render("Maybe.ply", source)));
         let text = module.to_string();
-        assert!(
-            text.contains(": fromMaybe ( a (Maybe a) -- a )"),
-            "{text}"
-        );
+        assert!(text.contains(": fromMaybe ( a (Maybe a) -- a )"), "{text}");
         assert!(text.contains("Nothing ->\n  Just -> nip"), "{text}");
         assert!(
             text.contains(": mapMaybe ( (Maybe a) (a -- b) -- (Maybe b) )"),
@@ -2079,7 +2105,8 @@ mod tests {
         let program = ok(": one ( -- Num )\n  1\n\n: nums ( -- (Array Num) )\n  < 1 one dup >\n");
         assert!(program.contains("< 1 one dup >"), "{program}");
         assert_eq!(ok(&program), program);
-        let read = ok("; Person = Person name : Str, age : Num\n: get ( Person -- Str )\n  name>>\n");
+        let read =
+            ok("; Person = Person name : Str, age : Num\n: get ( Person -- Str )\n  name>>\n");
         assert!(read.contains("name>>"), "{read}");
         assert_eq!(
             err(": bad ( -- (Array Num) )\n  < 1 | 2 >\n", ParseMode::Source),
@@ -2090,7 +2117,10 @@ mod tests {
             "unexpected character"
         );
         assert_eq!(
-            err("; Person = Person name : Str, name : Int\n", ParseMode::Source),
+            err(
+                "; Person = Person name : Str, name : Int\n",
+                ParseMode::Source
+            ),
             "duplicate field name"
         );
     }
@@ -2135,7 +2165,8 @@ mod tests {
     #[test]
     fn a_word_after_the_scheme_is_the_body() {
         let source = ": double ( Int -- Int ) dup iadd\n";
-        let module = parse(source, ParseMode::Source).unwrap_or_else(|error| panic!("{}", error.message));
+        let module =
+            parse(source, ParseMode::Source).unwrap_or_else(|error| panic!("{}", error.message));
         let crate::ast::Item::Def(def) = &module.items[0] else {
             panic!("def");
         };
@@ -2143,7 +2174,10 @@ mod tests {
         assert!(matches!(def.body[0].node, crate::ast::TermNode::Word(ref name) if name == "dup"));
         assert!(matches!(def.body[1].node, crate::ast::TermNode::Word(ref name) if name == "iadd"));
         let text = ok(source);
-        assert!(text.contains(": double ( Int -- Int )\n  dup iadd"), "{text}");
+        assert!(
+            text.contains(": double ( Int -- Int )\n  dup iadd"),
+            "{text}"
+        );
         assert_eq!(
             err(": fact ( Int -- Int ) 0n -> 1n\n", ParseMode::Source),
             "expected term"
@@ -2167,7 +2201,8 @@ mod tests {
 
     #[test]
     fn a_doc_comment_sticks_to_the_next_declaration() {
-        let text = ok(".. Copy the top.\n..\n.. Again.\n: double ( Int -- Int )\n  .. note\n  dup\n");
+        let text =
+            ok(".. Copy the top.\n..\n.. Again.\n: double ( Int -- Int )\n  .. note\n  dup\n");
         assert!(
             text.starts_with(".. Copy the top.\n..\n.. Again.\n: double"),
             "{text}"
@@ -2176,7 +2211,10 @@ mod tests {
         let detached = ok(".. gone\n\n: double ( Int -- Int )\n  dup\n");
         assert!(!detached.contains("gone"), "{detached}");
         let before_import = ok(".. gone\n\n~ \"Data/Maybe\" Just\n\n: id ( Int -- Int )\n  dup\n");
-        assert!(before_import.contains("~ \"Data/Maybe\" Just"), "{before_import}");
+        assert!(
+            before_import.contains("~ \"Data/Maybe\" Just"),
+            "{before_import}"
+        );
         assert!(!before_import.contains("gone"), "{before_import}");
         assert_eq!(
             err(
@@ -2194,13 +2232,9 @@ mod tests {
             text.contains("# Eq Int\n  eq = eqInt\n.. Next.\n: id"),
             "{text}"
         );
-        let spaced = ok(
-            "# Eq Int\n  eq = eqInt\n\n.. Next.\n: id ( Int -- Int )\n  dup\n",
-        );
+        let spaced = ok("# Eq Int\n  eq = eqInt\n\n.. Next.\n: id ( Int -- Int )\n  dup\n");
         assert!(spaced.contains(".. Next.\n: id"), "{spaced}");
-        let class = ok(
-            "& Eq a\n  eq ( a a -- Bool )\n.. Next.\n: id ( Int -- Int )\n  dup\n",
-        );
+        let class = ok("& Eq a\n  eq ( a a -- Bool )\n.. Next.\n: id ( Int -- Int )\n  dup\n");
         assert!(
             class.contains("& Eq a\n  eq ( a a -- Bool )\n.. Next.\n: id"),
             "{class}"
@@ -2214,7 +2248,8 @@ mod tests {
 
     #[test]
     fn interface_has_no_body() {
-        let source = "language 1\n; Maybe a = Nothing | Just a\n\n: fromMaybe ( a. a (Maybe a) -- a )\n";
+        let source =
+            "language 1\n; Maybe a = Nothing | Just a\n\n: fromMaybe ( a. a (Maybe a) -- a )\n";
         let module = parse(source, ParseMode::Interface)
             .unwrap_or_else(|error| panic!("{}", error.render("Maybe.d.ply", source)));
         assert_eq!(module.language, Some(1));
@@ -2241,7 +2276,11 @@ mod tests {
         let source = "language 1\n; foreign Hub a\n";
         let module = parse(source, ParseMode::Interface)
             .unwrap_or_else(|error| panic!("{}", error.render("Hub.d.ply", source)));
-        assert!(module.to_string().contains("language 1\n; foreign Hub a"), "{}", module);
+        assert!(
+            module.to_string().contains("language 1\n; foreign Hub a"),
+            "{}",
+            module
+        );
         assert_eq!(
             err("; foreign Hub a = Listeners\n", ParseMode::Source),
             "foreign type has no constructors"
@@ -2254,7 +2293,10 @@ mod tests {
             err("; foreign Hub a\n  Listeners\n", ParseMode::Source),
             "foreign type has no constructors"
         );
-        assert_eq!(err("; Hub a =\n", ParseMode::Source), "expected constructor");
+        assert_eq!(
+            err("; Hub a =\n", ParseMode::Source),
+            "expected constructor"
+        );
     }
 
     #[test]
@@ -2320,10 +2362,7 @@ mod tests {
             "expected '--'"
         );
         assert_eq!(
-            err(
-                ": f ( (..s a) -- Int )\n  drop\n",
-                ParseMode::Source
-            ),
+            err(": f ( (..s a) -- Int )\n  drop\n", ParseMode::Source),
             "expected '--'"
         );
     }
@@ -2339,29 +2378,33 @@ mod tests {
             "expected import path"
         );
         assert_eq!(
-            err("language 1\n~ public \"Data/Scan\" (scan)\n", ParseMode::Interface),
+            err(
+                "language 1\n~ public \"Data/Scan\" (scan)\n",
+                ParseMode::Interface
+            ),
             "expected import path"
         );
         let listed = ok("@ Maybe, Nothing, Just\n\n; Maybe a = Nothing | Just a\n");
         assert!(listed.contains("@ Maybe, Nothing, Just\n"), "{listed}");
-        let after_import = ok(
-            "~ \"Data/Clock\" Time\n\n@ Time, soon\n\n: soon ( -- Unit )\n  Unit\n",
-        );
+        let after_import =
+            ok("~ \"Data/Clock\" Time\n\n@ Time, soon\n\n: soon ( -- Unit )\n  Unit\n");
         assert!(after_import.starts_with("@ Time, soon\n"), "{after_import}");
-        assert!(after_import.contains("~ \"Data/Clock\" Time"), "{after_import}");
-        let after_word = ok(
-            ": soon ( -- Unit )\n  Unit\n\n@ soon\n",
+        assert!(
+            after_import.contains("~ \"Data/Clock\" Time"),
+            "{after_import}"
         );
+        let after_word = ok(": soon ( -- Unit )\n  Unit\n\n@ soon\n");
         assert!(after_word.starts_with("@ soon\n"), "{after_word}");
         assert!(after_word.contains(": soon ( -- Unit )"), "{after_word}");
-        let between = ok(
-            "~ \"Data/Clock\" Time\n\n@ Time\n\n~ \"Data/Sink\" Sink\n",
-        );
+        let between = ok("~ \"Data/Clock\" Time\n\n@ Time\n\n~ \"Data/Sink\" Sink\n");
         assert!(between.starts_with("@ Time\n"), "{between}");
         assert!(between.contains("~ \"Data/Clock\" Time"), "{between}");
         assert!(between.contains("~ \"Data/Sink\" Sink"), "{between}");
         let wrapped = ok("@\n  Stream, Behavior,\n  listen\n\n~ \"Data/Stream\" Stream\n");
-        assert!(wrapped.contains("@ Stream, Behavior, listen\n"), "{wrapped}");
+        assert!(
+            wrapped.contains("@ Stream, Behavior, listen\n"),
+            "{wrapped}"
+        );
         let empty = ok("@\n\n: main ( -- Unit )\n  Unit\n");
         assert!(empty.contains("@\n"), "{empty}");
         assert!(!empty.contains("@ main"), "{empty}");
@@ -2380,7 +2423,10 @@ mod tests {
             err(".. The list.\n@ soon\n", ParseMode::Source),
             "doc comment must sit above a declaration"
         );
-        assert_eq!(err("public (A)\n", ParseMode::Source), "expected declaration");
+        assert_eq!(
+            err("public (A)\n", ParseMode::Source),
+            "expected declaration"
+        );
         assert_eq!(
             err("language 1\npublic (A)\n", ParseMode::Interface),
             "expected declaration"
@@ -2400,10 +2446,7 @@ mod tests {
         assert!(text.contains("& Eq a\n  eq ( a a -- Bool )"), "{text}");
         assert!(!text.contains("eq :"), "{text}");
         assert_eq!(
-            err(
-                "& Eq a\n  eq : a a -- Bool\n",
-                ParseMode::Source
-            ),
+            err("& Eq a\n  eq : a a -- Bool\n", ParseMode::Source),
             "expected '('"
         );
         let neutral = ok("& Neutral a\n  empty ( -- a )\n");
@@ -2421,15 +2464,24 @@ mod tests {
             "expected declaration"
         );
         assert_eq!(
-            err(": foreign private nzero ( Num -- Bool )\n", ParseMode::Source),
+            err(
+                ": foreign private nzero ( Num -- Bool )\n",
+                ParseMode::Source
+            ),
             "expected '('"
         );
         assert_eq!(
-            err("language 1\n: private hidden ( Int -- Int )\n", ParseMode::Interface),
+            err(
+                "language 1\n: private hidden ( Int -- Int )\n",
+                ParseMode::Interface
+            ),
             "expected '('"
         );
         assert_eq!(
-            err(": foreign foreign nzero ( Num -- Bool )\n", ParseMode::Source),
+            err(
+                ": foreign foreign nzero ( Num -- Bool )\n",
+                ParseMode::Source
+            ),
             "expected definition name"
         );
         assert_eq!(
@@ -2437,7 +2489,8 @@ mod tests {
             "expected declaration"
         );
         let source = ": fact ( Int -- Int )\n  0n -> 1n\n  n -> n dup 1n isub fact imul\n: double ( Int -- Int ) dup iadd\n";
-        let module = parse(source, ParseMode::Source).unwrap_or_else(|error| panic!("{}", error.message));
+        let module =
+            parse(source, ParseMode::Source).unwrap_or_else(|error| panic!("{}", error.message));
         assert_eq!(module.items.len(), 2, "{module}");
         let crate::ast::Item::Def(fact) = &module.items[0] else {
             panic!("fact");
@@ -2450,8 +2503,14 @@ mod tests {
         assert!(double.clauses.is_empty());
         assert_eq!(double.body.len(), 2);
         let printed = ok(source);
-        assert!(printed.contains(": fact ( Int -- Int )\n  0n -> 1n"), "{printed}");
-        assert!(printed.contains(": double ( Int -- Int )\n  dup iadd"), "{printed}");
+        assert!(
+            printed.contains(": fact ( Int -- Int )\n  0n -> 1n"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains(": double ( Int -- Int )\n  dup iadd"),
+            "{printed}"
+        );
     }
 
     #[test]
@@ -2472,7 +2531,8 @@ mod tests {
         assert!(two.contains(": b ( Int -- Int )\n  0n"), "{two}");
 
         let source = ": id ( a. a -- a )\n  n -> n\n";
-        let module = parse(source, ParseMode::Source).unwrap_or_else(|error| panic!("{}", error.message));
+        let module =
+            parse(source, ParseMode::Source).unwrap_or_else(|error| panic!("{}", error.message));
         let crate::ast::Item::Def(def) = &module.items[0] else {
             panic!("def");
         };
@@ -2481,7 +2541,9 @@ mod tests {
             def.clauses[0].patterns.as_slice(),
             [crate::ast::Pattern::Bind(_, name)] if name == "n"
         ));
-        assert!(matches!(def.clauses[0].body[0].node, crate::ast::TermNode::Word(ref name) if name == "n"));
+        assert!(
+            matches!(def.clauses[0].body[0].node, crate::ast::TermNode::Word(ref name) if name == "n")
+        );
         assert_eq!(
             err(": bad ( Int -- Int )\n  -> n\n", ParseMode::Source),
             "expected term"
@@ -2492,14 +2554,17 @@ mod tests {
         );
 
         let quoted = ": rev ( a b. a b -- b a )\n  [ x y -> y x ] call\n";
-        let module = parse(quoted, ParseMode::Source).unwrap_or_else(|error| panic!("{}", error.message));
+        let module =
+            parse(quoted, ParseMode::Source).unwrap_or_else(|error| panic!("{}", error.message));
         let crate::ast::Item::Def(def) = &module.items[0] else {
             panic!("def");
         };
         let crate::ast::TermNode::Quote(terms) = &def.body[0].node else {
             panic!("quote");
         };
-        assert!(matches!(&terms[0].node, crate::ast::TermNode::Bind(names) if names == &["x".to_string(), "y".to_string()]));
+        assert!(
+            matches!(&terms[0].node, crate::ast::TermNode::Bind(names) if names == &["x".to_string(), "y".to_string()])
+        );
         assert!(matches!(&terms[1].node, crate::ast::TermNode::Word(name) if name == "y"));
         assert!(matches!(&terms[2].node, crate::ast::TermNode::Word(name) if name == "x"));
         let printed = ok(": rev ( a b. a b -- b a )\n  [ x y -> y x ] call\n");
@@ -2527,13 +2592,9 @@ mod tests {
 
     #[test]
     fn an_array_pattern_has_a_fixed_length() {
-        let text = ok(
-            ": isEmpty ( (Array a) -- Bool )\n  <> -> true\n  _ -> false\n",
-        );
+        let text = ok(": isEmpty ( (Array a) -- Bool )\n  <> -> true\n  _ -> false\n");
         assert!(text.contains("<> -> true"), "{text}");
-        let split = ok(
-            ": pick ( (Array Int) -- Int )\n  < 0n\n    a > -> a\n  _ -> 0n\n",
-        );
+        let split = ok(": pick ( (Array Int) -- Int )\n  < 0n\n    a > -> a\n  _ -> 0n\n");
         assert!(split.contains("< 0n a > -> a"), "{split}");
         let nested = ok(
             ": inner ( (Array (Maybe Int)) -- Int )\n  < (Just x) > -> x\n  < < > > -> 0n\n  _ -> 0n\n",
@@ -2548,19 +2609,14 @@ mod tests {
             "expected pattern"
         );
         assert_eq!(
-            err(
-                ": bad ( (Array Int) -- Int )\n  < 0n\n",
-                ParseMode::Source
-            ),
+            err(": bad ( (Array Int) -- Int )\n  < 0n\n", ParseMode::Source),
             "unterminated array"
         );
     }
 
     #[test]
     fn an_instance_prints_every_class_on_one_head() {
-        let text = ok(
-            "# Comparable, Sortable (Box a)\n  eq = eqBox\n  compare = cmpBox\n",
-        );
+        let text = ok("# Comparable, Sortable (Box a)\n  eq = eqBox\n  compare = cmpBox\n");
         assert!(
             text.contains("# Comparable, Sortable (Box a)\n  eq = eqBox\n  compare = cmpBox"),
             "{text}"
@@ -2569,16 +2625,12 @@ mod tests {
 
     #[test]
     fn a_superclass_and_a_constraint_comma_print() {
-        let class = ok(
-            "& Comparable a => Sortable a\n  compare ( a a -- Ordering )\n",
-        );
+        let class = ok("& Comparable a => Sortable a\n  compare ( a a -- Ordering )\n");
         assert!(
             class.contains("& Comparable a => Sortable a\n  compare ( a a -- Ordering )"),
             "{class}"
         );
-        let several = ok(
-            "& Comparable a, Show a => Sortable a\n  compare ( a a -- Bool )\n",
-        );
+        let several = ok("& Comparable a, Show a => Sortable a\n  compare ( a a -- Bool )\n");
         assert!(
             several.contains("& Comparable a, Show a => Sortable a"),
             "{several}"
@@ -2592,7 +2644,10 @@ mod tests {
         let both = ok(": f ( Eq Person, Ord a => a -- a )\n  dup\n");
         assert!(both.contains("Eq Person => Ord a =>"), "{both}");
         assert_eq!(
-            err("& Comparable => Sortable a\n  compare ( a a -- Bool )\n", ParseMode::Source),
+            err(
+                "& Comparable => Sortable a\n  compare ( a a -- Bool )\n",
+                ParseMode::Source
+            ),
             "expected class argument"
         );
         assert_eq!(
@@ -2602,7 +2657,10 @@ mod tests {
             ),
             "expected method name"
         );
-        assert_eq!(err(": f ( Eq a, => a -- a )\n  dup\n", ParseMode::Source), "expected class name");
+        assert_eq!(
+            err(": f ( Eq a, => a -- a )\n  dup\n", ParseMode::Source),
+            "expected class name"
+        );
     }
 
     #[test]

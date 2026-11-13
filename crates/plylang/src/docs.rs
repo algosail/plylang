@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use crate::ast::{
     method_line, type_string, Class, Data, Def, Exports, Instance, Item, Module, Synonym, Type,
 };
-use crate::build::{io_error, located, module_path_of, open_package, os_error, walk_ply, BuildError};
+use crate::build::{
+    io_error, located, module_path_of, open_package, os_error, walk_ply, BuildError,
+};
 use crate::codes::Error;
 use crate::lexer::tokenize;
 use crate::parser::parse;
@@ -41,8 +43,8 @@ fn render(package: &crate::build::Package) -> Result<String, BuildError> {
     let mut pages = Vec::new();
     for file in files {
         let source = fs::read_to_string(&file).map_err(|error| os_error(&file, error))?;
-        let module = parse(&source, ParseMode::Source)
-            .map_err(|error| located(&file, &source, error))?;
+        let module =
+            parse(&source, ParseMode::Source).map_err(|error| located(&file, &source, error))?;
         let module_path = module_path_of(&package.source, &file);
         if let Err(message) = crate::paths::module_name_from_path(&format!("{module_path}.ply")) {
             return Err(located(
@@ -51,8 +53,8 @@ fn render(package: &crate::build::Package) -> Result<String, BuildError> {
                 crate::diagnostic::Diagnostic::new(module.span, message),
             ));
         }
-        let description = module_description(&source)
-            .map_err(|error| located(&file, &source, error))?;
+        let description =
+            module_description(&source).map_err(|error| located(&file, &source, error))?;
         pages.push(Page {
             path: module_path,
             file,
@@ -144,16 +146,21 @@ fn render_page(
             Item::Def(def) if docs_def(&page.module, def) => {
                 words.push((def.name.clone(), format_word(def), def.doc.clone()))
             }
-            Item::Place(place) if docs_name(&page.module, &place.name) => words.push((
-                place.name.clone(),
-                format_place(place),
-                place.doc.clone(),
-            )),
+            Item::Place(place) if docs_name(&page.module, &place.name) => {
+                words.push((place.name.clone(), format_place(place), place.doc.clone()))
+            }
             _ => {}
         }
     }
     if matches!(page.module.exports, Exports::List(_)) {
-        append_published(&page.file, &page.module, &mut types, &mut classes, &mut instances, &mut words);
+        append_published(
+            &page.file,
+            &page.module,
+            &mut types,
+            &mut classes,
+            &mut instances,
+            &mut words,
+        );
     }
     for head in heads_defined_here(pages, index) {
         if !instances.iter().any(|have| have == &head) {
@@ -179,7 +186,10 @@ fn docs_data(module: &Module, data: &Data) -> bool {
 
 fn docs_class(module: &Module, class: &Class) -> bool {
     docs_name(module, &class.name)
-        || class.methods.iter().any(|method| docs_name(module, &method.name))
+        || class
+            .methods
+            .iter()
+            .any(|method| docs_name(module, &method.name))
 }
 
 fn docs_def(module: &Module, def: &Def) -> bool {
@@ -219,7 +229,11 @@ fn append_published(
                 types.push((data.name.clone(), format_data(&data), data.doc.clone()));
             }
             crate::surface::Found::Synonym(synonym) => {
-                types.push((synonym.name.clone(), format_synonym(&synonym), synonym.doc.clone()));
+                types.push((
+                    synonym.name.clone(),
+                    format_synonym(&synonym),
+                    synonym.doc.clone(),
+                ));
             }
             crate::surface::Found::Class(class) => {
                 if classes.iter().any(|(have, _, _)| have == &class.name) {
@@ -311,7 +325,10 @@ fn import_path(package_name: Option<&str>, module_path: &str) -> String {
 fn module_description(source: &str) -> Result<String, crate::diagnostic::Diagnostic> {
     let tokens = tokenize(source)?;
     let mut index = 0;
-    while matches!(tokens.get(index).map(|token| &token.kind), Some(TokenKind::Newline)) {
+    while matches!(
+        tokens.get(index).map(|token| &token.kind),
+        Some(TokenKind::Newline)
+    ) {
         index += 1;
     }
     let mut lines = Vec::new();
@@ -319,15 +336,26 @@ fn module_description(source: &str) -> Result<String, crate::diagnostic::Diagnos
         lines.push(text.clone());
         index += 1;
         let mut breaks = 0;
-        while matches!(tokens.get(index).map(|token| &token.kind), Some(TokenKind::Newline)) {
+        while matches!(
+            tokens.get(index).map(|token| &token.kind),
+            Some(TokenKind::Newline)
+        ) {
             breaks += 1;
             index += 1;
         }
-        let next_is_doc = matches!(tokens.get(index).map(|token| &token.kind), Some(TokenKind::Doc(_)));
+        let next_is_doc = matches!(
+            tokens.get(index).map(|token| &token.kind),
+            Some(TokenKind::Doc(_))
+        );
         if breaks == 1 && next_is_doc {
             continue;
         }
-        if breaks >= 2 || tokens.get(index).map(|token| &token.kind).is_none_or(|kind| matches!(kind, TokenKind::Eof)) {
+        if breaks >= 2
+            || tokens
+                .get(index)
+                .map(|token| &token.kind)
+                .is_none_or(|kind| matches!(kind, TokenKind::Eof))
+        {
             return Ok(join_doc(&lines));
         }
         return Ok(String::new());
@@ -622,9 +650,7 @@ mod tests {
         );
         write_docs(&temp.0, None).unwrap_or_else(|error| panic!("{}", error.render()));
         let page = fs::read_to_string(temp.0.join("DOCS.md")).unwrap();
-        let maybe_at = page
-            .find("## head/Data/Maybe\n")
-            .expect("Maybe section");
+        let maybe_at = page.find("## head/Data/Maybe\n").expect("Maybe section");
         let maybe = page[maybe_at..].split("\n## ").next().unwrap();
         assert!(maybe.contains("- Show (Maybe a)\n"), "{maybe}");
         assert!(!maybe.contains("- Show Num\n"), "{maybe}");

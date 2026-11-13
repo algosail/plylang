@@ -26,13 +26,13 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ast::{
-    Class, Def, EffectRow, Exports, Import, Item, Lit, Module, Place, RecordTail,
-    Scheme, Stack, StackEffect, StackTail, Synonym, Term, TermNode, Type, Vis,
+    Class, Def, EffectRow, Exports, Import, Item, Lit, Module, Place, RecordTail, Scheme, Stack,
+    StackEffect, StackTail, Synonym, Term, TermNode, Type, Vis,
 };
 
 use crate::builtin;
-use crate::diagnostic::Diagnostic;
 use crate::codes::Error;
+use crate::diagnostic::Diagnostic;
 use crate::parser::parse;
 use crate::paths::ParseMode;
 use crate::span::Span;
@@ -453,7 +453,10 @@ struct InstanceMethod {
 #[derive(Clone, Debug)]
 enum Dict {
     Assumption(usize),
-    Super { base: Box<Dict>, field: String },
+    Super {
+        base: Box<Dict>,
+        field: String,
+    },
     Instance {
         methods: Vec<ResolvedMethod>,
         /// Immediate superclass dictionaries. The field name is the class.
@@ -961,7 +964,10 @@ impl Checker {
         let mut param_scope = Scope::new();
         for param in &data.params {
             if param_scope.tys.contains_key(param) {
-                return Err(self.error(data.name_span, Error::DuplicateTypeVariable(param.to_string())));
+                return Err(self.error(
+                    data.name_span,
+                    Error::DuplicateTypeVariable(param.to_string()),
+                ));
             }
             let kind = self.kind_type();
             let id = self.ty_of_kind(kind);
@@ -1063,9 +1069,11 @@ impl Checker {
             .items
             .iter()
             .filter_map(|item| match item {
-                Item::Synonym(synonym) => {
-                    Some((synonym.name.clone(), synonym.params.len(), synonym.name_span))
-                }
+                Item::Synonym(synonym) => Some((
+                    synonym.name.clone(),
+                    synonym.params.len(),
+                    synonym.name_span,
+                )),
                 _ => None,
             })
             .collect();
@@ -1087,11 +1095,7 @@ impl Checker {
         only: Option<&HashSet<String>>,
         span: Span,
     ) -> Result<(), Diagnostic> {
-        let stored = self
-            .datas
-            .get(data_name)
-            .cloned()
-            .expect("data was staged");
+        let stored = self.datas.get(data_name).cloned().expect("data was staged");
         for ctor in &stored.ctors {
             let export = match only {
                 None => true,
@@ -1297,7 +1301,10 @@ impl Checker {
     fn import_missing(&self, import: &Import, name: &str) -> Diagnostic {
         self.error(
             import.span,
-            Error::ImportNotExported { path: import.path.to_string(), name: name.to_string() },
+            Error::ImportNotExported {
+                path: import.path.to_string(),
+                name: name.to_string(),
+            },
         )
     }
 
@@ -1334,10 +1341,7 @@ impl Checker {
         let mut seen = HashSet::new();
         for item in &list.names {
             if !seen.insert(item.name.clone()) {
-                return Err(self.error(
-                    item.span,
-                    Error::DuplicateDefinition(item.name.clone()),
-                ));
+                return Err(self.error(item.span, Error::DuplicateDefinition(item.name.clone())));
             }
             if crate::surface::defines(module, &item.name) || self.imported_name(&item.name) {
                 continue;
@@ -1483,9 +1487,9 @@ impl Checker {
     /// An imported synonym is expanded in its declaring module. A name written
     /// in this module still has to be imported.
     fn hidden_type_visible(&self) -> bool {
-        self.expanding.iter().any(|name| {
-            self.synonyms.get(name).is_some_and(|body| body.open)
-        })
+        self.expanding
+            .iter()
+            .any(|name| self.synonyms.get(name).is_some_and(|body| body.open))
     }
 
     /// Elaborate a saturated synonym. The caller has already checked the arity.
@@ -1531,7 +1535,10 @@ impl Checker {
             ));
         }
         if self.words.contains_key(&def.name) {
-            return Err(self.error(def.name_span, Error::DuplicateDefinition(def.name.to_string())));
+            return Err(self.error(
+                def.name_span,
+                Error::DuplicateDefinition(def.name.to_string()),
+            ));
         }
         let scheme = self.elaborate_scheme(&def.scheme, def.name_span)?;
         self.words.insert(def.name.clone(), scheme);
@@ -1587,11 +1594,7 @@ impl Checker {
         if !self.places.contains(name) {
             return Err(self.error(span, Error::UndefinedPlace(name.to_string())));
         }
-        let scheme = self
-            .words
-            .get(name)
-            .cloned()
-            .expect("a place has a reader");
+        let scheme = self.words.get(name).cloned().expect("a place has a reader");
         let (_, output, effect, _) = self.instantiate_scheme(&scheme, false);
         self.join_effect(effect, span)?;
         let Some((_, ty)) = self.top_slot(output) else {
@@ -1942,7 +1945,9 @@ impl Checker {
             builtin::Lowering::If => {
                 if let Some((below_else, else_q)) = self.top_slot(stack) {
                     if let Some((below_then, then_q)) = self.top_slot(below_else) {
-                        let input = self.drop_cons(below_then, 1).map(|stack| self.open_spine(stack));
+                        let input = self
+                            .drop_cons(below_then, 1)
+                            .map(|stack| self.open_spine(stack));
                         self.run_quote(then_q, input)?;
                         self.run_quote(else_q, input)?;
                     }
@@ -1965,7 +1970,9 @@ impl Checker {
                 self.stacks[stack.0 as usize] = StackNode::Link(cons);
                 Ok((tail, ty))
             }
-            StackNode::Empty | StackNode::Rigid { .. } => Err(self.error(span, Error::StackUnderflow)),
+            StackNode::Empty | StackNode::Rigid { .. } => {
+                Err(self.error(span, Error::StackUnderflow))
+            }
             other => panic!("bind on {other:?}"),
         }
     }
@@ -2266,7 +2273,9 @@ impl Checker {
             if !self.effect_is_bare(*id) {
                 return Err(self.error(
                     span,
-                    Error::EffectNotOpen { found: self.show_effect_row(*id) },
+                    Error::EffectNotOpen {
+                        found: self.show_effect_row(*id),
+                    },
                 ));
             }
         }
@@ -2328,7 +2337,10 @@ impl Checker {
                 if self.constructor_open(&data_name, &ctor.name).is_err() {
                     return Err(self.error(span, Error::FieldsPrivate(data_name)));
                 }
-                let Some(index) = ctor.names.iter().position(|field| field.as_deref() == Some(name))
+                let Some(index) = ctor
+                    .names
+                    .iter()
+                    .position(|field| field.as_deref() == Some(name))
                 else {
                     return Err(self.error(
                         span,
@@ -2347,11 +2359,17 @@ impl Checker {
             if self.constructor_open(&data_name, &ctor.name).is_err() {
                 return Err(self.error(span, Error::FieldsPrivate(data_name)));
             }
-            let Some(index) = ctor.names.iter().position(|field| field.as_deref() == Some(name))
+            let Some(index) = ctor
+                .names
+                .iter()
+                .position(|field| field.as_deref() == Some(name))
             else {
                 return Err(self.error(
                     span,
-                    Error::NoSuchField { type_name: data_name, name: name.to_string() },
+                    Error::NoSuchField {
+                        type_name: data_name,
+                        name: name.to_string(),
+                    },
                 ));
             };
             let fields = self.instantiate_fields(&data.params, &args, &ctor.fields);
@@ -2365,7 +2383,10 @@ impl Checker {
             if self.constructor_open(&data_name, &ctor.name).is_err() {
                 return Err(self.error(span, Error::FieldsPrivate(data_name)));
             }
-            let Some(index) = ctor.names.iter().position(|field| field.as_deref() == Some(name))
+            let Some(index) = ctor
+                .names
+                .iter()
+                .position(|field| field.as_deref() == Some(name))
             else {
                 return Err(self.error(span, Error::FieldOfSeveralConstructors(name.to_string())));
             };
@@ -2373,10 +2394,9 @@ impl Checker {
             let field = fields[index];
             if let Some(previous) = shared {
                 if !self.congruent_ty(previous, field) {
-                    return Err(self.error(
-                        span,
-                        Error::FieldOfSeveralConstructors(name.to_string()),
-                    ));
+                    return Err(
+                        self.error(span, Error::FieldOfSeveralConstructors(name.to_string()))
+                    );
                 }
             } else {
                 shared = Some(field);
@@ -2386,12 +2406,7 @@ impl Checker {
     }
 
     /// `>>name` replaces one field. The value is above the base. The result is a new value.
-    fn set_field(
-        &mut self,
-        span: Span,
-        name: &str,
-        stack: StackId,
-    ) -> Result<StackId, Diagnostic> {
+    fn set_field(&mut self, span: Span, name: &str, stack: StackId) -> Result<StackId, Diagnostic> {
         let (under, value_ty) = self.pop_slot(stack, span)?;
         let ctor = self.refinement_of(under);
         let (rest, base_ty) = self.pop_slot(under, span)?;
@@ -2425,12 +2440,11 @@ impl Checker {
         let (rest, record_ty) = self.pop_slot(rest, span)?;
         let record_ty = self.expose(record_ty);
         let TyNode::Record(row) = self.tys[record_ty.0 as usize].clone() else {
-            return Err(self.error(
-                span,
-                Error::ExpectedRecord(self.show_ty(record_ty)),
-            ));
+            return Err(self.error(span, Error::ExpectedRecord(self.show_ty(record_ty))));
         };
-        let (mut fields, tail) = self.peel_row(row).map_err(|message| self.error(span, message))?;
+        let (mut fields, tail) = self
+            .peel_row(row)
+            .map_err(|message| self.error(span, message))?;
         if tail.is_some() {
             return Err(self.error(span, Error::RecordTailOpen));
         }
@@ -2490,10 +2504,7 @@ impl Checker {
 
     fn shared_spine(before: &[(StackId, TyId)], after: &[(StackId, TyId)]) -> usize {
         let mut shared = 0;
-        while shared < before.len()
-            && shared < after.len()
-            && before[shared].0 == after[shared].0
-        {
+        while shared < before.len() && shared < after.len() && before[shared].0 == after[shared].0 {
             shared += 1;
         }
         shared
@@ -2527,11 +2538,7 @@ impl Checker {
         Ok(self.ty_ctor("Array", vec![elem_ty]))
     }
 
-    fn check_record(
-        &mut self,
-        span: Span,
-        fields: &[(String, Term)],
-    ) -> Result<TyId, Diagnostic> {
+    fn check_record(&mut self, span: Span, fields: &[(String, Term)]) -> Result<TyId, Diagnostic> {
         let mut seen = HashSet::new();
         let mut pairs = Vec::new();
         for (name, term) in fields {
@@ -2983,7 +2990,8 @@ impl Checker {
                     let (arg_id, arg_kind) = self.elab_ty(arg, scope, span)?;
                     let result = self.kind_var();
                     let expect = self.kind_arrow(arg_kind, result);
-                    self.unify_kind(kind, expect).map_err(|message| self.error(span, message))?;
+                    self.unify_kind(kind, expect)
+                        .map_err(|message| self.error(span, message))?;
                     id = self.type_app(id, arg_id);
                     kind = result;
                 }
@@ -3029,7 +3037,10 @@ impl Checker {
                 } else {
                     Err(self.error(
                         span,
-                        Error::KindMismatch { expected: "Type".to_string(), found: self.show_kind(kind) },
+                        Error::KindMismatch {
+                            expected: "Type".to_string(),
+                            found: self.show_kind(kind),
+                        },
                     ))
                 }
             }
@@ -3095,10 +3106,7 @@ impl Checker {
     ) -> Result<(), Diagnostic> {
         let spliced = self.expose(spliced);
         let TyNode::Record(row_id) = self.tys[spliced.0 as usize].clone() else {
-            return Err(self.error(
-                span,
-                Error::ExpectedRecord(self.show_ty(spliced)),
-            ));
+            return Err(self.error(span, Error::ExpectedRecord(self.show_ty(spliced))));
         };
         let (spliced_fields, spliced_tail) = self
             .peel_row(row_id)
@@ -3167,7 +3175,12 @@ impl Checker {
 
     /// `| name` is one quantified row for the whole scheme. A type variable
     /// already bound before the dot cannot be reused as that tail.
-    fn named_row(&mut self, scope: &mut Scope, name: &str, span: Span) -> Result<RowId, Diagnostic> {
+    fn named_row(
+        &mut self,
+        scope: &mut Scope,
+        name: &str,
+        span: Span,
+    ) -> Result<RowId, Diagnostic> {
         if scope.tys.contains_key(name) {
             return Err(self.error(span, Error::DuplicateTypeVariable(name.to_string())));
         }
@@ -3289,7 +3302,13 @@ impl Checker {
 
     /// Same type after links and synonyms. This does not unify, so it does not commit.
     fn congruent_ty(&self, left: TyId, right: TyId) -> bool {
-        self.congruent_ty_seen(left, right, &mut HashSet::new(), &mut HashSet::new(), &mut HashSet::new())
+        self.congruent_ty_seen(
+            left,
+            right,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+        )
     }
 
     fn congruent_ty_seen(
@@ -3375,8 +3394,12 @@ impl Checker {
             }
             (StackNode::Empty, StackNode::Empty) => true,
             (
-                StackNode::Rigid { name: left_name, .. },
-                StackNode::Rigid { name: right_name, .. },
+                StackNode::Rigid {
+                    name: left_name, ..
+                },
+                StackNode::Rigid {
+                    name: right_name, ..
+                },
             ) => left_name == right_name,
             _ => false,
         }
@@ -3470,7 +3493,10 @@ impl Checker {
             (StackNode::Empty, StackNode::Empty) => Ok(()),
             (StackNode::Empty, StackNode::Cons(_, _))
             | (StackNode::Rigid { .. }, StackNode::Cons(_, _)) => Err(Error::StackUnderflow),
-            _ => Err(Error::TypeMismatch { expected: self.show_stack(need), found: self.show_stack(have) }),
+            _ => Err(Error::TypeMismatch {
+                expected: self.show_stack(need),
+                found: self.show_stack(have),
+            }),
         }
     }
 
@@ -3507,8 +3533,10 @@ impl Checker {
             return Err(Error::OccursCheck);
         }
         if self.recording {
-            self.trail
-                .push(Edit::Stack(var_id.0, self.stacks[var_id.0 as usize].clone()));
+            self.trail.push(Edit::Stack(
+                var_id.0,
+                self.stacks[var_id.0 as usize].clone(),
+            ));
         }
         self.stacks[var_id.0 as usize] = StackNode::Link(target);
         Ok(())
@@ -3704,7 +3732,10 @@ impl Checker {
                 return Err(Error::OccursCheck);
             }
             match &self.rows[row.0 as usize] {
-                RowNode::Fields { fields: found, tail } => {
+                RowNode::Fields {
+                    fields: found,
+                    tail,
+                } => {
                     for (name, ty) in found {
                         if fields.insert(name.clone(), *ty).is_some() {
                             return Err(Error::DuplicateField(name.to_string()));
@@ -3814,7 +3845,10 @@ impl Checker {
     }
 
     fn effect_mismatch(&self, need: EffectId, have: EffectId) -> Result<(), Error> {
-        Err(Error::EffectMismatch { expected: self.show_effect_row(need), found: self.show_effect_row(have) })
+        Err(Error::EffectMismatch {
+            expected: self.show_effect_row(need),
+            found: self.show_effect_row(have),
+        })
     }
 
     fn bind_effect_labels(
@@ -3869,7 +3903,10 @@ impl Checker {
                 return Err(Error::OccursCheck);
             }
             match &self.effects[effect.0 as usize] {
-                EffectNode::Labels { labels: found, tail } => {
+                EffectNode::Labels {
+                    labels: found,
+                    tail,
+                } => {
                     for name in found {
                         if !labels.insert(name.clone()) {
                             return Err(Error::DuplicateEffect(name.to_string()));
@@ -3921,17 +3958,22 @@ impl Checker {
             return false;
         }
         match self.tys[in_id.0 as usize].clone() {
-            TyNode::Ctor(_, args) => args.into_iter().any(|arg| self.occurs_ty(var_id, arg, seen)),
+            TyNode::Ctor(_, args) => args
+                .into_iter()
+                .any(|arg| self.occurs_ty(var_id, arg, seen)),
             TyNode::App(head, args) => {
                 self.occurs_ty(var_id, head, seen)
-                    || args.into_iter().any(|arg| self.occurs_ty(var_id, arg, seen))
+                    || args
+                        .into_iter()
+                        .any(|arg| self.occurs_ty(var_id, arg, seen))
             }
             TyNode::Fun(input, output, _) => {
                 self.ty_in_stack(var_id, input, seen) || self.ty_in_stack(var_id, output, seen)
             }
             TyNode::Record(row) => self.ty_in_row(var_id, row, seen),
             TyNode::Alias { args, body, .. } => {
-                args.into_iter().any(|arg| self.occurs_ty(var_id, arg, seen))
+                args.into_iter()
+                    .any(|arg| self.occurs_ty(var_id, arg, seen))
                     || self.occurs_ty(var_id, body, seen)
             }
             TyNode::Link(next) => self.occurs_ty(var_id, next, seen),
@@ -3946,7 +3988,9 @@ impl Checker {
         }
         match self.rows[row.0 as usize].clone() {
             RowNode::Fields { fields, tail } => {
-                fields.iter().any(|(_, ty)| self.occurs_ty(var_id, *ty, seen))
+                fields
+                    .iter()
+                    .any(|(_, ty)| self.occurs_ty(var_id, *ty, seen))
                     || tail.is_some_and(|tail| self.ty_in_row(var_id, tail, seen))
             }
             RowNode::Link(next) => self.ty_in_row(var_id, next, seen),
@@ -3994,14 +4038,19 @@ impl Checker {
             TyNode::Fun(input, output, _) => {
                 self.occurs_stack(var_id, input, seen) || self.occurs_stack(var_id, output, seen)
             }
-            TyNode::Ctor(_, args) => args.into_iter().any(|arg| self.stack_in_ty(var_id, arg, seen)),
+            TyNode::Ctor(_, args) => args
+                .into_iter()
+                .any(|arg| self.stack_in_ty(var_id, arg, seen)),
             TyNode::App(head, args) => {
                 self.stack_in_ty(var_id, head, seen)
-                    || args.into_iter().any(|arg| self.stack_in_ty(var_id, arg, seen))
+                    || args
+                        .into_iter()
+                        .any(|arg| self.stack_in_ty(var_id, arg, seen))
             }
             TyNode::Record(row) => self.stack_in_row(var_id, row, seen),
             TyNode::Alias { args, body, .. } => {
-                args.into_iter().any(|arg| self.stack_in_ty(var_id, arg, seen))
+                args.into_iter()
+                    .any(|arg| self.stack_in_ty(var_id, arg, seen))
                     || self.stack_in_ty(var_id, body, seen)
             }
             TyNode::Link(next) => self.stack_in_ty(var_id, next, seen),
@@ -4016,7 +4065,9 @@ impl Checker {
         }
         match self.rows[row.0 as usize].clone() {
             RowNode::Fields { fields, tail } => {
-                fields.iter().any(|(_, ty)| self.stack_in_ty(var_id, *ty, seen))
+                fields
+                    .iter()
+                    .any(|(_, ty)| self.stack_in_ty(var_id, *ty, seen))
                     || tail.is_some_and(|tail| self.stack_in_row(var_id, tail, seen))
             }
             RowNode::Link(next) => self.stack_in_row(var_id, next, seen),
@@ -4034,7 +4085,9 @@ impl Checker {
         }
         match self.rows[in_row.0 as usize].clone() {
             RowNode::Fields { fields, tail } => {
-                fields.iter().any(|(_, ty)| self.row_in_ty(var_id, *ty, seen))
+                fields
+                    .iter()
+                    .any(|(_, ty)| self.row_in_ty(var_id, *ty, seen))
                     || tail.is_some_and(|tail| self.occurs_row(var_id, tail, seen))
             }
             RowNode::Link(next) => self.occurs_row(var_id, next, seen),
@@ -4049,16 +4102,21 @@ impl Checker {
         }
         match self.tys[ty.0 as usize].clone() {
             TyNode::Record(row) => self.occurs_row(var_id, row, seen),
-            TyNode::Ctor(_, args) => args.into_iter().any(|arg| self.row_in_ty(var_id, arg, seen)),
+            TyNode::Ctor(_, args) => args
+                .into_iter()
+                .any(|arg| self.row_in_ty(var_id, arg, seen)),
             TyNode::App(head, args) => {
                 self.row_in_ty(var_id, head, seen)
-                    || args.into_iter().any(|arg| self.row_in_ty(var_id, arg, seen))
+                    || args
+                        .into_iter()
+                        .any(|arg| self.row_in_ty(var_id, arg, seen))
             }
             TyNode::Fun(input, output, _) => {
                 self.row_in_stack(var_id, input, seen) || self.row_in_stack(var_id, output, seen)
             }
             TyNode::Alias { args, body, .. } => {
-                args.into_iter().any(|arg| self.row_in_ty(var_id, arg, seen))
+                args.into_iter()
+                    .any(|arg| self.row_in_ty(var_id, arg, seen))
                     || self.row_in_ty(var_id, body, seen)
             }
             TyNode::Link(next) => self.row_in_ty(var_id, next, seen),
@@ -4157,7 +4215,10 @@ impl Checker {
             };
             let row = self.find_row(row);
             match &self.rows[row.0 as usize] {
-                RowNode::Fields { fields: found, tail } => {
+                RowNode::Fields {
+                    fields: found,
+                    tail,
+                } => {
                     for (name, ty) in found {
                         if seen.insert(name.clone()) {
                             fields.push((name.clone(), self.show_ty_at(*ty, depth + 1, fold)));
@@ -4564,7 +4625,10 @@ impl Checker {
                 self.unify_kind(have_arg, need_arg)?;
                 self.unify_kind(have_ret, need_ret)
             }
-            _ => Err(Error::KindMismatch { expected: self.show_kind(need), found: self.show_kind(have) }),
+            _ => Err(Error::KindMismatch {
+                expected: self.show_kind(need),
+                found: self.show_kind(have),
+            }),
         }
     }
 
@@ -4629,10 +4693,7 @@ impl Checker {
         }
     }
 
-    fn trial<T>(
-        &mut self,
-        body: impl FnOnce(&mut Self) -> Result<T, Error>,
-    ) -> Result<T, Error> {
+    fn trial<T>(&mut self, body: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
         let mark = self.trail.len();
         let saved = self.recording;
         self.recording = true;
@@ -4767,9 +4828,7 @@ impl Checker {
         }
         match self.stacks[stack.0 as usize].clone() {
             StackNode::Var => true,
-            StackNode::Cons(rest, ty) => {
-                self.flexible_stack(rest, seen) || self.flexible(ty, seen)
-            }
+            StackNode::Cons(rest, ty) => self.flexible_stack(rest, seen) || self.flexible(ty, seen),
             StackNode::Link(next) => self.flexible_stack(next, seen),
             _ => false,
         }
@@ -4783,9 +4842,7 @@ impl Checker {
         match self.rows[row.0 as usize].clone() {
             RowNode::Var => true,
             RowNode::Fields { fields, tail } => {
-                fields
-                    .into_iter()
-                    .any(|(_, ty)| self.flexible(ty, seen))
+                fields.into_iter().any(|(_, ty)| self.flexible(ty, seen))
                     || tail.is_some_and(|tail| self.flexible_row(tail, seen))
             }
             RowNode::Link(next) => self.flexible_row(next, seen),
@@ -4835,7 +4892,10 @@ fn dependency_order(known: &[KnownModule]) -> Vec<&Module> {
     for index in 0..known.len() {
         visit_dependency(index, &edges, &mut seen, &mut order);
     }
-    order.into_iter().map(|index| &known[index].module).collect()
+    order
+        .into_iter()
+        .map(|index| &known[index].module)
+        .collect()
 }
 
 fn visit_dependency(index: usize, edges: &[Vec<usize>], seen: &mut [bool], order: &mut Vec<usize>) {
@@ -5042,9 +5102,8 @@ fn hidden_type(module: &Module, ty: &Type) -> Option<String> {
     match ty {
         Type::Var(_) => None,
         Type::Ctor(name) => hidden_local(module, name),
-        Type::App(head, args) => hidden_type(module, head).or_else(|| {
-            args.iter().find_map(|arg| hidden_type(module, arg))
-        }),
+        Type::App(head, args) => hidden_type(module, head)
+            .or_else(|| args.iter().find_map(|arg| hidden_type(module, arg))),
         Type::Fun(effect) => hidden_in_stacks(module, effect),
         Type::Record(row) => row
             .fields
@@ -5224,7 +5283,9 @@ fn collect_place_uses(
 }
 
 fn known_at<'a>(known: &'a [KnownModule], origin: &str) -> Option<&'a KnownModule> {
-    known.iter().find(|known_module| known_module.origin == origin)
+    known
+        .iter()
+        .find(|known_module| known_module.origin == origin)
 }
 
 fn instance_key(known_module: &KnownModule) -> String {
@@ -5236,7 +5297,9 @@ fn instance_key(known_module: &KnownModule) -> String {
 }
 
 fn module_has_public(module: &Module, name: &str) -> bool {
-    crate::surface::own_public_names(module).iter().any(|have| have == name)
+    crate::surface::own_public_names(module)
+        .iter()
+        .any(|have| have == name)
 }
 
 /// `name` is on the surface an importer can ask for. A list that omits it is closed.
@@ -5495,7 +5558,10 @@ mod tests {
         ok(": r ( a b. b (a b -- c) -- (a -- c) )\n  cons");
         ok(": r ( a. a -- ( -- a) )\n  [ ] cons");
         ok(": r ( a. a -- ( -- a Num) )\n  [ 1 ] cons");
-        err(": bad ( a. (a -- b) -- ( -- b) )\n  cons", "stack underflow");
+        err(
+            ": bad ( a. (a -- b) -- ( -- b) )\n  cons",
+            "stack underflow",
+        );
         ok(
             ": foreign nmul ( Num Num -- Num )\n: foreign nadd ( Num Num -- Num )\n\n: both ( Num -- Num Num )\n  [ 2 nmul ] [ 3 nadd ] bi",
         );
@@ -5577,10 +5643,7 @@ mod tests {
         err(": bad ( Foo -- Foo )\n  drop", "undefined type Foo");
         ok(": id ( a -- a )\n  dup drop");
         err("; Box = Mk a", "type variable a is not quantified");
-        err(
-            ": bad ( a. a -- a a )\n  [ dup ] dip",
-            "stack underflow",
-        );
+        err(": bad ( a. a -- a a )\n  [ dup ] dip", "stack underflow");
         err(
             ": bad ( Int -- Int )\n  (Nothing ..) ->",
             "type mismatch: expected a data type, found Int",
@@ -5886,7 +5949,10 @@ mod tests {
             ": bad ( Int -- Int )\n  1 >>age",
             "type mismatch: expected a data type, found Int",
         );
-        err(": bad ( -- Str )\n  { name: \"Ada\" }", "unexpected character");
+        err(
+            ": bad ( -- Str )\n  { name: \"Ada\" }",
+            "unexpected character",
+        );
         err(": bad ( Int -- Int )\n  +city", "unexpected character");
         err(
             "; Person = Person name : Str, age : Num\n\n: bad ( Person -- Str )\n  age>>",
@@ -5900,10 +5966,7 @@ mod tests {
         ok("& Eq a\n  eq ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  drop drop true\n\n# Eq Int\n  eq = eqInt\n\n: use ( Int Int -- Bool )\n  eq\n\n: same ( a. Eq a => a a -- Bool )\n  eq\n\n: useSame ( Int Int -- Bool )\n  same\n\n: eqBool ( Bool Bool -- Bool )\n  drop drop true\n\n# Eq Bool\n  eq = eqBool\n");
         ok("; Maybe a = Nothing | Just a\n\n& Functor f\n  map ( a b. (f a) (a -- b) -- (f b) )\n\n: mapMaybe ( a b. (Maybe a) (a -- b) -- (Maybe b) )\n  (Nothing ..) q -> q drop Nothing\n  (Just x) q -> x q call Just\n\n# Functor Maybe\n  map = mapMaybe\n\n: use ( (Maybe Int) -- (Maybe Int) )\n  [ dup drop ] map\n");
         ok(": idf ( f a. (f a) -- (f a) )\n  dup drop");
-        err(
-            "# Show Int\n  show = showInt",
-            "undefined class Show",
-        );
+        err("# Show Int\n  show = showInt", "undefined class Show");
         err(
             ": bad ( a. Show a => a -- a )\n  dup drop",
             "undefined class Show",
@@ -5970,11 +6033,7 @@ mod tests {
 
     #[test]
     fn interface_checks_signatures_only() {
-        check_source(
-            "language 1\n: id ( a. a -- a )\n",
-            ParseMode::Interface,
-        )
-        .unwrap();
+        check_source("language 1\n: id ( a. a -- a )\n", ParseMode::Interface).unwrap();
         check_source(
             "language 1\n: foreign read ( -- Str )\n",
             ParseMode::Interface,
@@ -6056,10 +6115,12 @@ mod tests {
             ParseMode::Source,
         )
         .unwrap();
-        let comparable_known = super::KnownModule::new("Ply/Comparable.ply".to_string(), comparable);
+        let comparable_known =
+            super::KnownModule::new("Ply/Comparable.ply".to_string(), comparable);
         let mut ints_known = super::KnownModule::new("Ply/Int.ply".to_string(), ints);
         ints_known.deps = vec!["Ply/Comparable.ply".to_string()];
-        let mut hashable_known = super::KnownModule::new("Ply/Hashable.ply".to_string(), hashable.clone());
+        let mut hashable_known =
+            super::KnownModule::new("Ply/Hashable.ply".to_string(), hashable.clone());
         hashable_known.deps = vec!["Ply/Comparable.ply".to_string(), "Ply/Int.ply".to_string()];
         let known = vec![hashable_known, comparable_known, ints_known];
         super::check_with_imports(
@@ -6126,7 +6187,10 @@ mod tests {
         .unwrap();
         let consumer = parse("~ \"Ply/Flatmappable\" Flatmappable\n", ParseMode::Source).unwrap();
         let known = vec![
-            super::KnownModule::new("/deps/dist/Ply/Flatmappable.d.ply".to_string(), flat.clone()),
+            super::KnownModule::new(
+                "/deps/dist/Ply/Flatmappable.d.ply".to_string(),
+                flat.clone(),
+            ),
             super::KnownModule::new("/deps/dist/Ply/Mappable.d.ply".to_string(), mappable),
             super::KnownModule::new("/deps/dist/Ply/Applicable.d.ply".to_string(), applicable),
         ];
@@ -6162,7 +6226,10 @@ mod tests {
             super::KnownModule::new("Ply/Number.ply".to_string(), number.clone()),
             super::KnownModule::new("Ply/Comparable.ply".to_string(), comparable.clone()),
         ];
-        let known_comparable = vec![super::KnownModule::new("Ply/Comparable.ply".to_string(), comparable.clone())];
+        let known_comparable = vec![super::KnownModule::new(
+            "Ply/Comparable.ply".to_string(),
+            comparable.clone(),
+        )];
         super::check_with_imports(
             &consumer,
             &[
@@ -6188,7 +6255,10 @@ mod tests {
             ParseMode::Source,
         )
         .unwrap();
-        let known = vec![super::KnownModule::new("Data/Maybe".to_string(), provider.clone())];
+        let known = vec![super::KnownModule::new(
+            "Data/Maybe".to_string(),
+            provider.clone(),
+        )];
         let check_import = |source: &str| {
             let module = parse(source, ParseMode::Source).unwrap();
             super::check_with_imports(
@@ -6204,20 +6274,16 @@ mod tests {
             "~ \"Data/Maybe\" fromMaybe, Nothing\n\n: use ( Int -- Int )\n  Nothing fromMaybe\n",
         )
         .unwrap();
-        let missing_word = check_import(
-            "~ \"Data/Maybe\" Maybe\n\n: use ( a. -- (Maybe a) )\n  Nothing\n",
-        )
-        .unwrap_err();
+        let missing_word =
+            check_import("~ \"Data/Maybe\" Maybe\n\n: use ( a. -- (Maybe a) )\n  Nothing\n")
+                .unwrap_err();
         assert_eq!(missing_word.message, "undefined word Nothing");
-        let missing_type = check_import(
-            "~ \"Data/Maybe\" Nothing\n\n: use ( a. -- (Maybe a) )\n  Nothing\n",
-        )
-        .unwrap_err();
+        let missing_type =
+            check_import("~ \"Data/Maybe\" Nothing\n\n: use ( a. -- (Maybe a) )\n  Nothing\n")
+                .unwrap_err();
         assert_eq!(missing_type.message, "undefined type Maybe");
-        let hidden = check_import(
-            "~ \"Data/Maybe\" hidden\n\n: use ( Int -- Int )\n  hidden\n",
-        )
-        .unwrap_err();
+        let hidden = check_import("~ \"Data/Maybe\" hidden\n\n: use ( Int -- Int )\n  hidden\n")
+            .unwrap_err();
         assert_eq!(hidden.message, "~ \"Data/Maybe\" does not export hidden");
     }
 
@@ -6228,7 +6294,10 @@ mod tests {
             ParseMode::Source,
         )
         .unwrap();
-        let known = vec![super::KnownModule::new("Data/Maybe".to_string(), provider.clone())];
+        let known = vec![super::KnownModule::new(
+            "Data/Maybe".to_string(),
+            provider.clone(),
+        )];
         let check_import = |source: &str| {
             let module = parse(source, ParseMode::Source).unwrap();
             super::check_with_imports(
@@ -6254,10 +6323,9 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(partial.message, "non-exhaustive match: Nothing");
-        let hidden_type = check_import(
-            "~ \"Data/Maybe\" : Bus\n\n: use ( a. -- (Maybe a) )\n  Nothing\n",
-        )
-        .unwrap_err();
+        let hidden_type =
+            check_import("~ \"Data/Maybe\" : Bus\n\n: use ( a. -- (Maybe a) )\n  Nothing\n")
+                .unwrap_err();
         assert_eq!(hidden_type.message, "undefined type Maybe");
         let hidden_word = check_import(
             "~ \"Data/Maybe\" : Bus\n\n: use ( a. a (Bus:Maybe a) -- a )\n  Nothing Bus:fromMaybe\n",
@@ -6338,7 +6406,10 @@ mod tests {
         )
         .unwrap();
         let known_num = vec![super::KnownModule::new("Num.ply".to_string(), num.clone())];
-        let known_other = vec![super::KnownModule::new("Other.ply".to_string(), other.clone())];
+        let known_other = vec![super::KnownModule::new(
+            "Other.ply".to_string(),
+            other.clone(),
+        )];
         let module = parse(
             "~ \"Num\" Mk\n~ \"Other\" wrap\n\n: id ( Int -- Int )\n  dup drop\n",
             ParseMode::Source,
@@ -6367,7 +6438,10 @@ mod tests {
             ParseMode::Source,
         )
         .unwrap();
-        let known_twin = vec![super::KnownModule::new("Twin.ply".to_string(), twin.clone())];
+        let known_twin = vec![super::KnownModule::new(
+            "Twin.ply".to_string(),
+            twin.clone(),
+        )];
         let again = parse(
             "~ \"Num\" Box\n~ \"Twin\" Box\n\n: id ( Int -- Int )\n  dup drop\n",
             ParseMode::Source,
@@ -6426,7 +6500,10 @@ mod tests {
             ParseMode::Source,
         )
         .unwrap();
-        let known_element = vec![super::KnownModule::new("Element".to_string(), element.clone())];
+        let known_element = vec![super::KnownModule::new(
+            "Element".to_string(),
+            element.clone(),
+        )];
         let known_child = vec![super::KnownModule::new("Child".to_string(), child.clone())];
         let module = parse(
             "~ \"Element\" Prop, Mark\n~ \"Child\" Child\n\n: page ( Str Str -- Prop )\n  Mark\n",
@@ -6462,15 +6539,16 @@ mod tests {
 
     #[test]
     fn fields_stay_with_the_constructor() {
-        ok(
-            "@ Box\n\n; Box a = Mk one : a, two : a\n\n: read ( a. (Box a) -- a )\n  one>>\n",
-        );
+        ok("@ Box\n\n; Box a = Mk one : a, two : a\n\n: read ( a. (Box a) -- a )\n  one>>\n");
         let provider = parse(
             "@ Box, Mk\n\n; Box a = Mk one : a, two : a\n",
             ParseMode::Source,
         )
         .unwrap();
-        let known = vec![super::KnownModule::new("Data/Box".to_string(), provider.clone())];
+        let known = vec![super::KnownModule::new(
+            "Data/Box".to_string(),
+            provider.clone(),
+        )];
         let hidden = parse(
             "~ \"Data/Box\" Box\n\n: read ( a. (Box a) -- a )\n  one>>\n",
             ParseMode::Source,
@@ -6504,8 +6582,7 @@ mod tests {
 
     #[test]
     fn comparable_is_derived_for_a_product_of_ints() {
-        ok(
-            "\
+        ok("\
 & Comparable a
   eq ( a a -- Bool )
 
@@ -6519,10 +6596,8 @@ mod tests {
 
 : same ( Person Person -- Bool )
   eq
-",
-        );
-        ok(
-            "\
+");
+        ok("\
 & Comparable a
   eq ( a a -- Bool )
 
@@ -6536,8 +6611,7 @@ mod tests {
 
 : same ( Answer Answer -- Bool )
   eq
-",
-        );
+");
         err(
             "\
 & Comparable a
@@ -6582,8 +6656,7 @@ mod tests {
 
     #[test]
     fn showable_and_sortable_and_hashable_are_derived() {
-        ok(
-            "\
+        ok("\
 & Showable a
   show ( a -- Str )
 
@@ -6597,10 +6670,8 @@ mod tests {
 
 : shown ( Person -- Str )
   show
-",
-        );
-        ok(
-            "\
+");
+        ok("\
 & Showable a
   show ( a -- Str )
 
@@ -6614,10 +6685,8 @@ mod tests {
 
 : shown ( Answer -- Str )
   show
-",
-        );
-        ok(
-            "\
+");
+        ok("\
 & Showable a
   show ( a -- Str )
 
@@ -6626,10 +6695,8 @@ mod tests {
 
 : shown ( Wrap -- Str )
   show
-",
-        );
-        ok(
-            "\
+");
+        ok("\
 & Showable a
   show ( a -- Str )
 
@@ -6649,8 +6716,7 @@ mod tests {
 
 : shown ( Person -- Str )
   show
-",
-        );
+");
         err(
             "\
 & Showable a
@@ -6695,8 +6761,7 @@ mod tests {
 ",
             "no instance for Showable Cell",
         );
-        ok(
-            "\
+        ok("\
 ; Ordering = LT | EQ | GT
 
 & Comparable a
@@ -6721,8 +6786,7 @@ mod tests {
 
 : ordered ( Answer Answer -- Ordering )
   compare
-",
-        );
+");
         err(
             "\
 & Comparable a
@@ -6744,8 +6808,7 @@ mod tests {
 ",
             "no instance for Sortable Person",
         );
-        ok(
-            "\
+        ok("\
 & Comparable a
   eq ( a a -- Bool )
 
@@ -6768,8 +6831,7 @@ mod tests {
 
 : hashed ( Person -- Int )
   hash
-",
-        );
+");
     }
 
     #[test]
@@ -6786,10 +6848,7 @@ mod tests {
         ok(": repeat ( Num -- (Array Num) )\n  n -> < n dup >");
         ok(": hidden ( Num -- (Array Num) )\n  drop < 1 >");
         ok(": quotes ( -- (Array (Num -- Num)) )\n  < [ dup drop ] [ dup drop ] >");
-        err(
-            ": bad ( Num -- (Array Num) )\n  < dup >",
-            "stack underflow",
-        );
+        err(": bad ( Num -- (Array Num) )\n  < dup >", "stack underflow");
         err(
             ": pair ( -- Num Str )\n  1 \"a\"\n\n: bad ( -- (Array Num) )\n  < pair >",
             "type mismatch: expected Num, found Str",
@@ -6826,10 +6885,7 @@ mod tests {
             ": bad ( Int Int -- Int )\n  n n -> n\n",
             "duplicate definition n",
         );
-        err(
-            ": bad ( -- Int )\n  n -> n\n",
-            "stack underflow",
-        );
+        err(": bad ( -- Int )\n  n -> n\n", "stack underflow");
         err(": bad ( Int -- Int )\n  -> n", "expected term");
         err(": bad ( Int -- Int )\n  [ -> n ]", "expected term");
     }
@@ -6864,9 +6920,15 @@ mod tests {
             "; Age == Age Num\n\n: bad ( Age -- Num )\n  dup drop\n",
             "type mismatch: expected Num, found Age",
         );
-        err("; Pair == Left Int | Right Int", "newtype expects one constructor");
+        err(
+            "; Pair == Left Int | Right Int",
+            "newtype expects one constructor",
+        );
         err("; Unitish == Unitish", "newtype expects one field");
-        err("; Two == Two one : Int, two : Int", "newtype expects one field");
+        err(
+            "; Two == Two one : Int, two : Int",
+            "newtype expects one field",
+        );
         err(
             "& Eq a\n  eq ( a a -- Bool )\n\n; Person = Person name : Str, age : Num\n- Human Person\n\n: eqHuman ( Human Human -- Bool )\n  drop drop true\n\n: eqPerson ( Person Person -- Bool )\n  drop drop true\n\n# Eq Human\n  eq = eqHuman\n\n# Eq Person\n  eq = eqPerson\n",
             "incoherent instance",
@@ -6927,7 +6989,10 @@ mod tests {
             ParseMode::Source,
         )
         .unwrap();
-        let known = vec![super::KnownModule::new("Data/Person".to_string(), provider.clone())];
+        let known = vec![super::KnownModule::new(
+            "Data/Person".to_string(),
+            provider.clone(),
+        )];
         let check_import = |source: &str| {
             let module = parse(source, ParseMode::Source).unwrap();
             super::check_with_imports(
@@ -6939,23 +7004,19 @@ mod tests {
                 }],
             )
         };
-        check_import(
-            "~ \"Data/Person\" older, Human\n\n: use ( Human -- Human )\n  older\n",
-        )
-        .unwrap();
+        check_import("~ \"Data/Person\" older, Human\n\n: use ( Human -- Human )\n  older\n")
+            .unwrap();
         check_import(
             "~ \"Data/Person\" : Person\n\n: use ( Person:Human -- Person:Human )\n  Person:older\n",
         )
         .unwrap();
-        let missing = check_import(
-            "~ \"Data/Person\" older\n\n: use ( Human -- Human )\n  older\n",
-        )
-        .unwrap_err();
+        let missing =
+            check_import("~ \"Data/Person\" older\n\n: use ( Human -- Human )\n  older\n")
+                .unwrap_err();
         assert_eq!(missing.message, "undefined type Human");
-        let hidden = check_import(
-            "~ \"Data/Person\" older, Human\n\n: use ( Person -- Person )\n  drop\n",
-        )
-        .unwrap_err();
+        let hidden =
+            check_import("~ \"Data/Person\" older, Human\n\n: use ( Person -- Person )\n  drop\n")
+                .unwrap_err();
         assert_eq!(hidden.message, "undefined type Person");
         let sneak = check_import(
             "~ \"Data/Person\" older\n\n- Sneak Person\n\n: use ( Sneak -- Sneak )\n  drop\n",
@@ -6966,36 +7027,22 @@ mod tests {
 
     #[test]
     fn clauses_match_literals_slots_and_nesting() {
-        ok(
-            ": toString ( Bool -- Str )\n  true -> \"true\"\n  false -> \"false\"\n",
-        );
-        ok(
-            ": fact ( Int -- Int )\n  0n -> 1n\n  n -> n\n",
-        );
+        ok(": toString ( Bool -- Str )\n  true -> \"true\"\n  false -> \"false\"\n");
+        ok(": fact ( Int -- Int )\n  0n -> 1n\n  n -> n\n");
         ok(
             "; Maybe a = Nothing | Just a\n\n: mapMaybe ( a b. (Maybe a) (a -- b) -- (Maybe b) )\n  (Nothing ..) q -> q drop Nothing\n  (Just x) q -> x q call Just\n\n: divInt ( Int Int -- (Maybe Int) )\n  x 0n -> Nothing\n  x y -> Nothing\n\n: fromMaybe ( a. a (Maybe a) -- a )\n  x (Nothing ..) -> x\n  x (Just y) -> y\n\n: flatten ( a. (Maybe (Maybe a)) -- (Maybe a) )\n  (Nothing ..) -> Nothing\n  (Just (Nothing ..)) -> Nothing\n  (Just (Just x)) -> x Just\n\n: fromJust ( (Maybe Int) -- Int )\n  (Nothing ..) -> 0n\n  (Just ..) ->\n\n: isJust ( a. (Maybe a) -- Bool )\n  (Nothing ..) -> false\n  (Just _) -> true\n",
         );
-        ok(
-            ": addToAll ( Num (Array Num) -- (Array Num) )\n  n xs ->\n    xs [ n ] drop\n",
-        );
-        ok(
-            ": id ( a. a -- a )\n  n -> n\n",
-        );
-        ok(
-            ": swapped ( a b. a b -- b a )\n  x y -> y x\n",
-        );
-        ok(
-            ": held ( a. a Bool -- a )\n  true ->\n  false ->\n",
-        );
+        ok(": addToAll ( Num (Array Num) -- (Array Num) )\n  n xs ->\n    xs [ n ] drop\n");
+        ok(": id ( a. a -- a )\n  n -> n\n");
+        ok(": swapped ( a b. a b -- b a )\n  x y -> y x\n");
+        ok(": held ( a. a Bool -- a )\n  true ->\n  false ->\n");
         ok(
             "; Pair a b = Pair frs : a, snd : b\n\n: snd ( a b. (Pair a b) -- b )\n  (Pair _ y) -> y\n\n: both ( (Pair Bool Bool) -- Int )\n  (Pair true true) -> 1n\n  (Pair true false) -> 2n\n  (Pair false true) -> 3n\n  (Pair false false) -> 4n\n",
         );
         ok(
             "; Age == Age Num\n\n: years ( Age -- Num )\n  (Age n) -> n\n\n: bare ( Age -- Num )\n  (Age ..) ->\n",
         );
-        ok(
-            ": bump ( Int -- Int )\n  0n -> 1n\n  n -> [ n ] call\n",
-        );
+        ok(": bump ( Int -- Int )\n  0n -> 1n\n  n -> [ n ] call\n");
         err(
             ": bad ( Int -- Int )\n  0n -> 1n\n",
             "non-exhaustive match: Int",
@@ -7032,10 +7079,7 @@ mod tests {
             ": bad ( Bool Bool -- Bool )\n  true false -> true\n  x -> x\n",
             "expected 2 patterns",
         );
-        err(
-            ": bad ( Int -- Int )\n  x y -> x\n",
-            "stack underflow",
-        );
+        err(": bad ( Int -- Int )\n  x y -> x\n", "stack underflow");
         err(
             ": bad ( Bool -- Bool )\n  0n -> true\n  b -> b\n",
             "type mismatch: expected Int, found Bool",
@@ -7140,9 +7184,7 @@ mod tests {
             ": bad ( (Array Int) Bool -- Bool )\n  < a > _ -> true\n  < 0n > true -> false\n",
             "redundant pattern",
         );
-        ok(
-            ": wider ( (Array Int) -- Int )\n  < 0n > -> 0n\n  < a > -> a\n  _ -> 0n\n",
-        );
+        ok(": wider ( (Array Int) -- Int )\n  < 0n > -> 0n\n  < a > -> a\n  _ -> 0n\n");
         err(
             ": bad ( (Array Int) -- Int )\n  < 0 > -> 0n\n  _ -> 0n\n",
             "type mismatch: expected Num, found Int",
@@ -7201,8 +7243,7 @@ mod tests {
             "& Eq a\n  eq ( a a -- Bool )\n\n& Eq a => Ord a\n  compare ( a a -- Bool )\n\n: cmpInt ( Int Int -- Bool )\n  drop drop true\n\n# Ord Int\n  compare = cmpInt\n",
             "no instance for Eq Int",
         );
-        ok(
-            "\
+        ok("\
 & Mappable f
   map ( (f a) (a -- b) -- (f b) )
 
@@ -7221,10 +7262,8 @@ mod tests {
 
 : use ( Sequenceable f => (f Int) (Int -- Bool) -- (f Bool) )
   map
-",
-        );
-        ok(
-            "\
+");
+        ok("\
 & Eq a
   eq ( a a -- Bool )
 
@@ -7240,8 +7279,7 @@ mod tests {
 
 : use ( Law a => a a -- Bool )
   eq
-",
-        );
+");
         err(
             "\
 & Wrappable f
@@ -7310,8 +7348,7 @@ mod tests {
 ",
             "duplicate definition Eq",
         );
-        ok(
-            "\
+        ok("\
 & Mappable f
   map ( (f a) (a -- b) -- (f b) )
 
@@ -7338,8 +7375,7 @@ mod tests {
 
 : use ( Both f => (f Int) (Int -- Bool) -- (f Bool) )
   map
-",
-        );
+");
         err(
             "& Eq a\n  eq ( a a -- Bool )\n\n& Eq a => Ord a\n  compare ( a a -- Bool )\n\n& Eq a => Show a\n  show ( a -- Str )\n\n: bad ( Ord a, Show a => a a -- Bool )\n  eq\n",
             "incoherent instance",
@@ -7404,17 +7440,16 @@ mod tests {
             "place scale is not ready",
         );
         err(": w ( Num -- )\n  =missing\n", "no place missing");
-        err(": w ( Num ( -- Num ) -- Num )\n  =>missing\n", "no place missing");
+        err(
+            ": w ( Num ( -- Num ) -- Num )\n  =>missing\n",
+            "no place missing",
+        );
         err("= base a\n  0\n", "type variable a is not quantified");
     }
 
     #[test]
     fn an_imported_place_opens_its_writer_and_binder() {
-        let provider = parse(
-            "@ base\n\n= base Num\n  10\n",
-            ParseMode::Source,
-        )
-        .unwrap();
+        let provider = parse("@ base\n\n= base Num\n  10\n", ParseMode::Source).unwrap();
         let known = vec![super::KnownModule::new("Lib".to_string(), provider.clone())];
         let check_import = |source: &str| {
             let module = parse(source, ParseMode::Source).unwrap();
@@ -7427,10 +7462,8 @@ mod tests {
                 }],
             )
         };
-        check_import(
-            "~ \"Lib\" base\n\n: use ( Num -- Num )\n  dup =base [ base ] =>base\n",
-        )
-        .unwrap();
+        check_import("~ \"Lib\" base\n\n: use ( Num -- Num )\n  dup =base [ base ] =>base\n")
+            .unwrap();
         check_import(
             "~ \"Lib\" base : floor\n\n: use ( Num -- Num )\n  dup =floor [ floor ] =>floor\n",
         )

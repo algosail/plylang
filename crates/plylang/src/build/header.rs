@@ -11,9 +11,7 @@ use crate::ast::{Def, Exports, Import, Item, Module, Type};
 use crate::codes::Error;
 use crate::diagnostic::Diagnostic;
 
-use super::{
-    classify, located, module_key_of, BuildError, Session, Spec, ENTRY_WORD,
-};
+use super::{classify, located, module_key_of, BuildError, Session, Spec, ENTRY_WORD};
 
 impl Session {
     pub(super) fn js_header(&self, id: usize, from_js: &Path, anf: &AnfModule) -> String {
@@ -186,8 +184,10 @@ impl Session {
         if !foreign.is_empty() {
             let sibling = self.foreign_js(id).expect("foreign directory");
             let spec = relative_specifier(from_js, &sibling);
-            let names: Vec<(String, String)> =
-                foreign.iter().map(|(name, _)| (name.clone(), name.clone())).collect();
+            let names: Vec<(String, String)> = foreign
+                .iter()
+                .map(|(name, _)| (name.clone(), name.clone()))
+                .collect();
             header.push_str(&import_line(&spec, &names));
             header.push('\n');
             let exported = foreign
@@ -264,7 +264,7 @@ impl Session {
         &self.surfaces[id]
     }
 
-    fn surface_of(&self, id: usize) -> Vec<String> {
+    pub(super) fn surface_of(&self, id: usize) -> Vec<String> {
         let Exports::List(list) = &self.units[id].module.exports else {
             return Vec::new();
         };
@@ -312,9 +312,12 @@ impl Session {
         if !seen.insert(id) {
             return None;
         }
-        if self.units[id].module.items.iter().any(|item| {
-            matches!(item, Item::Place(place) if place.name == local)
-        }) {
+        if self.units[id]
+            .module
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::Place(place) if place.name == local))
+        {
             return Some((id, local.to_string()));
         }
         let imports = self.units[id].module.imports.clone();
@@ -454,9 +457,10 @@ fn foreign_names(module: &Module) -> Vec<(String, bool)> {
         .items
         .iter()
         .filter_map(|item| match item {
-            Item::Def(def) if def.vis.is_foreign() => {
-                Some((def.name.clone(), !crate::surface::js_exports_def(module, def)))
-            }
+            Item::Def(def) if def.vis.is_foreign() => Some((
+                def.name.clone(),
+                !crate::surface::js_exports_def(module, def),
+            )),
             _ => None,
         })
         .collect()
