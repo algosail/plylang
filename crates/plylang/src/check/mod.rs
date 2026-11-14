@@ -108,16 +108,18 @@ pub(crate) fn check_with_imports(
     module: &Module,
     imports: &[ResolvedImport<'_>],
 ) -> Result<CheckedModule, Diagnostic> {
-    check_with_imports_key(module, imports, "")
+    check_with_imports_key(module, imports, "", true)
 }
 
 pub(crate) fn check_with_imports_key(
     module: &Module,
     imports: &[ResolvedImport<'_>],
     module_key: &str,
+    check_probes: bool,
 ) -> Result<CheckedModule, Diagnostic> {
     with_checker(|checker| {
         checker.module_key = module_key.to_string();
+        checker.check_probes = check_probes;
         for imported in imports {
             checker.import_resolved(imported.provider, imported.import, imported.known)?;
         }
@@ -157,6 +159,7 @@ pub(crate) fn check_and_note(
 ) -> ImportNotes {
     with_checker(|checker| {
         checker.module_key = module_key.to_string();
+        checker.check_probes = true;
         for imported in imports {
             if let Err(error) =
                 checker.import_resolved(imported.provider, imported.import, imported.known)
@@ -232,6 +235,7 @@ pub(crate) fn collect_sites_with_imports_key(
 ) -> Vec<StackAt> {
     with_checker(|checker| {
         checker.module_key = module_key.to_string();
+        checker.check_probes = true;
         for imported in imports {
             if checker
                 .import_resolved(imported.provider, imported.import, imported.known)
@@ -615,6 +619,8 @@ struct Checker {
     relax_visibility: bool,
     /// Identity of the module being checked. Local `#` lines use it.
     module_key: String,
+    /// `plylang check` and the language server typecheck `?`. `build` does not.
+    check_probes: bool,
     /// Constructor words in scope. Lowering reads the field count from here,
     /// not from whichever data declaration happens to share the name.
     ctor_words: HashMap<String, CtorWord>,
@@ -689,6 +695,7 @@ impl Checker {
             guarded: Vec::new(),
             relax_visibility: false,
             module_key: String::new(),
+            check_probes: false,
             ctor_words: HashMap::new(),
             renamed: HashMap::new(),
             derived: Vec::new(),
@@ -750,6 +757,7 @@ impl Checker {
         self.guarded.clear();
         self.relax_visibility = false;
         self.module_key.clear();
+        self.check_probes = false;
         self.ctor_words.clear();
         self.renamed.clear();
         self.derived.clear();
@@ -762,6 +770,7 @@ impl Checker {
     }
 
     fn check_module(&mut self, module: &Module) -> Result<(), Diagnostic> {
+        self.check_probes = true;
         self.prepare(module)?;
         self.check_ready(module)
     }
@@ -782,7 +791,11 @@ impl Checker {
                     }
                 }
                 Item::Synonym(synonym) => self.register_synonym(synonym)?,
-                Item::Def(_) | Item::Class(_) | Item::Instance(_) | Item::Place(_) => {}
+                Item::Def(_)
+                | Item::Class(_)
+                | Item::Instance(_)
+                | Item::Place(_)
+                | Item::Probe(_) => {}
             }
         }
         self.check_synonym_bodies(module)?;
@@ -795,7 +808,7 @@ impl Checker {
                 Item::Class(class) => self.register_class(class)?,
                 Item::Def(def) => self.register_def(def)?,
                 Item::Place(place) => self.register_place(place)?,
-                Item::Synonym(_) | Item::Instance(_) => {}
+                Item::Synonym(_) | Item::Instance(_) | Item::Probe(_) => {}
             }
         }
         let origin = self.module_key.clone();
@@ -833,7 +846,67 @@ impl Checker {
                 }
             }
         }
+        if self.check_probes {
+            for item in &module.items {
+                if let Item::Probe(probe) = item {
+                    self.check_probe(probe)?;
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The picture and the program both start empty. Their stacks must agree.
+    fn check_probe(&mut self, probe: &crate::ast::Probe) -> Result<(), Diagnostic> {
+        let picture = self.check_program(&probe.picture)?;
+        let body = self.check_program(&probe.body)?;
+        self.unify_stack(body, picture)
+            .map_err(|message| self.error(probe.name_span, message))?;
+        Ok(())
+    }
+
+    /// Run `terms` from an empty stack. A check may perform effects.
+    fn check_program(&mut self, terms: &[crate::ast::Term]) -> Result<StackId, Diagnostic> {
+        let saved = self.ambient.take();
+        self.assumptions.clear();
+        self.deferred.clear();
+        self.pending_arity.clear();
+        self.pending_quotes.clear();
+        self.bind_tys.clear();
+        self.use_dicts.clear();
+        self.locals.push(HashMap::new());
+        let empty = self.stack_empty();
+        let checked = self.check_terms(terms, empty);
+        self.locals.pop();
+        let stack = match checked {
+            Ok(stack) => stack,
+            Err(error) => {
+                self.deferred.clear();
+                self.pending_arity.clear();
+                self.pending_quotes.clear();
+                self.bind_tys.clear();
+                self.ambient = saved;
+                self.assumptions.clear();
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.finish_quotes() {
+            self.deferred.clear();
+            self.pending_arity.clear();
+            self.pending_quotes.clear();
+            self.bind_tys.clear();
+            self.ambient = saved;
+            self.assumptions.clear();
+            return Err(error);
+        }
+        let finished = self.finish_deferred();
+        self.ambient = saved;
+        self.assumptions.clear();
+        self.use_dicts.clear();
+        finished?;
+        self.finish_arity()?;
+        self.harvest_bind_arity();
+        Ok(stack)
     }
 
     /// A public name may mention an exported type, a builtin, or an imported type.
@@ -1206,7 +1279,11 @@ impl Checker {
                             .entry(synonym.name.clone())
                             .or_insert(synonym.params.len());
                     }
-                    Item::Def(_) | Item::Class(_) | Item::Instance(_) | Item::Place(_) => {}
+                    Item::Def(_)
+                    | Item::Class(_)
+                    | Item::Instance(_)
+                    | Item::Place(_)
+                    | Item::Probe(_) => {}
                 }
             }
         }

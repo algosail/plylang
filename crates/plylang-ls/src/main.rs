@@ -671,7 +671,10 @@ mod tests {
             panic!("expected diagnostics, got {published:?}");
         };
         assert_eq!(notification.method, "textDocument/publishDiagnostics");
-        assert!(notification.params["diagnostics"].as_array().unwrap().is_empty());
+        assert!(notification.params["diagnostics"]
+            .as_array()
+            .unwrap()
+            .is_empty());
 
         client
             .sender
@@ -717,7 +720,9 @@ mod tests {
             panic!("expected hover, got {hovered:?}");
         };
         assert_eq!(
-            response.result.unwrap()["contents"]["value"].as_str().unwrap(),
+            response.result.unwrap()["contents"]["value"]
+                .as_str()
+                .unwrap(),
             "```ply\n: double ( Int -- Int )\n```"
         );
 
@@ -808,7 +813,10 @@ mod tests {
         let Message::Response(response) = completed else {
             panic!("expected completion, got {completed:?}");
         };
-        let items = response.result.unwrap()["items"].as_array().unwrap().clone();
+        let items = response.result.unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .clone();
         let dup = items.iter().find(|item| item["label"] == "dup").unwrap();
         assert_eq!(dup["kind"], 3);
         assert_eq!(dup["detail"], "..s a -- ..s a a");
@@ -870,7 +878,8 @@ mod tests {
                 params: json!({}),
             }))
             .unwrap();
-        let source = "; Person = Person name : Str, age : Int\n\n: get ( Person -- Person )\n  1 >>\n";
+        let source =
+            "; Person = Person name : Str, age : Int\n\n: get ( Person -- Person )\n  1 >>\n";
         client
             .sender
             .send(Message::Notification(Notification {
@@ -912,9 +921,15 @@ mod tests {
         let Message::Response(response) = completed else {
             panic!("expected completion, got {completed:?}");
         };
-        let items = response.result.unwrap()["items"].as_array().unwrap().clone();
+        let items = response.result.unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .clone();
         assert_eq!(
-            items.iter().map(|item| item["label"].as_str().unwrap()).collect::<Vec<_>>(),
+            items
+                .iter()
+                .map(|item| item["label"].as_str().unwrap())
+                .collect::<Vec<_>>(),
             vec!["age", "name"]
         );
         let name = items.iter().find(|item| item["label"] == "name").unwrap();
@@ -1070,8 +1085,14 @@ mod tests {
     }
 
     fn position(source: &str, offset: usize) -> (u32, u32) {
-        let line = source[..offset].bytes().filter(|byte| *byte == b'\n').count() as u32;
-        let line_start = source[..offset].rfind('\n').map(|index| index + 1).unwrap_or(0);
+        let line = source[..offset]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count() as u32;
+        let line_start = source[..offset]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
         let character = source[line_start..offset].encode_utf16().count() as u32;
         (line, character)
     }
@@ -1082,10 +1103,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "plylang-ls-export-{}-{nanos}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("plylang-ls-export-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(root.join("src/Data")).unwrap();
         std::fs::write(
             root.join("package.json"),
@@ -1149,7 +1168,10 @@ mod tests {
             let opened = drain_diagnostics(&client);
             assert_eq!(opened.len(), 1, "{opened:?}");
             assert_eq!(opened[0]["uri"], *uri);
-            assert!(opened[0]["diagnostics"].as_array().unwrap().is_empty(), "{opened:?}");
+            assert!(
+                opened[0]["diagnostics"].as_array().unwrap().is_empty(),
+                "{opened:?}"
+            );
         }
 
         client
@@ -1165,13 +1187,13 @@ mod tests {
         let published = drain_diagnostics(&client);
         assert_eq!(published.len(), 2, "{published:?}");
         assert_eq!(published[0]["uri"], lib_uri);
-        assert!(published[0]["diagnostics"].as_array().unwrap().is_empty(), "{published:?}");
+        assert!(
+            published[0]["diagnostics"].as_array().unwrap().is_empty(),
+            "{published:?}"
+        );
         assert_eq!(published[1]["uri"], app_uri);
         let message = published[1]["diagnostics"][0]["message"].as_str().unwrap();
-        assert!(
-            message.starts_with("PL0091:"),
-            "{message}"
-        );
+        assert!(message.starts_with("PL0091:"), "{message}");
         assert!(message.contains("does not export kept"), "{message}");
         assert!(!published.iter().any(|item| item["uri"] == other_uri));
 
@@ -1189,7 +1211,10 @@ mod tests {
         assert_eq!(cleared.len(), 2, "{cleared:?}");
         assert_eq!(cleared[0]["uri"], lib_uri);
         assert_eq!(cleared[1]["uri"], app_uri);
-        assert!(cleared[1]["diagnostics"].as_array().unwrap().is_empty(), "{cleared:?}");
+        assert!(
+            cleared[1]["diagnostics"].as_array().unwrap().is_empty(),
+            "{cleared:?}"
+        );
 
         client
             .sender
@@ -1220,7 +1245,10 @@ mod tests {
         let closed = drain_diagnostics(&client);
         assert_eq!(closed.len(), 1, "{closed:?}");
         assert_eq!(closed[0]["uri"], app_uri);
-        assert!(closed[0]["diagnostics"].as_array().unwrap().is_empty(), "{closed:?}");
+        assert!(
+            closed[0]["diagnostics"].as_array().unwrap().is_empty(),
+            "{closed:?}"
+        );
 
         client
             .sender

@@ -1,6 +1,6 @@
 {
   "name": "@plylang/plylang",
-  "version": "1.0.27",
+  "version": "1.1.0",
   "description": "Ply compiler",
   "license": "MIT",
   "author": "Algosail",
@@ -30,12 +30,12 @@
     "bin/native.js"
   ],
   "optionalDependencies": {
-    "@plylang/plylang-darwin-arm64": "1.0.27",
-    "@plylang/plylang-darwin-x64": "1.0.27",
-    "@plylang/plylang-linux-arm64": "1.0.27",
-    "@plylang/plylang-linux-x64": "1.0.27",
-    "@plylang/plylang-win32-arm64": "1.0.27",
-    "@plylang/plylang-win32-x64": "1.0.27"
+    "@plylang/plylang-darwin-arm64": "1.1.0",
+    "@plylang/plylang-darwin-x64": "1.1.0",
+    "@plylang/plylang-linux-arm64": "1.1.0",
+    "@plylang/plylang-linux-x64": "1.1.0",
+    "@plylang/plylang-win32-arm64": "1.1.0",
+    "@plylang/plylang-win32-x64": "1.1.0"
   },
   "scripts": {
     "build": "cargo build --release",

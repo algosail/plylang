@@ -297,6 +297,12 @@ impl Checker {
         }
         for item in &known_module.module.items {
             if let Item::Instance(instance) = item {
+                // A head this file kept off `@` is not a type the importer can
+                // name. The interface omits that instance. Importing it would
+                // look the hidden type up in the importer.
+                if crate::surface::instance_head_is_hidden(&known_module.module, instance) {
+                    continue;
+                }
                 self.declare_instance(instance, &known_module.module, false, &key)?;
             }
         }

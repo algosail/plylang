@@ -138,7 +138,7 @@ fn render_page(
                 synonym.doc.clone(),
             )),
             Item::Class(class) if docs_class(&page.module, class) => {
-                classes.push((class.name.clone(), format_class(class), class.doc.clone()))
+                push_class(&mut classes, class);
             }
             Item::Instance(instance) if !matches!(page.module.exports, Exports::Closed) => {
                 instances.push(instance_head(instance))
@@ -240,7 +240,10 @@ fn append_published(
                     continue;
                 }
                 seen.insert(class.name.clone());
-                classes.push((class.name.clone(), format_class(&class), class.doc.clone()));
+                for method in &class.methods {
+                    seen.insert(method.name.clone());
+                }
+                push_class(classes, &class);
             }
             crate::surface::Found::Def(def) => {
                 words.push((def.name.clone(), format_word(&def), def.doc.clone()));
@@ -398,7 +401,26 @@ fn format_synonym(synonym: &Synonym) -> String {
     synonym.to_string()
 }
 
-fn format_class(class: &Class) -> String {
+fn push_class(classes: &mut Vec<(String, String, String)>, class: &Class) {
+    if classes.iter().any(|(have, _, _)| have == &class.name) {
+        return;
+    }
+    classes.push((
+        class.name.clone(),
+        format_class_head(class),
+        class.doc.clone(),
+    ));
+    for method in &class.methods {
+        classes.push((
+            method.name.clone(),
+            method_line(class, method),
+            method.doc.clone(),
+        ));
+    }
+}
+
+/// The class line, without its methods. Each method is its own heading.
+fn format_class_head(class: &Class) -> String {
     let mut out = String::from("& ");
     if !class.supers.is_empty() {
         for (index, constraint) in class.supers.iter().enumerate() {
@@ -417,10 +439,6 @@ fn format_class(class: &Class) -> String {
     for param in &class.params {
         out.push(' ');
         out.push_str(param);
-    }
-    for method in &class.methods {
-        out.push_str("\n  ");
-        out.push_str(&method_line(class, method));
     }
     out
 }
@@ -659,6 +677,38 @@ mod tests {
         assert!(page.contains("- Show Num\n"), "{page}");
     }
 
+    #[test]
+    fn a_method_doc_is_its_own_heading() {
+        let temp = Temp::new("divide");
+        temp.write("package.json", &package_json("divide"));
+        temp.write(
+            "src/Divisible.ply",
+            ".. Division.\n\n@ Divisible, divide, modulo, degree\n\n& Subtractable a => Divisible a\n  .. The lower value divided by the upper one.\n  ..\n  .. Zero throws.\n  divide ( a a -- a )\n  .. The remainder. Zero throws.\n  modulo ( a a -- a )\n  degree ( a -- Int )\n",
+        );
+        write_docs(&temp.0, None).unwrap_or_else(|error| panic!("{}", error.render()));
+        let page = fs::read_to_string(temp.0.join("DOCS.md")).unwrap();
+        let class = page.find("#### Divisible\n").expect("class heading");
+        let body = &page[class..];
+        assert!(
+            body.starts_with("#### Divisible\n\n```ply\n& Subtractable a => Divisible a\n```\n\n"),
+            "{body}"
+        );
+        assert!(body.contains("#### divide\n\n```ply\ndivide ( Divisible a => a a -- a )\n```\n\nThe lower value divided by the upper one.\n\nZero throws.\n"), "{body}");
+        assert!(body.contains("#### modulo\n\n```ply\nmodulo ( Divisible a => a a -- a )\n```\n\nThe remainder. Zero throws.\n"), "{body}");
+        assert!(
+            body.contains("#### degree\n\n```ply\ndegree ( Divisible a => a -- Int )\n```\n"),
+            "{body}"
+        );
+        let degree = body.find("#### degree\n").expect("degree");
+        let after = &body[degree..];
+        let fence_end = after.find("```\n").expect("fence");
+        let rest = &after[fence_end + 4..];
+        assert!(
+            rest.starts_with("\n") && !rest.contains("Zero throws."),
+            "{rest}"
+        );
+    }
+
     const EXPECTED: &str = r#"# shelf
 
 - [shelf/Age](#shelfage)
@@ -709,7 +759,12 @@ Sameness of two values.
 
 ```ply
 & Equal a
-  eq ( Equal a => a a -- Bool )
+```
+
+#### eq
+
+```ply
+eq ( Equal a => a a -- Bool )
 ```
 
 ### Instances

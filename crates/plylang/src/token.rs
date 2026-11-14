@@ -69,6 +69,8 @@ pub enum TokenKind {
     Foreign,
     Class,
     Instance,
+    /// `?` starts a check at column 0.
+    Probe,
     True,
     False,
     /// A `..` line at column 0, outside parentheses. One leading space is already stripped.

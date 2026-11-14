@@ -6,15 +6,15 @@ use std::process::ExitCode;
 use std::io::IsTerminal;
 
 use plylang::{
-    build_watch, build_with, check_package, compile_with, javascript_file, mode_from_path, parse,
-    test_package, write_docs, BuildFlags, CompileFlags,
+    build_watch, build_with, check_package, compile_with, javascript_file, mode_from_path,
+    module_name_from_path, parse, test_package, write_docs, BuildFlags, CompileFlags,
 };
 
 const USAGE: &[&str] = &[
     "usage: plylang check [dir]",
     "       plylang check --js <file>",
     "       plylang check --parse <file>",
-    "       plylang build [dir] [--exports] [--watch] [--entry <module>] [--out <dir>] [--foreign <dir>]",
+    "       plylang build [dir] [--exports [--all] [--check] [<module>...]] [--watch] [--entry <module>] [--out <dir>] [--foreign <dir>]",
     "       plylang compile [dir] [--entry <module>] [--out <file>] [--foreign <dir>]",
     "       plylang test [pattern]",
     "       plylang docs [dir] [--out <file>]",
@@ -90,7 +90,7 @@ fn test_command(mut args: impl Iterator<Item = String>) -> ExitCode {
         }
         pattern = Some(arg);
     }
-    let pattern = pattern.unwrap_or_else(|| "test/**/*.ply".to_string());
+    let pattern = pattern.unwrap_or_else(|| "**/*.ply".to_string());
     match test_package(Path::new("."), &pattern) {
         Ok(report) => {
             let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
@@ -128,20 +128,38 @@ fn build_command(args: impl Iterator<Item = String>) -> ExitCode {
         Ok(run) => run,
         Err(code) => return code,
     };
-    if run.watch && run.exports {
-        eprintln!("--watch cannot be combined with --exports");
-        return ExitCode::from(2);
+    if let Err(code) = reject_run(&run) {
+        return code;
     }
     let flags = BuildFlags {
         entry: run.entry,
         out: run.out,
         foreign: run.foreign,
         exports: run.exports,
+        export_all: run.export_all,
+        export_modules: run.export_modules,
+        export_check: run.export_check,
     };
     if run.watch {
         return finish_package(build_watch(Path::new(&run.dir), &flags));
     }
-    finish_package(build_with(Path::new(&run.dir), &flags))
+    finish_build(build_with(Path::new(&run.dir), &flags))
+}
+
+fn reject_run(run: &RunArgs) -> Result<(), ExitCode> {
+    if (run.export_all || run.export_check || !run.export_modules.is_empty()) && !run.exports {
+        usage(true);
+        return Err(ExitCode::from(2));
+    }
+    if run.export_all && !run.export_modules.is_empty() {
+        usage(true);
+        return Err(ExitCode::from(2));
+    }
+    if run.watch && run.exports {
+        eprintln!("--watch cannot be combined with --exports");
+        return Err(ExitCode::from(2));
+    }
+    Ok(())
 }
 
 struct RunArgs {
@@ -150,6 +168,9 @@ struct RunArgs {
     out: Option<String>,
     foreign: Option<String>,
     exports: bool,
+    export_all: bool,
+    export_check: bool,
+    export_modules: Vec<String>,
     watch: bool,
 }
 
@@ -162,6 +183,9 @@ fn read_run_args(
     let mut out = None;
     let mut foreign = None;
     let mut exports = false;
+    let mut export_all = false;
+    let mut export_check = false;
+    let mut export_modules = Vec::new();
     let mut watch = false;
     while let Some(arg) = args.next() {
         if is_help(&arg) {
@@ -184,12 +208,38 @@ fn read_run_args(
             exports = true;
             continue;
         }
+        if arg == "--all" {
+            if !allow_exports || export_all {
+                usage(true);
+                return Err(ExitCode::from(2));
+            }
+            export_all = true;
+            continue;
+        }
+        if arg == "--check" {
+            if !allow_exports || export_check {
+                usage(true);
+                return Err(ExitCode::from(2));
+            }
+            export_check = true;
+            continue;
+        }
         let slot = match arg.as_str() {
             "--entry" => &mut entry,
             "--out" => &mut out,
             "--foreign" => &mut foreign,
             _ => {
-                if arg.starts_with('-') || dir.is_some() {
+                if arg.starts_with('-') {
+                    usage(true);
+                    return Err(ExitCode::from(2));
+                }
+                if exports {
+                    if let Some(name) = canonical_export_name(&arg) {
+                        export_modules.push(name);
+                        continue;
+                    }
+                }
+                if dir.is_some() {
                     usage(true);
                     return Err(ExitCode::from(2));
                 }
@@ -213,8 +263,21 @@ fn read_run_args(
         out,
         foreign,
         exports,
+        export_all,
+        export_check,
+        export_modules,
         watch,
     })
+}
+
+/// `Data/Sheet` and `./Data/Sheet` both name `Data/Sheet`.
+fn canonical_export_name(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("./").unwrap_or(name);
+    if rest.is_empty() {
+        return None;
+    }
+    let segments = module_name_from_path(&format!("{rest}.ply")).ok()?;
+    Some(segments.join("/"))
 }
 
 fn check_command(mut args: impl Iterator<Item = String>) -> ExitCode {
@@ -300,6 +363,17 @@ fn finish_package(result: Result<(), plylang::BuildError>) -> ExitCode {
     }
 }
 
+fn finish_build(result: Result<bool, plylang::BuildError>) -> ExitCode {
+    match result {
+        Ok(false) => ExitCode::SUCCESS,
+        Ok(true) => ExitCode::from(1),
+        Err(error) => {
+            eprintln!("{}", error.render());
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn is_help(arg: &str) -> bool {
     arg == "--help" || arg == "-h" || arg == "help"
 }
@@ -310,6 +384,74 @@ fn usage(to_stderr: bool) {
             eprintln!("{line}");
         } else {
             println!("{line}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{canonical_export_name, read_run_args, reject_run, ExitCode};
+
+    fn parse(args: &[&str]) -> Result<super::RunArgs, ExitCode> {
+        read_run_args(args.iter().map(|arg| (*arg).to_string()), true)
+    }
+
+    #[test]
+    fn a_module_after_exports_is_a_name() {
+        let run = parse(&["--exports", "./Data/Sheet", "Css"]).unwrap();
+        assert!(run.exports);
+        assert_eq!(run.dir, ".");
+        assert_eq!(run.export_modules, ["Data/Sheet", "Css"]);
+        assert!(reject_run(&run).is_ok());
+        assert_eq!(
+            canonical_export_name("./Data/Sheet").as_deref(),
+            Some("Data/Sheet")
+        );
+    }
+
+    #[test]
+    fn a_module_before_exports_is_the_directory() {
+        let run = parse(&["Data/Sheet", "--exports"]).unwrap();
+        assert_eq!(run.dir, "Data/Sheet");
+        assert!(run.export_modules.is_empty());
+        assert!(run.exports);
+        let package = parse(&["--exports", "pkg"]).unwrap();
+        assert_eq!(package.dir, "pkg");
+        assert!(package.export_modules.is_empty());
+        assert!(parse(&["--exports", "pkg", "other"]).is_err());
+    }
+
+    #[test]
+    fn a_build_without_exports_keeps_one_directory() {
+        let run = parse(&["Data/Sheet"]).unwrap();
+        assert_eq!(run.dir, "Data/Sheet");
+        assert!(!run.exports);
+        assert!(reject_run(&run).is_ok());
+    }
+
+    #[test]
+    fn all_and_check_need_exports_and_all_takes_no_names() {
+        let bare = parse(&["--all"]).unwrap();
+        assert_eq!(reject_run(&bare), Err(ExitCode::from(2)));
+        let check = parse(&["--check"]).unwrap();
+        assert_eq!(reject_run(&check), Err(ExitCode::from(2)));
+        let both = parse(&["--exports", "--all", "--check"]).unwrap();
+        assert!(both.export_all && both.export_check && both.exports);
+        assert!(reject_run(&both).is_ok());
+        let named = parse(&["--exports", "--all", "Data/Sheet"]).unwrap();
+        assert_eq!(reject_run(&named), Err(ExitCode::from(2)));
+        let watched = parse(&["--watch", "--exports"]).unwrap();
+        assert_eq!(reject_run(&watched), Err(ExitCode::from(2)));
+    }
+
+    #[test]
+    fn compile_rejects_export_flags() {
+        let args = ["--exports", "--all", "--check"];
+        for arg in args {
+            assert!(matches!(
+                read_run_args(std::iter::once(arg.to_string()), false),
+                Err(code) if code == ExitCode::from(2)
+            ));
         }
     }
 }

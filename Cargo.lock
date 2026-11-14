@@ -316,7 +316,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "plylang"
-version = "1.0.27"
+version = "1.1.0"
 dependencies = [
  "notify",
  "serde_json",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "plylang-ls"
-version = "1.0.27"
+version = "1.1.0"
 dependencies = [
  "lsp-server",
  "lsp-types",

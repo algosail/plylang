@@ -106,6 +106,9 @@ pub enum Item {
     Place(Place),
     Class(Class),
     Instance(Instance),
+    /// A check. The picture and the program both start from an empty stack.
+    /// `build` and `compile` leave it out of `.js` and `.d.ply`.
+    Probe(Probe),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -182,6 +185,21 @@ pub struct Def {
     pub doc: String,
 }
 
+/// `? "name" < picture > [ program ]`. Both programs start from an empty stack.
+/// The picture is the stack the program must leave, bottom to top.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Probe {
+    pub span: Span,
+    pub name_span: Span,
+    pub name: String,
+    /// Terms between `<` and `>`. They run on an empty stack.
+    pub picture: Vec<Term>,
+    /// Terms inside the quotation. They run on an empty stack.
+    pub body: Vec<Term>,
+    /// Text of the `..` lines directly above this check. Empty if there are none.
+    pub doc: String,
+}
+
 /// `= name Type` and a program `( -- Type )`. The program runs once, when the module loads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Place {
@@ -244,6 +262,9 @@ pub struct MethodSig {
     pub name: String,
     pub name_span: Span,
     pub scheme: Scheme,
+    /// Text of the indented `..` lines directly above this method. Empty when
+    /// the method has none. The hover then uses the class text.
+    pub doc: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -454,8 +475,41 @@ impl fmt::Display for Item {
             Self::Place(place) => write!(formatter, "{place}"),
             Self::Class(class) => write!(formatter, "{class}"),
             Self::Instance(instance) => write!(formatter, "{instance}"),
+            Self::Probe(probe) => write!(formatter, "{probe}"),
         }
     }
+}
+
+impl fmt::Display for Probe {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_doc(formatter, &self.doc)?;
+        write!(formatter, "? \"{}\" ", escape_string(&self.name))?;
+        write!(formatter, "{}", picture_string(&self.picture))?;
+        write!(formatter, " [")?;
+        if !self.body.is_empty() {
+            write!(formatter, " ")?;
+            for (index, term) in self.body.iter().enumerate() {
+                if index > 0 {
+                    write!(formatter, " ")?;
+                }
+                write!(formatter, "{}", term_string(term, 0))?;
+            }
+            write!(formatter, " ")?;
+        }
+        write!(formatter, "]")
+    }
+}
+
+fn picture_string(terms: &[Term]) -> String {
+    if terms.is_empty() {
+        return "<>".to_string();
+    }
+    let inner = terms
+        .iter()
+        .map(|term| term_string(term, 0))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("< {inner} >")
 }
 
 impl fmt::Display for Data {
@@ -553,6 +607,7 @@ impl fmt::Display for Class {
             write!(formatter, " {param}")?;
         }
         for method in &self.methods {
+            write_indented_doc(formatter, &method.doc)?;
             write!(
                 formatter,
                 "\n  {} ( {} )",
@@ -562,6 +617,19 @@ impl fmt::Display for Class {
         }
         Ok(())
     }
+}
+
+fn write_indented_doc(formatter: &mut fmt::Formatter<'_>, doc: &str) -> fmt::Result {
+    if doc.is_empty() {
+        return Ok(());
+    }
+    for line in doc.split('\n') {
+        write!(formatter, "\n  ..")?;
+        if !line.is_empty() {
+            write!(formatter, " {line}")?;
+        }
+    }
+    Ok(())
 }
 
 impl fmt::Display for Instance {
@@ -612,6 +680,15 @@ pub fn method_line(class: &Class, method: &MethodSig) -> String {
         },
     );
     format!("{} ( {} )", method.name, scheme_string(&scheme))
+}
+
+/// The method's own text, or the class text when the method has none.
+pub fn method_doc<'a>(class: &'a Class, method: &'a MethodSig) -> &'a str {
+    if method.doc.is_empty() {
+        class.doc.as_str()
+    } else {
+        method.doc.as_str()
+    }
 }
 
 pub fn scheme_string(scheme: &Scheme) -> String {

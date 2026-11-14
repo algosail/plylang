@@ -52,6 +52,7 @@ fn interface_keeps(module: &Module, item: &Item) -> bool {
             list.has(&class.name) || class.methods.iter().any(|method| list.has(&method.name))
         }
         Item::Instance(instance) => !instance_mentions_unlisted(module, instance),
+        Item::Probe(_) => false,
     }
 }
 
@@ -169,6 +170,7 @@ fn closed_interface(module: &Module) -> String {
                 out.push_str(&instance.to_string());
                 out.push('\n');
             }
+            Item::Probe(_) => {}
         }
     }
     out

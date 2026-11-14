@@ -1,19 +1,18 @@
-//! `plylang test` finds test files, compiles them in the package, and runs them.
+//! `plylang test` finds `?` checks in source files, compiles them, and runs them.
 //!
-//! A test is a word `( -- Verdict )`. The runner calls each one and uses
-//! the word as its name. A file with none of those words may export `suite`
-//! `( -- (Array Verdict) )` instead. Each verdict has `ok`, `name`, and `text`.
-//! `text` is empty when the check passed.
+//! A check is `? "name" < picture > [ program ]`. Both programs start from an
+//! empty stack. The runner reads the name before the program runs. Comparison
+//! is structural. One failed check does not cancel the others in the file.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::build::{
-    build, compile_test_file, file_is_test_entry, package_dirs, reject_shadowed_test_modules,
-    BuildError, CompiledTest,
-};
+use crate::ast::Item;
+use crate::build::{build, compile_checks, open_package, package_dirs, BuildError, PlannedCheck};
+use crate::parser::parse;
+use crate::paths::ParseMode;
 
 const HARNESS: &str = r##"
 import { pathToFileURL } from "node:url";
@@ -21,7 +20,7 @@ import { writeFileSync } from "node:fs";
 
 const file = process.argv[2];
 const out = process.argv[3];
-const names = JSON.parse(process.argv[4]);
+const checks = JSON.parse(process.argv[4]);
 const mod = await import(pathToFileURL(file).href);
 
 function detail(error) {
@@ -29,50 +28,75 @@ function detail(error) {
   return text.endsWith("\n") ? text.slice(0, -1) : text;
 }
 
-function verdict(name, row) {
-  if (row == null || typeof row !== "object" || Array.isArray(row)) {
-    return { ok: false, name, text: "test did not return a verdict" };
-  }
-  return {
-    ok: row.ok === true,
-    name,
-    text: typeof row.text === "string" ? row.text : "",
-  };
+function stack(value, arity) {
+  if (arity === 0) return [];
+  if (arity === 1) return [value];
+  return Array.isArray(value) ? value : [value];
 }
 
-let report;
-if (names.length > 0) {
-  report = names.map((name) => {
-    const run = mod[name];
-    if (typeof run !== "function") {
-      return { ok: false, name, text: "missing test " + name };
+function same(left, right) {
+  if (Object.is(left, right)) return true;
+  if (typeof left !== typeof right) return false;
+  if (left && right && typeof left === "object") {
+    if (Array.isArray(left) || Array.isArray(right)) {
+      if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+      return left.every((item, index) => same(item, right[index]));
     }
-    try {
-      return verdict(name, run());
-    } catch (error) {
-      return { ok: false, name, text: detail(error) };
-    }
-  });
-} else if (typeof mod.suite === "function") {
-  let rows;
-  try {
-    rows = mod.suite();
-  } catch (error) {
-    process.stderr.write(detail(error) + "\n");
-    process.exit(1);
+    const keys = Object.keys(left);
+    if (keys.length !== Object.keys(right).length) return false;
+    return keys.every((key) => Object.prototype.hasOwnProperty.call(right, key) && same(left[key], right[key]));
   }
-  if (!Array.isArray(rows)) {
-    process.stderr.write("suite must return an array of verdicts\n");
-    process.exit(3);
-  }
-  report = rows.map((row, index) => {
-    const name = typeof row?.name === "string" && row.name.length > 0 ? row.name : "#" + (index + 1);
-    return verdict(name, row);
-  });
-} else {
-  process.stderr.write("no tests\n");
-  process.exit(3);
+  return false;
 }
+
+function show(value) {
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (typeof value === "function") return "[quotation]";
+  if (value === null || value === undefined) return String(value);
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "<>";
+    return "< " + value.map(show).join(" ") + " >";
+  }
+  if (typeof value.tag === "string") {
+    const fields = Object.keys(value).filter((key) => key !== "tag");
+    if (fields.length === 0) return value.tag;
+    if (fields.length === 1 && fields[0] === "value") return value.tag + " " + show(value.value);
+    return value.tag + " " + fields.map((key) => key + ": " + show(value[key])).join(" ");
+  }
+  return JSON.stringify(value);
+}
+
+function showStack(values) {
+  if (values.length === 0) return "<>";
+  return "< " + values.map(show).join(" ") + " >";
+}
+
+const report = checks.map((check) => {
+  const wantFn = mod[check.want];
+  const bodyFn = mod[check.body];
+  if (typeof wantFn !== "function" || typeof bodyFn !== "function") {
+    return { ok: false, name: check.name, text: "missing check" };
+  }
+  let want;
+  try {
+    want = stack(wantFn(), check.arity);
+  } catch (error) {
+    return { ok: false, name: check.name, text: detail(error) };
+  }
+  let got;
+  try {
+    got = stack(bodyFn(), check.arity);
+  } catch (error) {
+    return { ok: false, name: check.name, text: detail(error) };
+  }
+  if (same(got, want)) return { ok: true, name: check.name, text: "" };
+  return {
+    ok: false,
+    name: check.name,
+    text: "want " + showStack(want) + "\ngot " + showStack(got),
+  };
+});
 writeFileSync(out, JSON.stringify(report));
 "##;
 
@@ -93,7 +117,7 @@ pub struct FileReport {
 #[derive(Debug)]
 pub struct Check {
     pub name: String,
-    /// 1-based line of the word. `0` when the check came from `suite`.
+    /// 1-based line of the name. `0` when the line is unknown.
     pub line: u32,
     pub ok: bool,
     pub text: String,
@@ -186,8 +210,6 @@ fn failure_title(failure: &str) -> &str {
     let first = failure.lines().next().unwrap_or(failure);
     if first.contains("error: PL") {
         "failed to compile"
-    } else if first.starts_with("missing suite") || first.starts_with("suite must return") {
-        "failed to run"
     } else {
         "failed to run"
     }
@@ -247,29 +269,26 @@ impl Paint {
     }
 }
 
-/// Find `pattern` under the package that contains `start`, build that package,
-/// compile each test, and run its `suite`.
+/// Find `pattern` under `ply.source`, build the package, and run each file that
+/// has a `?` check. The pattern is relative to the source directory.
 pub fn test_package(start: &Path, pattern: &str) -> Result<TestReport, BuildError> {
     let started = Instant::now();
-    let (root, out) = package_dirs(start)?;
-    let files = match_tests(&root, &out, pattern)?;
-    if files.is_empty() {
-        return Err(BuildError::plain(format!("no tests matched {pattern}")));
-    }
-    build(&root)?;
-    reject_shadowed_test_modules(&root)?;
+    let (root, _out) = package_dirs(start)?;
+    let package = open_package(&root)?;
+    let files = match_source(&package.source, pattern)?;
     let mut entries = Vec::new();
     for file in files {
-        if file_is_test_entry(&file)? {
+        if file_has_probe(&file)? {
             entries.push(file);
         }
     }
     if entries.is_empty() {
         return Err(BuildError::plain(format!("no tests matched {pattern}")));
     }
+    build(&root)?;
     let mut reports = Vec::new();
     for file in entries {
-        reports.push(run_file(&root, &out, &file));
+        reports.push(run_file(&root, &package.source, &file));
     }
     Ok(TestReport {
         files: reports,
@@ -277,23 +296,21 @@ pub fn test_package(start: &Path, pattern: &str) -> Result<TestReport, BuildErro
     })
 }
 
-fn match_tests(root: &Path, out: &Path, pattern: &str) -> Result<Vec<PathBuf>, BuildError> {
+fn match_source(source: &Path, pattern: &str) -> Result<Vec<PathBuf>, BuildError> {
     let mut found = Vec::new();
-    walk_tests(root, root, out, pattern, &mut found)?;
+    if source.is_dir() {
+        walk_source(source, source, pattern, &mut found)?;
+    }
     found.sort();
     Ok(found)
 }
 
-fn walk_tests(
-    root: &Path,
+fn walk_source(
+    source: &Path,
     dir: &Path,
-    out: &Path,
     pattern: &str,
     found: &mut Vec<PathBuf>,
 ) -> Result<(), BuildError> {
-    if dir.starts_with(out) && dir != root {
-        return Ok(());
-    }
     let entries = fs::read_dir(dir).map_err(|error| crate::build::os_error(dir, error))?;
     for entry in entries {
         let entry = entry.map_err(|error| crate::build::os_error(dir, error))?;
@@ -301,17 +318,17 @@ fn walk_tests(
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if path.is_dir() {
-            if name.starts_with('.') || name == "node_modules" || path == *out {
+            if name.starts_with('.') || name == "node_modules" {
                 continue;
             }
-            walk_tests(root, &path, out, pattern, found)?;
+            walk_source(source, &path, pattern, found)?;
             continue;
         }
         if !name.ends_with(".ply") || name.ends_with(".d.ply") {
             continue;
         }
         let relative = path
-            .strip_prefix(root)
+            .strip_prefix(source)
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
@@ -322,14 +339,40 @@ fn walk_tests(
     Ok(())
 }
 
-fn run_file(root: &Path, out: &Path, file: &Path) -> FileReport {
+/// A file that fails to parse still counts, so the runner can show the diagnostic.
+fn file_has_probe(path: &Path) -> Result<bool, BuildError> {
+    let source = fs::read_to_string(path).map_err(|error| crate::build::os_error(path, error))?;
+    match parse(&source, ParseMode::Source) {
+        Err(_) => Ok(true),
+        Ok(module) => Ok(module
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::Probe(_)))),
+    }
+}
+
+fn run_file(root: &Path, source: &Path, file: &Path) -> FileReport {
     let started = Instant::now();
     let path = file
-        .strip_prefix(root)
+        .strip_prefix(source)
         .unwrap_or(file)
         .to_string_lossy()
         .replace('\\', "/");
-    let compiled = match compile_test_file(root, file) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|time| time.as_nanos())
+        .unwrap_or(0);
+    let temp_root = root.join(format!(".ply-test-{}-{nanos}", std::process::id()));
+    let _cleanup = DirCleanup {
+        path: temp_root.clone(),
+    };
+    let relative = file
+        .strip_prefix(source)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let from_js = temp_root.join(&relative).with_extension("js");
+    let compiled = match compile_checks(root, file, &from_js) {
         Ok(compiled) => compiled,
         Err(error) => {
             return FileReport {
@@ -340,7 +383,7 @@ fn run_file(root: &Path, out: &Path, file: &Path) -> FileReport {
             };
         }
     };
-    let (checks, failure) = match execute(root, out, &compiled) {
+    let (checks, failure) = match execute(root, &from_js, &compiled.0, &compiled.1) {
         Ok(checks) => (checks, None),
         Err(error) => (Vec::new(), Some(error)),
     };
@@ -352,16 +395,16 @@ fn run_file(root: &Path, out: &Path, file: &Path) -> FileReport {
     }
 }
 
-fn execute(root: &Path, out: &Path, compiled: &CompiledTest) -> Result<Vec<Check>, String> {
-    if let Some(parent) = compiled.js_path.parent() {
+fn execute(
+    root: &Path,
+    from_js: &Path,
+    js: &str,
+    plans: &[PlannedCheck],
+) -> Result<Vec<Check>, String> {
+    if let Some(parent) = from_js.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    fs::write(&compiled.js_path, &compiled.js).map_err(|error| error.to_string())?;
-    // Stop at `ply.out`. Empty parents under it go away. The output directory stays.
-    let _cleanup = (!compiled.keep).then(|| JsCleanup {
-        file: compiled.js_path.clone(),
-        stop: out.to_path_buf(),
-    });
+    fs::write(from_js, js).map_err(|error| error.to_string())?;
     let harness = std::env::temp_dir().join(format!(
         "plylang-test-harness-{}-{}.mjs",
         std::process::id(),
@@ -379,15 +422,21 @@ fn execute(root: &Path, out: &Path, compiled: &CompiledTest) -> Result<Vec<Check
             .and_then(|name| name.to_str())
             .unwrap_or("run")
     ));
-    let names: Vec<&str> = compiled
-        .words
+    let payload = plans
         .iter()
-        .map(|word| word.name.as_str())
-        .collect();
-    let words = serde_json::to_string(&names).map_err(|error| error.to_string())?;
+        .map(|plan| {
+            serde_json::json!({
+                "name": plan.name,
+                "want": plan.want,
+                "body": plan.body,
+                "arity": plan.arity,
+            })
+        })
+        .collect::<Vec<_>>();
+    let words = serde_json::to_string(&payload).map_err(|error| error.to_string())?;
     let output = Command::new("node")
         .arg(&harness)
-        .arg(&compiled.js_path)
+        .arg(from_js)
         .arg(&result)
         .arg(words)
         .current_dir(root)
@@ -408,7 +457,7 @@ fn execute(root: &Path, out: &Path, compiled: &CompiledTest) -> Result<Vec<Check
             error.to_string()
         })?;
         let _ = fs::remove_file(&result);
-        return read_checks(&bytes).map(|checks| locate(&compiled.words, checks));
+        return read_checks(&bytes).map(|checks| locate(plans, checks));
     }
     let _ = fs::remove_file(&result);
     let mut detail = String::new();
@@ -427,24 +476,13 @@ fn execute(root: &Path, out: &Path, compiled: &CompiledTest) -> Result<Vec<Check
     Err(detail)
 }
 
-struct JsCleanup {
-    file: PathBuf,
-    stop: PathBuf,
+struct DirCleanup {
+    path: PathBuf,
 }
 
-impl Drop for JsCleanup {
+impl Drop for DirCleanup {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.file);
-        let mut dir = self.file.parent().map(Path::to_path_buf);
-        while let Some(current) = dir {
-            if current == self.stop || !current.starts_with(&self.stop) {
-                break;
-            }
-            if fs::remove_dir(&current).is_err() {
-                break;
-            }
-            dir = current.parent().map(Path::to_path_buf);
-        }
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -478,7 +516,7 @@ fn read_checks(bytes: &[u8]) -> Result<Vec<Check>, String> {
         serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
     let rows = value
         .as_array()
-        .ok_or_else(|| "suite report was not an array".to_string())?;
+        .ok_or_else(|| "check report was not an array".to_string())?;
     Ok(rows
         .iter()
         .map(|row| Check {
@@ -501,9 +539,12 @@ fn read_checks(bytes: &[u8]) -> Result<Vec<Check>, String> {
         .collect())
 }
 
-fn locate(words: &[crate::build::TestWord], mut checks: Vec<Check>) -> Vec<Check> {
-    for (check, word) in checks.iter_mut().zip(words) {
-        check.line = word.line;
+fn locate(plans: &[PlannedCheck], mut checks: Vec<Check>) -> Vec<Check> {
+    for (check, plan) in checks.iter_mut().zip(plans) {
+        check.line = plan.line;
+        if check.name.is_empty() {
+            check.name = plan.name.clone();
+        }
     }
     checks
 }
@@ -601,94 +642,139 @@ Time   12ms
     }
 
     #[test]
-    fn a_package_runs_matching_files_and_deletes_the_ephemeral_javascript() {
+    fn a_package_runs_checks_in_source_files_and_deletes_the_temp_directory() {
         let temp = Temp::new("ply-test-run");
         temp.write(
             "package.json",
             "{\n  \"name\": \"fixture\",\n  \"type\": \"module\",\n  \"ply\": { \"source\": \"src\", \"foreign\": \"foreign\", \"out\": \"dist\", \"language\": 1 }\n}\n",
         );
-        temp.write("src/Lib.ply", "@ answer\n\n: answer ( -- Num )\n  1\n");
+        temp.write(
+            "src/Lib.ply",
+            "\
+@ answer
+
+: answer ( -- Num )
+  1
+
+: hidden ( -- Num )
+  1
+
+? \"yes\" < 1 > [
+  answer
+]
+
+? \"off\" < 1 > [
+  2
+]
+",
+        );
         temp.write(
             "src/Also.ply",
             "\
-@ suite, Verdict
+@
 
-; Verdict = Verdict ok : Bool, name : Str, text : Str
+: foreign boom ( -- Num )
 
-: foreign push ( (Array Verdict) Verdict -- (Array Verdict) )
+? \"named\" < 1 > [
+  boom
+]
 
-: suite ( -- (Array Verdict) )
-  <>
-  true \"kept\" \"\" Verdict push
+? \"empty\" <> [
+]
 ",
         );
         temp.write(
             "foreign/Also.js",
-            "export function push(array, value) {\n  return array.concat([value]);\n}\n",
+            "export function boom() { throw new Error(\"nope\"); }\n",
         );
         temp.write(
-            "test/Pass.ply",
+            "src/Bad.ply",
             "\
-~ \"Lib\" answer
+@
 
-; Verdict = Verdict ok : Bool, name : Str, text : Str
-
-: yes ( -- Verdict )
-  answer drop
-  true \"ignored\" \"\" Verdict
-
-: no ( -- Verdict )
-  false \"\" \"no: 1 !== 2\" Verdict
+? \"bad\" < 1 > [
+  \"no\"
+]
 ",
         );
-        temp.write("test/Bad.ply", ": suite ( -- Int )\n  \"nope\"\n");
-        temp.write("test/Miss.ply", ": other ( -- Num )\n  1\n");
+        temp.write(
+            "src/Miss.ply",
+            "\
+@
+
+: other ( -- Num )
+  1
+",
+        );
 
         let missing = super::test_package(&temp.0, "missing/**/*.ply").unwrap_err();
         assert_eq!(missing.render(), "no tests matched missing/**/*.ply");
         assert!(!temp.0.join("dist").exists());
 
-        let report = super::test_package(&temp.0, "test/**/*.ply")
+        let report = super::test_package(&temp.0, "**/*.ply")
             .unwrap_or_else(|error| panic!("{}", error.render()));
         assert!(report.failed());
-        assert_eq!(report.files.len(), 2, "{report:?}");
-        let bad = &report.files[0];
-        assert_eq!(bad.path, "test/Bad.ply");
+        assert_eq!(report.files.len(), 3, "{report:?}");
+        let also = report
+            .files
+            .iter()
+            .find(|file| file.path == "Also.ply")
+            .unwrap();
+        assert!(also.failure.is_none(), "{also:?}");
+        assert_eq!(also.checks.len(), 2);
+        assert_eq!(also.checks[0].name, "named");
+        assert!(!also.checks[0].ok);
+        assert!(also.checks[0].text.contains("nope"), "{also:?}");
+        assert!(also.checks[1].ok, "{also:?}");
+        let bad = report
+            .files
+            .iter()
+            .find(|file| file.path == "Bad.ply")
+            .unwrap();
         assert!(bad.checks.is_empty());
         let bad_text = bad.failure.as_deref().unwrap_or("");
         assert!(bad_text.contains("error: PL"), "{bad_text}");
-        let pass = &report.files[1];
-        assert_eq!(pass.path, "test/Pass.ply");
+        let pass = report
+            .files
+            .iter()
+            .find(|file| file.path == "Lib.ply")
+            .unwrap();
         assert!(pass.failure.is_none(), "{pass:?}");
         assert_eq!(pass.checks.len(), 2);
         assert_eq!(pass.checks[0].name, "yes");
-        assert_eq!(pass.checks[0].line, 5);
+        assert!(pass.checks[0].line > 0);
         assert!(pass.checks[0].ok);
         assert!(pass.checks[0].text.is_empty());
-        assert_eq!(pass.checks[1].name, "no");
-        assert_eq!(pass.checks[1].line, 9);
+        assert_eq!(pass.checks[1].name, "off");
         assert!(!pass.checks[1].ok);
-        assert_eq!(pass.checks[1].text, "no: 1 !== 2");
+        assert!(pass.checks[1].text.contains("want < 1 >"), "{pass:?}");
+        assert!(pass.checks[1].text.contains("got < 2 >"), "{pass:?}");
         let text = report.render(false);
         assert!(text.contains("✓ yes"), "{text}");
-        assert!(text.contains("✗ no"), "{text}");
-        assert!(text.contains("no: 1 !== 2"), "{text}");
+        assert!(text.contains("✗ off"), "{text}");
+        assert!(text.contains("want < 1 >"), "{text}");
         assert!(text.contains("✗ failed to compile"), "{text}");
-        assert!(text.contains("Tests  1 failed | 1 passed (2)"), "{text}");
-        assert!(text.contains("Files  2 failed (2)"), "{text}");
-        assert!(!temp.0.join("dist/test/Pass.js").exists());
-        assert!(!temp.0.join("dist/test/Miss.js").exists());
-        assert!(temp.0.join("dist/Lib.js").is_file());
-        assert!(temp.0.join("dist/Also.js").is_file());
-        assert!(!temp.0.join("src/Run.ply").exists());
-
-        let kept = super::test_package(&temp.0, "src/Also.ply")
-            .unwrap_or_else(|error| panic!("{}", error.render()));
-        assert!(!kept.failed());
-        assert_eq!(kept.files.len(), 1);
-        assert_eq!(kept.files[0].checks[0].name, "kept");
-        assert!(kept.files[0].checks[0].ok);
-        assert!(temp.0.join("dist/Also.js").is_file());
+        assert!(text.contains("Tests  2 failed | 2 passed (4)"), "{text}");
+        assert!(text.contains("Files  3 failed (3)"), "{text}");
+        let lib_js = std::fs::read_to_string(temp.0.join("dist/Lib.js")).unwrap();
+        assert!(!lib_js.contains("ply_check_"), "{lib_js}");
+        assert!(!lib_js.contains("ply_want_"), "{lib_js}");
+        assert!(lib_js.contains("function hidden"), "{lib_js}");
+        assert!(!lib_js.contains("export function hidden"), "{lib_js}");
+        let lib_iface = std::fs::read_to_string(temp.0.join("dist/Lib.d.ply")).unwrap();
+        assert!(!lib_iface.contains('?'), "{lib_iface}");
+        assert!(!temp.0.join("dist/Miss.js").is_file());
+        assert!(!temp.0.join("dist/Miss.d.ply").is_file());
+        assert!(
+            std::fs::read_dir(&temp.0)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".ply-test-")),
+            "temp check directory was left behind"
+        );
     }
 
     struct Temp(std::path::PathBuf);

@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::ast::{Class, Data, Def, Exports, Instance, Item, Module, Place, Synonym};
+use crate::ast::{Class, Data, Def, Exports, Instance, Item, Module, Place, Synonym, Type};
 
 pub(crate) enum Found {
     Data(Data),
@@ -30,7 +30,7 @@ pub(crate) fn defines(module: &Module, name: &str) -> bool {
         Item::Class(class) => {
             class.name == name || class.methods.iter().any(|method| method.name == name)
         }
-        Item::Instance(_) => false,
+        Item::Instance(_) | Item::Probe(_) => false,
     })
 }
 
@@ -100,18 +100,60 @@ pub(crate) fn own_public_values(module: &Module) -> Vec<String> {
     }
 }
 
-/// Words named by `#` lines written in this module.
+/// Words named by `#` lines whose head an importer can name.
+/// A head kept off `@` stays in this file, and so does its method word.
 pub(crate) fn own_method_words(module: &Module) -> Vec<String> {
     let mut names = Vec::new();
     let mut seen = HashSet::new();
     for item in &module.items {
         if let Item::Instance(instance) = item {
+            if instance_head_is_hidden(module, instance) {
+                continue;
+            }
             for binding in &instance.methods {
                 push(&mut names, &mut seen, binding.word.clone());
             }
         }
     }
     names
+}
+
+/// The instance head names a type this file did not publish.
+pub(crate) fn instance_head_is_hidden(module: &Module, instance: &Instance) -> bool {
+    instance.args.iter().any(|ty| type_is_hidden(module, ty))
+}
+
+fn type_is_hidden(module: &Module, ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) => false,
+        Type::Ctor(name) => local_type_is_hidden(module, name),
+        Type::App(head, args) => {
+            type_is_hidden(module, head) || args.iter().any(|ty| type_is_hidden(module, ty))
+        }
+        Type::Fun(effect) => effect
+            .input
+            .items
+            .iter()
+            .chain(&effect.output.items)
+            .any(|ty| type_is_hidden(module, ty)),
+        Type::Record(row) => {
+            row.fields.iter().any(|(_, ty)| type_is_hidden(module, ty))
+                || row.tail_ty().is_some_and(|ty| type_is_hidden(module, ty))
+        }
+    }
+}
+
+fn local_type_is_hidden(module: &Module, name: &str) -> bool {
+    let local = module.items.iter().any(|item| match item {
+        Item::Data(data) => data.name == name,
+        Item::Synonym(synonym) => synonym.name == name,
+        _ => false,
+    });
+    let published = match &module.exports {
+        Exports::List(list) => list.has(name),
+        Exports::Closed => false,
+    };
+    local && !published
 }
 
 pub(crate) fn own_instances(module: &Module) -> Vec<Instance> {

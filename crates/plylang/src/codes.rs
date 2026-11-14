@@ -180,7 +180,7 @@ pub enum Error {
     },
     /// A source module imported a package listed only in `devDependencies`.
     DevDependency(String),
-    /// A utility under `test/` uses the module path of a source module.
+    /// Not produced. Checks live in source files as `?` forms.
     TestModuleShadow(String),
     PackageJsonEntry,
     /// `ply.entry` names a module that is not in the source directory.
@@ -213,6 +213,12 @@ pub enum Error {
     PatternForm(String),
     /// The pattern names a type the runtime cannot distinguish, and the field is not already that type.
     PatternCannotTest(String),
+    /// The name of a `?` check is not a string literal.
+    ExpectedProbeName,
+    /// A `?` check has no `<` picture.
+    ExpectedProbePicture,
+    /// A `?` check has no quotation.
+    ExpectedProbeProgram,
 }
 
 impl Error {
@@ -473,6 +479,9 @@ impl Error {
             UndefinedPlace(name) => ("PL0135", format!("no place {name}")),
             PatternForm(name) => ("PL0136", format!("pattern {name} needs a field name or ..")),
             PatternCannotTest(ty) => ("PL0137", format!("pattern cannot test {ty}")),
+            ExpectedProbeName => static_text("PL0139", "check name must be a string"),
+            ExpectedProbePicture => static_text("PL0140", "expected a stack picture"),
+            ExpectedProbeProgram => static_text("PL0141", "expected a quotation"),
         }
     }
 }
@@ -1065,8 +1074,23 @@ mod tests {
                 "pattern cannot test (Option Num)",
                 "PL0137",
             ),
+            (
+                Error::ExpectedProbeName,
+                "check name must be a string",
+                "PL0139",
+            ),
+            (
+                Error::ExpectedProbePicture,
+                "expected a stack picture",
+                "PL0140",
+            ),
+            (
+                Error::ExpectedProbeProgram,
+                "expected a quotation",
+                "PL0141",
+            ),
         ];
-        assert_eq!(samples.len(), 138);
+        assert_eq!(samples.len(), 141);
         for (error, message, code) in samples {
             assert_eq!(error.code(), code, "{message}");
             assert_eq!(error.message(), message);

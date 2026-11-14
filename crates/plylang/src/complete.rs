@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::ast::{
-    method_line, scheme_string, type_string, Class, Ctor, Data, Def, Item, MethodSig, Module,
-    Scheme, Stack, StackEffect, StackTail, Type,
+    method_doc, method_line, scheme_string, type_string, Class, Ctor, Data, Def, Item, MethodSig,
+    Module, Scheme, Stack, StackEffect, StackTail, Type,
 };
 use crate::build::{
     available_import_paths, load_provider, load_surface, provider_file, read_module, stack_sites,
@@ -279,7 +279,7 @@ fn type_names(
                         replace,
                     ),
                 ),
-                Item::Def(_) | Item::Instance(_) | Item::Place(_) => {}
+                Item::Def(_) | Item::Instance(_) | Item::Place(_) | Item::Probe(_) => {}
             }
         }
         for name in imported_types(from, module) {
@@ -323,7 +323,7 @@ fn word_names(from: &Path, module: Option<&Module>, replace: Span) -> Vec<Comple
                         replace,
                     ),
                 ),
-                Item::Synonym(_) | Item::Instance(_) => {}
+                Item::Synonym(_) | Item::Instance(_) | Item::Probe(_) => {}
             }
         }
         for name in imported_words(from, module) {
@@ -559,7 +559,7 @@ fn imported_words(from: &Path, module: &Module) -> Vec<Named> {
                             label: local,
                             kind: CompletionKind::Word,
                             detail: method_line(&class, method),
-                            documentation: doc_text(&class.doc),
+                            documentation: doc_text(method_doc(&class, method)),
                             group: "2",
                         });
                     }
@@ -667,7 +667,7 @@ fn found_exports(found: &Found, name: &str) -> Vec<(CompletionKind, String, Stri
                 entries.push((
                     CompletionKind::Word,
                     method_line(class, method),
-                    doc_text(&class.doc),
+                    doc_text(method_doc(class, method)),
                 ));
             }
         }
@@ -701,7 +701,7 @@ fn method_entry(class: &Class, method: &MethodSig, group: &str, replace: Span) -
         &method.name,
         CompletionKind::Word,
         detail,
-        &class.doc,
+        method_doc(class, method),
         &format!("{group}{}", method.name),
         replace,
     )
@@ -1599,7 +1599,8 @@ fn add_fields(env: &mut FieldEnv, module: &Module) {
                     rhs: synonym.rhs.clone(),
                 });
             }
-            Item::Def(_) | Item::Class(_) | Item::Instance(_) | Item::Place(_) => {}
+            Item::Def(_) | Item::Class(_) | Item::Instance(_) | Item::Place(_) | Item::Probe(_) => {
+            }
         }
     }
 }
@@ -2048,6 +2049,16 @@ mod tests {
         assert_eq!(eq.detail, "Eq a => a a -- Bool");
         assert_eq!(eq.kind, CompletionKind::Word);
         assert_eq!(eq.documentation, "Equality.");
+        let own = ".. Equality.\n& Eq a\n  .. Two values are the same.\n  ..\n  .. The top two.\n  eq ( a a -- Bool )\n  differ ( a a -- Bool )\n\n: use ( Int Int -- Bool )\n  e";
+        let (line, character) = at(own, "\n  e");
+        let items = complete(own, Path::new("M.ply"), line, character);
+        let eq = items.iter().find(|item| item.label == "eq").expect("eq");
+        assert_eq!(eq.documentation, "Two values are the same.\n\nThe top two.");
+        let differ = items
+            .iter()
+            .find(|item| item.label == "differ")
+            .expect("differ");
+        assert_eq!(differ.documentation, "Equality.");
     }
 
     #[test]

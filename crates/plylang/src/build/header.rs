@@ -22,8 +22,9 @@ impl Session {
     }
 
     /// A `@` list. A name from an import is re-exported when the body does
-    /// not mention it. A mentioned name is imported and exported as a binding.
-    /// An instance word is imported from the module that defines it.
+    /// not mention it. A mentioned name is imported, and exported when `@`
+    /// lists it. A name the built program does not mention stays out of the
+    /// import. An instance word is imported from the module that defines it.
     fn list_js_header(&self, id: usize, from_js: &Path, anf: &AnfModule) -> String {
         let listed: HashSet<String> = self.units[id]
             .module
@@ -53,7 +54,7 @@ impl Session {
             for (remote, local_name) in brought {
                 if listed.contains(&local_name) && !referenced.contains(&local_name) {
                     reexport_names.push((remote, local_name));
-                } else {
+                } else if referenced.contains(&local_name) {
                     if listed.contains(&local_name) && !local_exports.contains(&local_name) {
                         local_exports.push(local_name.clone());
                     }
@@ -82,7 +83,12 @@ impl Session {
             header.push('\n');
         }
         let sibling = self.foreign_js(id);
-        header.push_str(&foreign_header(&self.units[id].module, sibling, from_js));
+        header.push_str(&foreign_header(
+            &self.units[id].module,
+            sibling,
+            from_js,
+            &referenced,
+        ));
         if !local_exports.is_empty() {
             let exported = local_exports
                 .iter()
@@ -158,14 +164,20 @@ impl Session {
     }
 
     /// A file with no name list. Test entries are this. Imports are used here
-    /// and are not re-exported. Every local word is a JavaScript export, so the
+    /// and are not re-exported. A name the built program does not mention stays
+    /// out of the import. Every local word is a JavaScript export, so the
     /// runner can call it.
     fn closed_js_header(&self, id: usize, from_js: &Path, anf: &AnfModule) -> String {
+        let referenced: HashSet<String> = referenced_words(anf).into_iter().collect();
         let mut groups: Vec<(String, Vec<(String, String)>)> = Vec::new();
         let imports = self.units[id].module.imports.clone();
         let deps = self.units[id].deps.clone();
         for (import, dep) in imports.iter().zip(&deps) {
-            let names = self.imported_values(*dep, import);
+            let names: Vec<(String, String)> = self
+                .imported_values(*dep, import)
+                .into_iter()
+                .filter(|(_, local_name)| referenced.contains(local_name))
+                .collect();
             if names.is_empty() {
                 continue;
             }
@@ -180,26 +192,12 @@ impl Session {
             header.push_str(&import_line(spec, names));
             header.push('\n');
         }
-        let foreign = foreign_names(&self.units[id].module);
-        if !foreign.is_empty() {
-            let sibling = self.foreign_js(id).expect("foreign directory");
-            let spec = relative_specifier(from_js, &sibling);
-            let names: Vec<(String, String)> = foreign
-                .iter()
-                .map(|(name, _)| (name.clone(), name.clone()))
-                .collect();
-            header.push_str(&import_line(&spec, &names));
-            header.push('\n');
-            let exported = foreign
-                .iter()
-                .filter(|(_, private)| !private)
-                .map(|(name, _)| export_binding(name))
-                .collect::<Vec<_>>()
-                .join(", ");
-            if !exported.is_empty() {
-                header.push_str(&format!("export {{ {exported} }};\n"));
-            }
-        }
+        header.push_str(&foreign_header(
+            &self.units[id].module,
+            self.foreign_js(id),
+            from_js,
+            &referenced,
+        ));
         header
     }
 
@@ -391,8 +389,16 @@ impl Session {
     }
 }
 
-fn foreign_header(module: &Module, sibling: Option<PathBuf>, from_js: &Path) -> String {
-    let foreign = foreign_names(module);
+fn foreign_header(
+    module: &Module,
+    sibling: Option<PathBuf>,
+    from_js: &Path,
+    referenced: &HashSet<String>,
+) -> String {
+    let foreign: Vec<(String, bool)> = foreign_names(module)
+        .into_iter()
+        .filter(|(name, private)| !private || referenced.contains(name))
+        .collect();
     if foreign.is_empty() {
         return String::new();
     }
@@ -446,7 +452,7 @@ fn local_runtime_names(module: &Module) -> HashSet<String> {
                 names.insert(format!("ply_set_{}", place.name));
                 names.insert(format!("ply_bind_{}", place.name));
             }
-            Item::Class(_) | Item::Instance(_) | Item::Synonym(_) => {}
+            Item::Class(_) | Item::Instance(_) | Item::Synonym(_) | Item::Probe(_) => {}
         }
     }
     names

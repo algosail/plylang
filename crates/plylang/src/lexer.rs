@@ -82,6 +82,13 @@ impl<'a> Lexer<'a> {
         ch
     }
 
+    /// `..` at the first non-space of a line is a doc comment, indented or not.
+    fn only_indent_before(&self, start: usize) -> bool {
+        self.source[self.line_start_at..start]
+            .chars()
+            .all(|ch| ch == ' ' || ch == '\t')
+    }
+
     fn skip_ignored(&mut self) {
         loop {
             match self.peek() {
@@ -91,7 +98,7 @@ impl<'a> Lexer<'a> {
                 Some('.')
                     if self.group_depth == 0
                         && self.peek_at(1) == Some('.')
-                        && self.index == self.line_start_at =>
+                        && self.only_indent_before(self.index) =>
                 {
                     break
                 }
@@ -187,7 +194,8 @@ impl<'a> Lexer<'a> {
             ';' => TokenKind::Data,
             '&' => TokenKind::Class,
             '#' => TokenKind::Instance,
-            '.' if self.group_depth == 0 && start == self.line_start_at => {
+            '?' => TokenKind::Probe,
+            '.' if self.group_depth == 0 && self.only_indent_before(start) => {
                 return self.doc_line(start)
             }
             '.' if self.group_depth == 0 => return self.dot(start),
@@ -239,7 +247,8 @@ impl<'a> Lexer<'a> {
         name
     }
 
-    /// `..` at column 0, outside parentheses. One leading space after the marker is not part of the text.
+    /// `..` at the start of a line, outside parentheses. Indent is allowed.
+    /// One leading space after the marker is not part of the text.
     fn doc_line(&mut self, start: usize) -> Result<Token, Diagnostic> {
         if self.peek() != Some('.') {
             return Err(self.error(start, Error::UnexpectedCharacter));
@@ -434,6 +443,12 @@ mod tests {
             spell(".. Copy the top.\n. note\n"),
             vec!["Doc(\"Copy the top.\")".to_string(), "Newline".to_string(),]
         );
+        assert_eq!(
+            spell("  .. The remainder.\n"),
+            vec!["Doc(\"The remainder.\")".to_string(), "Newline".to_string(),]
+        );
+        let mid = spell("eq .. gone\n");
+        assert!(mid.iter().all(|kind| !kind.starts_with("Doc")), "{mid:?}");
         assert_eq!(
             spell(".. kept\n\ndef\n"),
             vec![

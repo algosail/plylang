@@ -765,7 +765,7 @@ Fix: import a name from that list.
 
 The path is not a module of this package and not an export of another package. A missing file is the same message.
 
-Fix: check the spelling. A local module is `Data/Maybe`. A package module is the export path, such as `@algosail/example/Num`. The target must be listed in that package's `exports` with a `ply` condition. `plylang build` writes those entries for the package you are building.
+Fix: check the spelling. A local module is `Data/Maybe`. A package module is the export path, such as `@algosail/example/Num`. The target must be listed in that package's `exports` with a `ply` condition. `plylang build --exports` writes those entries for the package you are building when you name the module or pass `--all`.
 
 ## PL0093
 
@@ -1001,15 +1001,13 @@ Fix: use the field's name. Name the one field in the equation, `(Just x)`, or sp
 
 A module under the source directory imported a package that is listed in `devDependencies` and not in `dependencies`, `optionalDependencies`, or `peerDependencies`.
 
-Fix: move the package to `dependencies`, or import it from a file under `test/`.
+Fix: move the package to `dependencies`.
 
 ## PL0122
 
 `test module PATH is already a source module`
 
-A file under `test/` is a utility, and `src` already has that module path. A test entry, a word `( -- Verdict )` or `suite`, is not a module and does not clash.
-
-Fix: rename the utility, or make the file a test entry.
+This code is not produced. A check is a `?` form in a source file.
 
 ## PL0123
 
@@ -1031,7 +1029,7 @@ Fix: name a module that `plylang build` compiles, or remove the field.
 
 `module has no name list`
 
-A module under the source directory, or a utility under `test/`, has no `@` list. A test entry does not need one.
+A module under the source directory has no `@` list. A `?` check is not a published name and does not need one.
 
 Fix: write one `@` list. A bare `@` publishes nothing.
 
@@ -1136,3 +1134,27 @@ Fix: test a shape the runtime can see, `(Some (Array Num) items)`. When the fiel
 `--out` and `--foreign` are paths relative to the package root. `PATH` is absolute, empty, or contains `..`.
 
 Fix: pass a relative path that stays inside the package. `plylang compile --out` is the script file. `plylang build --out` is the module directory.
+
+## PL0139
+
+`check name must be a string`
+
+A `?` check names itself with a string literal. The runner reads that literal before the program runs, so a throw still has a name.
+
+Fix: write `? "name" < picture > [ program ]`.
+
+## PL0140
+
+`expected a stack picture`
+
+A `?` check has a name and then a picture of the stack in `<` and `>`. `<>` is an empty stack. `< 1 2 >` is two values, bottom to top.
+
+Fix: write the picture before the quotation.
+
+## PL0141
+
+`expected a quotation`
+
+A `?` check runs one quotation. The quotation starts from an empty stack and must leave the picture.
+
+Fix: write `[ program ]` after the picture.

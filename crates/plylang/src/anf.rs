@@ -15,6 +15,8 @@ pub struct AnfModule {
     pub defs: Vec<AnfDef>,
     /// Source order. An empty list leaves the JavaScript unchanged.
     pub places: Vec<AnfPlace>,
+    /// Checks. `javascript` leaves them out. The test runner appends them.
+    pub checks: Vec<AnfCheck>,
     pub needs_unit: bool,
     /// Instance words this module calls, and the module that wrote the `#`.
     pub method_homes: Vec<MethodHome>,
@@ -42,6 +44,13 @@ pub struct AnfCtor {
     pub names: Vec<Option<String>>,
     /// The constructor is the identity function. An equation reads the value itself.
     pub newtype: bool,
+}
+
+/// One `?` check, lowered as two functions the runner calls.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnfCheck {
+    pub want: AnfDef,
+    pub body: AnfDef,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -252,6 +261,18 @@ impl AnfModule {
             out.push_str(&place_runtime(place));
         }
         out
+    }
+
+    /// The module plus one exported function for each picture and each program.
+    /// Relative imports are still the caller's concern.
+    pub fn with_checks(&self) -> AnfModule {
+        let mut copy = self.clone();
+        let checks = std::mem::take(&mut copy.checks);
+        for check in checks {
+            copy.defs.push(check.want);
+            copy.defs.push(check.body);
+        }
+        copy
     }
 }
 
@@ -689,6 +710,10 @@ fn collect_value(value: &Value, names: &mut Vec<String>) {
     match value {
         Value::Call { word, .. } if word.starts_with('#') => {}
         Value::Call { word, .. } => names.push(word.clone()),
+        // A constructor is a JavaScript binding (`Leaf` or `Leaf(...)`).
+        // A facade that re-exports it still needs that binding when a private
+        // word builds the value.
+        Value::Ctor { name, .. } => names.push(name.clone()),
         Value::Dict { fields } => {
             for field in fields {
                 match &field.value {
@@ -709,7 +734,6 @@ fn collect_value(value: &Value, names: &mut Vec<String>) {
             }
         }
         Value::Lit(_)
-        | Value::Ctor { .. }
         | Value::Apply { .. }
         | Value::Field { .. }
         | Value::Index { .. }

@@ -1,11 +1,18 @@
-//! `plylang build` compiles a package: resolve imports, write `.js` and `.d.ply`,
-//! then align `package.json` `exports` with those modules.
+//! `plylang build` compiles a package: resolve imports, write the `.js` and
+//! `.d.ply` a module publishes, then optionally align `package.json` `exports`.
+//! An import is emitted when the built program uses the name or `@` re-exports
+//! it. A `.js` file is written when it exports a value, defines `main`, has a
+//! place, or is `ply.entry`. A `.d.ply` is written when `@` names something.
+//! A file with nothing to publish is left out, and a stale copy is removed.
 //! `plylang build --watch` is that same build and stays running. A later save
 //! rechecks the saved module and the importers whose interface changed.
 //! [`build`] is that compile and writes no `exports`. `plylang test` uses it.
-//! [`build_exports`] aligns `exports`: one key per source module, `.` when
-//! `ply.entry` names one, and a key this tool does not own stays.
-//! `--exports` calls the same alignment. `plylang check` writes nothing.
+//! [`build_exports`] refreshes `exports` entries that are already written.
+//! A source file with no entry stays out of the list. Passing module names adds
+//! those modules. `export_all` adds source modules whose `@` names something.
+//! `.` follows `ply.entry` when that module is already in the list. A key this
+//! tool does not own stays. Paths come from `ply.out` on disk. A module with
+//! no `.js` keeps `ply` and has no `import`. `plylang check` writes nothing.
 //! A word named `main` with scheme `( -- Unit )` is called at the bottom of its
 //! module when Node starts that file. `plylang compile` writes one page script
 //! from the same graph. `main` is the root when the entry module defines it.
@@ -25,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::ast::{Def, Exports, Item, Module, StackTail, Type};
+use crate::ast::{Exports, Item, Module};
 use crate::check::{
     check_and_note, check_with_imports_key, collect_sites, collect_sites_with_imports_key,
     module_notes, KnownModule, ResolvedImport, StackAt,
@@ -50,7 +57,7 @@ use header::{accepts_entry, apply_entry, combine, entry_def, reject_bad_entry, w
 #[cfg(test)]
 use header::relative_specifier;
 
-use exports::{write_package_exports, ExportEntry};
+use exports::sync_package_exports;
 use interface::interface_text;
 use js_arity::{exported_arity, JsExport};
 
@@ -152,8 +159,13 @@ impl Package {
 struct Output {
     js_path: PathBuf,
     js: String,
+    /// False when this module has no runtime file. The text stays for the test
+    /// runner. The dist write deletes a stale file and does not announce it.
+    write_js: bool,
     iface_path: PathBuf,
     iface: String,
+    /// False when `@` names nothing. The dist write deletes a stale interface.
+    write_iface: bool,
 }
 
 struct Session {
@@ -161,8 +173,6 @@ struct Session {
     units: Vec<Unit>,
     by_path: HashMap<PathBuf, usize>,
     by_module: HashMap<String, usize>,
-    /// Utilities under `test/`, keyed by the path a test imports (`Support/Session`).
-    by_test: HashMap<String, usize>,
     exports_cache: HashMap<PathBuf, HashMap<String, String>>,
     topo: Vec<usize>,
     /// Published JavaScript values of each unit. Empty until `fill_surfaces`.
@@ -170,6 +180,24 @@ struct Session {
     outputs: Vec<Output>,
     /// Bytes last written for each output path.
     written: HashMap<PathBuf, String>,
+    /// Typecheck `?` forms. `build` and `compile` leave this off.
+    check_probes: bool,
+    /// Put the check functions in the JavaScript. The test runner sets this.
+    emit_checks: bool,
+    /// Import paths are computed from this file when the runner writes elsewhere.
+    check_header: Option<PathBuf>,
+    /// Checks lowered by the latest [`Session::check_unit`] that emitted them.
+    planned: Vec<PlannedCheck>,
+}
+
+/// One `?` check the runner calls. The name is known before the program runs.
+#[derive(Clone)]
+pub(crate) struct PlannedCheck {
+    pub name: String,
+    pub line: u32,
+    pub arity: usize,
+    pub want: String,
+    pub body: String,
 }
 
 enum Spec {
@@ -187,8 +215,14 @@ pub struct BuildFlags {
     pub out: Option<String>,
     /// Hand-written JavaScript directory, relative to the package root.
     pub foreign: Option<String>,
-    /// Replace `package.json` `exports` with one entry per built module.
+    /// Refresh `package.json` `exports` for modules already listed there.
     pub exports: bool,
+    /// Add every source module whose `@` names something.
+    pub export_all: bool,
+    /// Module paths to add, such as `Data/Sheet`.
+    pub export_modules: Vec<String>,
+    /// Print the exports report and leave `package.json` unchanged.
+    pub export_check: bool,
 }
 
 /// One `plylang compile`. Absent fields keep the package values. Nothing is written
@@ -212,20 +246,21 @@ struct SessionOver {
 }
 
 pub fn build(dir: &Path) -> Result<(), BuildError> {
-    build_with(dir, &BuildFlags::default())
+    build_with(dir, &BuildFlags::default()).map(|_| ())
 }
 
-/// Build the package, then replace `package.json` `exports` with one entry per built module.
+/// Build the package, then refresh `package.json` `exports` for modules already listed.
 pub fn build_exports(dir: &Path) -> Result<(), BuildError> {
     let mut flags = BuildFlags::default();
     flags.exports = true;
-    build_with(dir, &flags)
+    build_with(dir, &flags).map(|_| ())
 }
 
 /// Build the package. [`BuildFlags`] override `ply.entry`, `ply.out`, and `ply.foreign`
-/// for this run and are not written back. `exports` is rewritten only when
-/// [`BuildFlags::exports`] is set.
-pub fn build_with(dir: &Path, flags: &BuildFlags) -> Result<(), BuildError> {
+/// for this run and are not written back. `exports` is refreshed only when
+/// [`BuildFlags::exports`] is set. `Ok(true)` means `--exports --check` found
+/// the map would change. The report is already printed.
+pub fn build_with(dir: &Path, flags: &BuildFlags) -> Result<bool, BuildError> {
     let mut session = open_session_over(
         dir,
         &SessionOver {
@@ -234,23 +269,151 @@ pub fn build_with(dir: &Path, flags: &BuildFlags) -> Result<(), BuildError> {
             foreign: flags.foreign.clone(),
         },
     )?;
-    let entries = export_entries(
-        &session.units,
-        &session.package.out_rel,
-        session.package.entry.as_deref(),
-    );
-    if flags.exports {
-        session.package.exports = entries
-            .iter()
-            .map(|entry| (entry.key.clone(), entry.ply.clone()))
-            .collect();
-    }
+    let named = if flags.exports {
+        let mut named = Vec::new();
+        for name in &flags.export_modules {
+            let Some(name) = canonical_export_name(name) else {
+                return Err(BuildError::plain(format!(
+                    "module {name} is not a source file"
+                )));
+            };
+            let local = session.units.iter().any(|unit| {
+                unit.kind == Kind::Local && unit.module_path.as_deref() == Some(name.as_str())
+            });
+            if !local {
+                return Err(BuildError::plain(format!(
+                    "module {name} is not a source file"
+                )));
+            }
+            named.push(name);
+        }
+        named
+    } else {
+        Vec::new()
+    };
     session.check_all()?;
     session.write_outputs()?;
     if flags.exports {
-        write_package_exports(&session.package.root, &entries)?;
+        let disk = read_package(&session.package.root)?;
+        let source = source_modules(&session.units);
+        let mut publish = named;
+        if flags.export_all {
+            publish.extend(public_modules(&session.units));
+        }
+        publish.sort();
+        publish.dedup();
+        let runtime = runtime_modules(&session);
+        let change = sync_package_exports(
+            &session.package.root,
+            &source,
+            &disk.out_rel,
+            disk.entry.as_deref(),
+            &publish,
+            &runtime,
+            flags.export_check,
+        )?;
+        print_export_change(&change);
+        if flags.export_check && change.drift {
+            return Ok(true);
+        }
     }
-    Ok(())
+    Ok(false)
+}
+
+/// `Data/Sheet` and `./Data/Sheet` both name `Data/Sheet`.
+fn canonical_export_name(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("./").unwrap_or(name);
+    if rest.is_empty() {
+        return None;
+    }
+    let segments = module_name_from_path(&format!("{rest}.ply")).ok()?;
+    Some(segments.join("/"))
+}
+
+fn source_modules(units: &[Unit]) -> Vec<String> {
+    let mut names = Vec::new();
+    for unit in units {
+        if unit.kind == Kind::Local {
+            if let Some(path) = &unit.module_path {
+                names.push(path.clone());
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Source modules `--all` adds. A bare `@` and a missing `@` publish nothing.
+fn public_modules(units: &[Unit]) -> Vec<String> {
+    let mut names = Vec::new();
+    for unit in units {
+        if unit.kind == Kind::Local && publishes(&unit.module) {
+            if let Some(path) = &unit.module_path {
+                names.push(path.clone());
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+fn publishes(module: &Module) -> bool {
+    matches!(&module.exports, Exports::List(list) if !list.names.is_empty())
+}
+
+/// `.js` is a program or a module that publishes a JavaScript value.
+/// `ply.entry` is loaded as a program even when `@` is empty.
+fn runtime_js(module: &Module, js: &str, is_entry: bool) -> bool {
+    if is_entry || entry_def(module).is_some() || has_place(module) {
+        return true;
+    }
+    publishes(module) && js_has_export(js)
+}
+
+fn js_has_export(js: &str) -> bool {
+    js.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("export ") || trimmed.starts_with("export{")
+    })
+}
+
+/// Modules whose `.js` was produced. `package.json` omits `import` for the rest.
+fn runtime_modules(session: &Session) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for output in &session.outputs {
+        if !output.write_js {
+            continue;
+        }
+        let Ok(rel) = output.js_path.strip_prefix(&session.package.out) else {
+            continue;
+        };
+        let module = rel.with_extension("").to_string_lossy().replace('\\', "/");
+        if !module.is_empty() {
+            names.insert(module);
+        }
+    }
+    names
+}
+
+fn print_export_change(change: &exports::ExportChange) {
+    println!("exports");
+    println!("  public  {}", change.public);
+    for key in &change.added {
+        println!("  added {key}");
+    }
+    for key in &change.removed {
+        println!("  removed {key}");
+    }
+    for key in &change.path {
+        println!("  path {key}");
+    }
+    if !change.not_exported.is_empty() {
+        println!("  not exported");
+        for name in &change.not_exported {
+            println!("    {name}");
+        }
+    }
+    let _ = io::stdout().flush();
 }
 
 /// Write the Node modules, then one classic page script.
@@ -287,6 +450,7 @@ pub fn compile_with(dir: &Path, flags: &CompileFlags) -> Result<(), BuildError> 
 /// Package check: the same work as [`build`], without writing `.js` or `.d.ply`.
 pub fn check_package(dir: &Path) -> Result<(), BuildError> {
     let mut session = open_session(dir)?;
+    session.check_probes = true;
     session.check_all()
 }
 
@@ -322,12 +486,15 @@ fn open_session_over(dir: &Path, over: &SessionOver) -> Result<Session, BuildErr
         units: Vec::new(),
         by_path: HashMap::new(),
         by_module: HashMap::new(),
-        by_test: HashMap::new(),
         exports_cache: HashMap::new(),
         topo: Vec::new(),
         surfaces: Vec::new(),
         outputs: Vec::new(),
         written: HashMap::new(),
+        check_probes: false,
+        emit_checks: false,
+        check_header: None,
+        planned: Vec::new(),
     };
     session.collect_sources()?;
     if let Some(name) = session.package.entry.clone() {
@@ -354,23 +521,6 @@ fn package_javascript(path: &Path) -> Result<Option<String>, BuildError> {
     session.emit_one(id).map(Some)
 }
 
-pub(crate) struct CompiledTest {
-    pub js: String,
-    /// Where the JavaScript must be written so its import paths resolve.
-    pub js_path: PathBuf,
-    /// A source module already written by [`build`]. The runner must not delete it.
-    pub keep: bool,
-    /// Public words `( -- Verdict )`, in source order. The runner calls these.
-    pub words: Vec<TestWord>,
-}
-
-/// One discovered test. `line` is the 1-based line of the word.
-#[derive(Clone)]
-pub(crate) struct TestWord {
-    pub name: String,
-    pub line: u32,
-}
-
 /// The package that contains `start`, and the directory `ply.out` points at.
 pub(crate) fn package_dirs(start: &Path) -> Result<(PathBuf, PathBuf), BuildError> {
     let found = find_ply_root(start)
@@ -380,62 +530,71 @@ pub(crate) fn package_dirs(start: &Path) -> Result<(PathBuf, PathBuf), BuildErro
     Ok((root, package.out))
 }
 
-/// Compile one file in a package. Imports resolve the same way as [`build`].
-/// A file outside `ply.source` is still compiled against that package.
-pub(crate) fn compile_test_file(root: &Path, file: &Path) -> Result<CompiledTest, BuildError> {
+/// Compile one source file with its `?` checks exported, for a runner that
+/// writes the JavaScript at `from_js`. Nothing is written here. Dependencies
+/// are typechecked without their checks. The returned text imports them from
+/// `ply.out`, so [`build`] has to have written that directory first.
+pub(crate) fn compile_checks(
+    root: &Path,
+    file: &Path,
+    from_js: &Path,
+) -> Result<(String, Vec<PlannedCheck>), BuildError> {
     let mut session = open_session(root)?;
-    let (id, keep) = session.add_test_file(file)?;
-    let js_path = session.test_js_path(id);
-    let words = {
-        let unit = &session.units[id];
-        test_words(&unit.module, &unit.source)
+    let canonical = fs::canonicalize(file).map_err(|error| os_error(file, error))?;
+    let Some(id) = session.by_path.get(&canonical).copied() else {
+        return Err(BuildError::plain(format!(
+            "check file is not a source module: {}",
+            file.display()
+        )));
     };
-    let js = session.emit_one(id)?;
-    // Dependencies under ply.source are already in ply.out. A harness outside
-    // that tree is only compiled here, and the test's JavaScript imports it.
-    session.write_outputs()?;
-    Ok(CompiledTest {
-        js,
-        js_path,
-        keep,
-        words,
-    })
-}
-
-/// A test is a word that takes nothing and returns `Verdict`.
-fn test_words(module: &Module, source: &str) -> Vec<TestWord> {
-    module
-        .items
-        .iter()
-        .filter_map(|item| {
-            let Item::Def(def) = item else {
-                return None;
-            };
-            if def.vis.is_foreign() || !bare_verdict(def) {
-                return None;
+    session.visit(id, &mut Vec::new())?;
+    session.fill_surfaces();
+    let order = session.topo.clone();
+    let mut js = String::new();
+    let mut plans = Vec::new();
+    for unit in order {
+        let entry = unit == id;
+        session.check_probes = entry;
+        session.emit_checks = entry;
+        session.check_header = entry.then(|| from_js.to_path_buf());
+        let before = session.outputs.len();
+        session.check_unit(unit)?;
+        if entry {
+            js = session
+                .outputs
+                .last()
+                .map(|output| output.js.clone())
+                .unwrap_or_default();
+            plans = std::mem::take(&mut session.planned);
+            if session.outputs.len() > before {
+                session.outputs.pop();
             }
-            let (line, _) = line_col(source, def.name_span.start);
-            Some(TestWord {
-                name: def.name.clone(),
-                line,
-            })
-        })
-        .collect()
+        }
+    }
+    Ok((js, plans))
 }
 
-fn bare_verdict(def: &Def) -> bool {
-    let scheme = &def.scheme;
-    if !scheme.vars.is_empty() || !scheme.constraints.is_empty() || scheme.effect.effects.is_some()
-    {
-        return false;
+fn planned_checks(source: &str, module: &Module, anf: &crate::anf::AnfModule) -> Vec<PlannedCheck> {
+    let mut plans = Vec::new();
+    let mut index = 0;
+    for item in module.items.iter() {
+        let Item::Probe(probe) = item else {
+            continue;
+        };
+        let Some(check) = anf.checks.get(index) else {
+            break;
+        };
+        let (line, _) = line_col(source, probe.name_span.start);
+        plans.push(PlannedCheck {
+            name: probe.name.clone(),
+            line,
+            arity: check.body.body.result.len(),
+            want: check.want.name.clone(),
+            body: check.body.name.clone(),
+        });
+        index += 1;
     }
-    let input = &scheme.effect.input;
-    let output = &scheme.effect.output;
-    let open = |tail: &StackTail| matches!(tail, StackTail::Implicit | StackTail::Empty);
-    open(&input.tail)
-        && open(&output.tail)
-        && input.items.is_empty()
-        && matches!(output.items.as_slice(), [Type::Ctor(name)] if name == "Verdict")
+    plans
 }
 
 fn snippet_javascript(path: &Path) -> Result<String, BuildError> {
@@ -556,9 +715,8 @@ pub fn buffer_notes_open(path: &Path, source: &str, open: &[(&Path, &str)]) -> B
 }
 
 /// Import paths the package of `from_file` can name: files under the source
-/// directory, utilities under `test/` when `from_file` is a test, then `ply`
-/// exports of installed dependencies. The current file is left out. A source
-/// file does not see a package that is only a devDependency.
+/// directory, then `ply` exports of installed dependencies. The current file
+/// is left out. A source file does not see a package that is only a devDependency.
 pub(crate) fn available_import_paths(from_file: &Path) -> Vec<String> {
     let Some(root) = find_ply_root(from_file) else {
         return Vec::new();
@@ -581,25 +739,6 @@ pub(crate) fn available_import_paths(from_file: &Path) -> Vec<String> {
             continue;
         }
         paths.push(module_path);
-    }
-    if importer_in_test(&package, from_file) {
-        let test_root = package.root.join("test");
-        let mut helpers = Vec::new();
-        if test_root.is_dir() {
-            let _ = walk_ply(&test_root, &package.out, &mut helpers);
-        }
-        for file in helpers {
-            if canonical(&file) == canonical(from_file) {
-                continue;
-            }
-            let module_path = module_path_of(&test_root, &file);
-            if module_name_from_path(&format!("{module_path}.ply")).is_err() {
-                continue;
-            }
-            if matches!(test_role(&file), Ok(TestRole::Utility)) {
-                paths.push(module_path);
-            }
-        }
     }
     let library = path_under(&package.source, from_file);
     let text = fs::read_to_string(root.join("package.json")).unwrap_or_default();
@@ -670,17 +809,6 @@ fn locate_import(from_file: &Path, import_path: &str) -> Option<Located> {
             let root = find_ply_root(from_file)?;
             let package = read_package(&root).ok()?;
             let source_file = package.source.join(&module_path).with_extension("ply");
-            if importer_in_test(&package, from_file) {
-                if let Some((file, role)) = classify_named_test(&package, &module_path) {
-                    let source_exists = source_file.is_file();
-                    match role {
-                        TestRole::Utility if source_exists => return None,
-                        TestRole::Utility => return Some(Located::Local(file)),
-                        TestRole::Broken if !source_exists => return Some(Located::Local(file)),
-                        TestRole::Entry | TestRole::Broken => {}
-                    }
-                }
-            }
             if source_file.is_file() {
                 return Some(Located::Local(source_file));
             }
@@ -787,10 +915,12 @@ impl Session {
         for index in 0..self.outputs.len() {
             let js_path = self.outputs[index].js_path.clone();
             let js = self.outputs[index].js.clone();
+            let write_js = self.outputs[index].write_js;
             let iface_path = self.outputs[index].iface_path.clone();
             let iface = self.outputs[index].iface.clone();
-            self.commit_file(&js_path, &js, false)?;
-            self.commit_file(&iface_path, &iface, false)?;
+            let write_iface = self.outputs[index].write_iface;
+            self.commit_side(&js_path, &js, write_js, false)?;
+            self.commit_side(&iface_path, &iface, write_iface, false)?;
         }
         Ok(())
     }
@@ -987,10 +1117,15 @@ impl Session {
         let output = self.outputs.pop().expect("checked local module");
         let iface_changed = match self.written.get(&output.iface_path) {
             Some(have) => have != &output.iface,
-            None => true,
+            None => output.write_iface || output.iface_path.is_file(),
         };
-        self.commit_file(&output.js_path, &output.js, announce)?;
-        self.commit_file(&output.iface_path, &output.iface, announce)?;
+        self.commit_side(&output.js_path, &output.js, output.write_js, announce)?;
+        self.commit_side(
+            &output.iface_path,
+            &output.iface,
+            output.write_iface,
+            announce,
+        )?;
         if let Some(slot) = self
             .outputs
             .iter_mut()
@@ -1001,6 +1136,29 @@ impl Session {
             self.outputs.push(output);
         }
         Ok(iface_changed)
+    }
+
+    /// Write one output, or delete a stale file without printing its path.
+    fn commit_side(
+        &mut self,
+        path: &Path,
+        text: &str,
+        write: bool,
+        announce: bool,
+    ) -> Result<(), BuildError> {
+        if write {
+            self.commit_file(path, text, announce)
+        } else {
+            self.drop_file(path)
+        }
+    }
+
+    fn drop_file(&mut self, path: &Path) -> Result<(), BuildError> {
+        if path.is_file() {
+            fs::remove_file(path).map_err(|error| os_error(path, error))?;
+        }
+        self.written.remove(path);
+        Ok(())
     }
 
     fn commit_file(&mut self, path: &Path, text: &str, announce: bool) -> Result<(), BuildError> {
@@ -1109,9 +1267,6 @@ impl Session {
             self.remove_output(&iface)?;
             if self.by_module.get(&module_path).copied() == Some(id) {
                 self.by_module.remove(&module_path);
-            }
-            if self.by_test.get(&module_path).copied() == Some(id) {
-                self.by_test.remove(&module_path);
             }
         }
         let path = self.units[id].path.clone();
@@ -1234,99 +1389,6 @@ impl Session {
             .expect("checked local module has javascript"))
     }
 
-    fn test_js_path(&self, id: usize) -> PathBuf {
-        let module_path = self.units[id].module_path.clone().expect("test module");
-        self.package.out.join(module_path).with_extension("js")
-    }
-
-    /// A source file is compiled in place. A test file outside `ply.source`
-    /// becomes a module whose path is its path relative to the package root.
-    fn add_test_file(&mut self, file: &Path) -> Result<(usize, bool), BuildError> {
-        let canonical = fs::canonicalize(file).map_err(|error| os_error(file, error))?;
-        if let Some(id) = self.by_path.get(&canonical).copied() {
-            return Ok((id, true));
-        }
-        let relative = canonical.strip_prefix(&self.package.root).map_err(|_| {
-            BuildError::plain(format!(
-                "test file is outside the package: {}",
-                canonical.display()
-            ))
-        })?;
-        let relative = relative.to_string_lossy().replace('\\', "/");
-        let Some(module_path) = relative.strip_suffix(".ply") else {
-            return Err(BuildError::plain(format!(
-                "test file is not a .ply file: {}",
-                canonical.display()
-            )));
-        };
-        if module_path.is_empty() || module_path.ends_with(".d") {
-            return Err(BuildError::plain(format!(
-                "test file is not a source file: {}",
-                canonical.display()
-            )));
-        }
-        if let Some(id) = self.by_module.get(module_path).copied() {
-            if self.units[id].path != canonical {
-                return Err(BuildError::plain(format!(
-                    "test file clashes with module {module_path}"
-                )));
-            }
-        }
-        let source = fs::read_to_string(&canonical).map_err(|error| os_error(&canonical, error))?;
-        let module = parse(&source, ParseMode::Source)
-            .map_err(|error| located(&canonical, &source, error))?;
-        let id = self.units.len();
-        self.by_path.insert(canonical.clone(), id);
-        self.units.push(Unit {
-            path: canonical.clone(),
-            display: canonical.display().to_string(),
-            source,
-            parsed: module.clone(),
-            module,
-            package_root: self.package.root.clone(),
-            module_path: Some(module_path.to_string()),
-            kind: Kind::Local,
-            color: Color::White,
-            deps: Vec::new(),
-            live: true,
-        });
-        Ok((id, false))
-    }
-
-    /// A utility under `test/`. Its module path is the import name, so the
-    /// library build does not publish it and a source module of that name is
-    /// a different file.
-    fn load_test_module(&mut self, file: &Path, module_path: &str) -> Result<usize, BuildError> {
-        if let Some(id) = self.by_test.get(module_path).copied() {
-            return Ok(id);
-        }
-        let canonical = fs::canonicalize(file).map_err(|error| os_error(file, error))?;
-        if let Some(id) = self.by_path.get(&canonical).copied() {
-            self.by_test.insert(module_path.to_string(), id);
-            return Ok(id);
-        }
-        let source = fs::read_to_string(&canonical).map_err(|error| os_error(&canonical, error))?;
-        let module = parse(&source, ParseMode::Source)
-            .map_err(|error| located(&canonical, &source, error))?;
-        let id = self.units.len();
-        self.by_path.insert(canonical.clone(), id);
-        self.by_test.insert(module_path.to_string(), id);
-        self.units.push(Unit {
-            path: canonical.clone(),
-            display: canonical.display().to_string(),
-            source,
-            parsed: module.clone(),
-            module,
-            package_root: self.package.root.clone(),
-            module_path: Some(module_path.to_string()),
-            kind: Kind::Local,
-            color: Color::White,
-            deps: Vec::new(),
-            live: true,
-        });
-        Ok(id)
-    }
-
     fn collect_sources(&mut self) -> Result<(), BuildError> {
         if !self.package.source.is_dir() {
             return Err(io_error(
@@ -1419,25 +1481,6 @@ impl Session {
     ) -> Result<usize, BuildError> {
         let package_root = self.units[from].package_root.clone();
         if package_root == self.package.root {
-            if importer_in_test(&self.package, &self.units[from].path) {
-                if let Some((file, role)) = classify_named_test(&self.package, module_path) {
-                    let source_exists = self.by_module.contains_key(module_path);
-                    match role {
-                        TestRole::Utility if source_exists => {
-                            return Err(self.fail(
-                                from,
-                                span,
-                                Error::TestModuleShadow(module_path.to_string()),
-                            ));
-                        }
-                        TestRole::Utility => return self.load_test_module(&file, module_path),
-                        TestRole::Broken if !source_exists => {
-                            return self.load_test_module(&file, module_path);
-                        }
-                        TestRole::Broken | TestRole::Entry => {}
-                    }
-                }
-            }
             if let Some(id) = self.by_module.get(module_path).copied() {
                 return Ok(id);
             }
@@ -1588,7 +1631,7 @@ impl Session {
             &self.units[id].package_root,
             self.units[id].module_path.as_deref(),
         );
-        let checked = check_with_imports_key(&module, &resolved, &key)
+        let checked = check_with_imports_key(&module, &resolved, &key, self.check_probes)
             .map_err(|error| self.fail_diagnostic(id, error))?;
         if self.units[id].kind == Kind::External {
             return Ok(());
@@ -1602,8 +1645,20 @@ impl Session {
         let module_path = self.units[id].module_path.clone().expect("local module");
         let js_path = self.package.out.join(&module_path).with_extension("js");
         let iface_path = self.package.out.join(format!("{module_path}.d.ply"));
-        let header = self.js_header(id, &js_path, &checked.anf);
-        let body = checked.anf.javascript();
+        let source = self.units[id].source.clone();
+        self.planned = if self.emit_checks {
+            planned_checks(&source, &module, &checked.anf)
+        } else {
+            Vec::new()
+        };
+        let header_at = self.check_header.clone().unwrap_or_else(|| js_path.clone());
+        let anf = if self.emit_checks {
+            checked.anf.with_checks()
+        } else {
+            checked.anf
+        };
+        let header = self.js_header(id, &header_at, &anf);
+        let body = anf.javascript();
         let js = combine(&header, &body);
         let js = match entry_def(&module) {
             Some(def) if accepts_entry(def) => with_entry_guard(js),
@@ -1611,11 +1666,16 @@ impl Session {
             None => js,
         };
         let iface = interface_text(&module);
+        let is_entry = self.package.entry.as_deref() == Some(module_path.as_str());
+        let write_js = runtime_js(&module, &js, is_entry);
+        let write_iface = publishes(&module);
         self.outputs.push(Output {
             js_path,
             js,
+            write_js,
             iface_path,
             iface,
+            write_iface,
         });
         Ok(())
     }
@@ -1676,11 +1736,7 @@ impl Session {
         if self.units[id].kind == Kind::External {
             return false;
         }
-        let path = &self.units[id].path;
-        if path_under(&self.package.source, path) {
-            return true;
-        }
-        importer_in_test(&self.package, path) && !is_test_entry(&self.units[id].module)
+        path_under(&self.package.source, &self.units[id].path)
     }
 
     fn fail(&self, id: usize, span: Span, error: Error) -> BuildError {
@@ -1822,43 +1878,6 @@ impl<'a> OpenDoc<'a> {
     ) -> Result<usize, Diagnostic> {
         let package_root = self.units[from].package_root.clone();
         if package_root == self.package.root {
-            if importer_in_test(&self.package, &self.units[from].path) {
-                if let Some((file, role)) = classify_named_test(&self.package, module_path) {
-                    let source_exists = self
-                        .package
-                        .source
-                        .join(module_path)
-                        .with_extension("ply")
-                        .is_file();
-                    match role {
-                        TestRole::Utility if source_exists => {
-                            return Err(Diagnostic::new(
-                                span,
-                                Error::TestModuleShadow(module_path.to_string()),
-                            ));
-                        }
-                        TestRole::Utility => {
-                            return self.load(
-                                file,
-                                package_root,
-                                Some(module_path.to_string()),
-                                span,
-                                import_path,
-                            );
-                        }
-                        TestRole::Broken if !source_exists => {
-                            return self.load(
-                                file,
-                                package_root,
-                                Some(module_path.to_string()),
-                                span,
-                                import_path,
-                            );
-                        }
-                        TestRole::Broken | TestRole::Entry => {}
-                    }
-                }
-            }
             if let Some(id) = self.by_module.get(module_path).copied() {
                 return Ok(id);
             }
@@ -2055,11 +2074,7 @@ impl<'a> OpenDoc<'a> {
     }
 
     fn buffer_needs_public(&self) -> bool {
-        let path = &self.units[0].path;
-        if path_under(&self.package.source, path) {
-            return true;
-        }
-        importer_in_test(&self.package, path) && !is_test_entry(&self.units[0].module)
+        path_under(&self.package.source, &self.units[0].path)
     }
 
     fn sites(&self) -> Vec<StackAt> {
@@ -2345,40 +2360,6 @@ fn export_key(subpath: &str) -> String {
     }
 }
 
-fn export_entries(units: &[Unit], out_rel: &str, entry: Option<&str>) -> Vec<ExportEntry> {
-    let mut entries = Vec::new();
-    for unit in units {
-        if unit.kind != Kind::Local {
-            continue;
-        }
-        let Some(module_path) = &unit.module_path else {
-            continue;
-        };
-        // A test file's path starts at the package root (`test/Data/State`).
-        // Source modules are the ones `exports` names.
-        if module_path.starts_with("test/") {
-            continue;
-        }
-        entries.push(ExportEntry {
-            key: export_key(module_path),
-            ply: format!("./{out_rel}/{module_path}.d.ply"),
-            js: format!("./{out_rel}/{module_path}.js"),
-        });
-    }
-    if let Some(name) = entry {
-        let key = export_key(name);
-        if let Some(module) = entries.iter().find(|item| item.key == key) {
-            entries.push(ExportEntry {
-                key: ".".to_string(),
-                ply: module.ply.clone(),
-                js: module.js.clone(),
-            });
-        }
-    }
-    entries.sort_by(|left, right| left.key.cmp(&right.key));
-    entries
-}
-
 fn target_file(root: &Path, target: &str) -> PathBuf {
     let relative = target.strip_prefix("./").unwrap_or(target);
     root.join(relative)
@@ -2397,103 +2378,11 @@ pub(crate) fn find_installed(start: &Path, name: &str) -> Option<PathBuf> {
     }
 }
 
-/// A file under `test/` that is not itself under the source directory.
-fn importer_in_test(package: &Package, file: &Path) -> bool {
-    path_under(&package.root.join("test"), file) && !path_under(&package.source, file)
-}
-
 fn path_under(dir: &Path, file: &Path) -> bool {
     if !dir.exists() {
         return false;
     }
     canonical(file).starts_with(&canonical(dir))
-}
-
-enum TestRole {
-    /// `( -- Verdict )` or `suite`. Not a module.
-    Entry,
-    /// A module only a test can import.
-    Utility,
-    /// The file did not parse. The runner still reports it as a test.
-    Broken,
-}
-
-fn test_role(file: &Path) -> std::io::Result<TestRole> {
-    let source = fs::read_to_string(file)?;
-    Ok(role_of_source(&source))
-}
-
-fn role_of_source(source: &str) -> TestRole {
-    match parse(source, ParseMode::Source) {
-        Err(_) => TestRole::Broken,
-        Ok(module) if is_test_entry(&module) => TestRole::Entry,
-        Ok(_) => TestRole::Utility,
-    }
-}
-
-/// A test entry is a word `( -- Verdict )` or a word named `suite`.
-fn is_test_entry(module: &Module) -> bool {
-    module.items.iter().any(|item| {
-        let Item::Def(def) = item else {
-            return false;
-        };
-        def.name == "suite" || (!def.vis.is_foreign() && bare_verdict(def))
-    })
-}
-
-/// `test/{module}.ply` when that file can be imported, or when it fails to parse.
-/// A test entry is not a module.
-fn classify_named_test(package: &Package, module_path: &str) -> Option<(PathBuf, TestRole)> {
-    if module_name_from_path(&format!("{module_path}.ply")).is_err() {
-        return None;
-    }
-    let file = package
-        .root
-        .join("test")
-        .join(module_path)
-        .with_extension("ply");
-    if !file.is_file() {
-        return None;
-    }
-    let role = test_role(&file).ok()?;
-    Some((file, role))
-}
-
-/// Parse failure counts as an entry so the runner shows the diagnostic.
-pub(crate) fn file_is_test_entry(path: &Path) -> Result<bool, BuildError> {
-    let source = fs::read_to_string(path).map_err(|error| os_error(path, error))?;
-    Ok(!matches!(role_of_source(&source), TestRole::Utility))
-}
-
-/// A utility whose path is already a source module fails the test run.
-pub(crate) fn reject_shadowed_test_modules(root: &Path) -> Result<(), BuildError> {
-    let package = read_package(root)?;
-    let test_root = package.root.join("test");
-    if !test_root.is_dir() {
-        return Ok(());
-    }
-    let mut files = Vec::new();
-    walk_ply(&test_root, &package.out, &mut files).map_err(|error| os_error(&test_root, error))?;
-    files.sort();
-    for file in files {
-        let module_path = module_path_of(&test_root, &file);
-        if module_name_from_path(&format!("{module_path}.ply")).is_err() {
-            continue;
-        }
-        let source = fs::read_to_string(&file).map_err(|error| os_error(&file, error))?;
-        if !matches!(role_of_source(&source), TestRole::Utility) {
-            continue;
-        }
-        let src = package.source.join(&module_path).with_extension("ply");
-        if src.is_file() {
-            return Err(located(
-                &file,
-                &source,
-                Diagnostic::new(Span::new(0, 0), Error::TestModuleShadow(module_path)),
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn find_ply_root(start: &Path) -> Option<PathBuf> {
@@ -3046,6 +2935,145 @@ mod tests {
     }
 
     #[test]
+    fn build_drops_an_unused_import_and_skips_an_empty_module() {
+        let temp = Temp::new("unused-import");
+        temp.write(
+            "package.json",
+            "{\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1, \"entry\": \"Boot\" },\n  \"exports\": {\n    \"./Time\": { \"ply\": \"./dist/Time.d.ply\", \"import\": \"./dist/Time.js\" },\n    \"./App\": { \"ply\": \"./dist/App.d.ply\", \"import\": \"./dist/App.js\", \"default\": \"./dist/App.js\" }\n  }\n}\n",
+        );
+        temp.write(
+            "src/Host.ply",
+            "@ Box, answer, spare\n\n; Box = Box\n\n: answer ( -- Num )\n  1\n\n: spare ( -- Num )\n  1\n",
+        );
+        temp.write(
+            "src/App.ply",
+            "@ use\n~ \"Host\" answer, spare\n\n: step ( Num -- Num )\n  dup drop\n\n: use ( -- Num )\n  answer step\n\n? \"spare\" < 1 > [\n  spare\n]\n",
+        );
+        temp.write("src/Face.ply", "@ spare\n~ \"Host\" spare\n");
+        temp.write("src/Time.ply", "@ Time\n~ \"Host\" Box\n\n- Time Box\n");
+        temp.write(
+            "src/Class.ply",
+            "@ Mappable, map\n\n& Mappable f\n  map ( (f a) (a -- b) -- (f b) )\n",
+        );
+        temp.write(
+            "src/Checks.ply",
+            "@\n\n~ \"Host\" answer\n\n: helper ( -- Num )\n  answer\n\n; Note = Note\n\n? \"kept\" < 1 > [\n  helper\n]\n",
+        );
+        temp.write("src/Program.ply", "@\n\n: main ( -- Unit )\n  Unit\n");
+        temp.write("src/Place.ply", "@\n\n= cell Num\n  1\n");
+        temp.write("src/Boot.ply", "@\n\n: boot ( -- Num )\n  1\n");
+        temp.write("dist/Time.js", "stale\n");
+        temp.write("dist/Checks.js", "stale\n");
+        temp.write("dist/Class.js", "stale\n");
+        let original = fs::read_to_string(temp.0.join("package.json")).unwrap();
+        build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        assert_eq!(
+            fs::read_to_string(temp.0.join("package.json")).unwrap(),
+            original
+        );
+
+        let app = fs::read_to_string(temp.0.join("dist/App.js")).unwrap();
+        assert!(app.contains("import { answer }"), "{app}");
+        assert!(!app.contains("spare"), "{app}");
+        assert!(app.contains("function step"), "{app}");
+        assert!(app.contains("export function use"), "{app}");
+        assert!(!app.contains("ply_check_"), "{app}");
+        let face = fs::read_to_string(temp.0.join("dist/Face.js")).unwrap();
+        assert!(
+            face.contains("export { spare } from \"./Host.js\";"),
+            "{face}"
+        );
+        assert!(!face.contains("import {"), "{face}");
+        assert!(!temp.0.join("dist/Time.js").is_file());
+        let time = fs::read_to_string(temp.0.join("dist/Time.d.ply")).unwrap();
+        assert!(time.contains("Time"), "{time}");
+        assert!(time.contains("Box"), "{time}");
+        assert!(!temp.0.join("dist/Class.js").is_file());
+        assert!(temp.0.join("dist/Class.d.ply").is_file());
+        assert!(!temp.0.join("dist/Checks.js").is_file());
+        assert!(!temp.0.join("dist/Checks.d.ply").is_file());
+        let program = fs::read_to_string(temp.0.join("dist/Program.js")).unwrap();
+        assert!(program.contains("function main"), "{program}");
+        assert!(!temp.0.join("dist/Program.d.ply").is_file());
+        assert!(temp.0.join("dist/Place.js").is_file());
+        assert!(!temp.0.join("dist/Place.d.ply").is_file());
+        assert!(temp.0.join("dist/Boot.js").is_file());
+        assert!(!temp.0.join("dist/Boot.d.ply").is_file());
+        assert!(temp.0.join("dist/Host.js").is_file());
+
+        let report = crate::test_run::test_package(&temp.0, "**/*.ply")
+            .unwrap_or_else(|error| panic!("{}", error.render()));
+        assert!(!report.failed(), "{report:?}");
+        assert_eq!(report.files.len(), 2);
+        assert!(!temp.0.join("dist/Checks.js").is_file());
+        assert!(!temp.0.join("dist/Time.js").is_file());
+
+        let flags = BuildFlags {
+            exports: true,
+            export_check: true,
+            ..BuildFlags::default()
+        };
+        let drift =
+            build_with(&temp.0, &flags).unwrap_or_else(|error| panic!("{}", error.render()));
+        assert!(drift);
+        assert_eq!(
+            fs::read_to_string(temp.0.join("package.json")).unwrap(),
+            original
+        );
+        build_with(
+            &temp.0,
+            &BuildFlags {
+                exports: true,
+                export_all: true,
+                ..BuildFlags::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{}", error.render()));
+        let written = fs::read_to_string(temp.0.join("package.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let exports = value.get("exports").unwrap();
+        assert!(
+            exports.get("./Time").unwrap().get("import").is_none(),
+            "{written}"
+        );
+        assert_eq!(
+            exports["./Time"]["ply"].as_str(),
+            Some("./dist/Time.d.ply"),
+            "{written}"
+        );
+        assert_eq!(
+            exports["./App"]["import"].as_str(),
+            Some("./dist/App.js"),
+            "{written}"
+        );
+        assert_eq!(
+            exports["./App"]["default"].as_str(),
+            Some("./dist/App.js"),
+            "{written}"
+        );
+        assert!(
+            exports.get("./Class").unwrap().get("import").is_none(),
+            "{written}"
+        );
+        assert_eq!(
+            exports["./Host"]["import"].as_str(),
+            Some("./dist/Host.js"),
+            "{written}"
+        );
+        assert_eq!(
+            exports["./Face"]["import"].as_str(),
+            Some("./dist/Face.js"),
+            "{written}"
+        );
+        for name in ["./Checks", "./Program", "./Place", "./Boot", "."] {
+            assert!(exports.get(name).is_none(), "{name} in {written}");
+        }
+        let settled =
+            build_with(&temp.0, &flags).unwrap_or_else(|error| panic!("{}", error.render()));
+        assert!(!settled);
+    }
+
+    #[test]
     fn build_exports_rewrites_the_exports_field() {
         let temp = Temp::new("exports");
         let original = "{\n  \"name\": \"@algosail/b\",\n  \"description\": \"say \\\"hi\\\"\",\n  \"type\": \"module\",\n  \"ply\": { \"source\": \"src\", \"out\": \"dist\", \"language\": 1 },\n  \"exports\": {\n    \"./Old\": { \"ply\": \"./dist/Old.d.ply\", \"import\": \"./dist/Old.js\" }\n  }\n}\n";
@@ -3067,16 +3095,44 @@ mod tests {
         assert!(temp.0.join("dist/Data/Num.js").is_file());
 
         build_exports(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
-        let expected = "{\n  \"name\": \"@algosail/b\",\n  \"description\": \"say \\\"hi\\\"\",\n  \"type\": \"module\",\n  \"ply\": { \"source\": \"src\", \"out\": \"dist\", \"language\": 1 },\n  \"exports\": {\n    \"./App\": {\n      \"ply\": \"./dist/App.d.ply\",\n      \"import\": \"./dist/App.js\"\n    },\n    \"./Data/Num\": {\n      \"ply\": \"./dist/Data/Num.d.ply\",\n      \"import\": \"./dist/Data/Num.js\"\n    },\n    \"./Hidden\": {\n      \"ply\": \"./dist/Hidden.d.ply\",\n      \"import\": \"./dist/Hidden.js\"\n    }\n  }\n}\n";
+        let expected = "{\n  \"name\": \"@algosail/b\",\n  \"description\": \"say \\\"hi\\\"\",\n  \"type\": \"module\",\n  \"ply\": { \"source\": \"src\", \"out\": \"dist\", \"language\": 1 },\n  \"exports\": {}\n}\n";
         let written = fs::read_to_string(temp.0.join("package.json")).unwrap();
         assert_eq!(written, expected);
+        assert!(!written.contains("Hidden"), "{written}");
+        build_with(
+            &temp.0,
+            &BuildFlags {
+                exports: true,
+                export_modules: vec!["Data/Num".to_string()],
+                ..BuildFlags::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{}", error.render()));
+        let named = fs::read_to_string(temp.0.join("package.json")).unwrap();
+        assert!(named.contains("./Data/Num"), "{named}");
+        assert!(!named.contains("./Hidden"), "{named}");
+        assert!(!named.contains("./App"), "{named}");
+        build_with(
+            &temp.0,
+            &BuildFlags {
+                exports: true,
+                export_all: true,
+                ..BuildFlags::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{}", error.render()));
+        let all = fs::read_to_string(temp.0.join("package.json")).unwrap();
+        assert!(all.contains("./App"), "{all}");
+        assert!(all.contains("./Data/Num"), "{all}");
+        assert!(!all.contains("./Hidden"), "{all}");
         assert!(temp.0.join("dist/App.js").is_file());
         assert!(temp.0.join("dist/Data/Num.d.ply").is_file());
-        assert!(temp.0.join("dist/Hidden.js").is_file());
+        assert!(!temp.0.join("dist/Hidden.js").is_file());
+        assert!(!temp.0.join("dist/Hidden.d.ply").is_file());
         build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         assert_eq!(
             fs::read_to_string(temp.0.join("package.json")).unwrap(),
-            expected
+            all
         );
 
         let fresh = Temp::new("exports-fresh");
@@ -3089,6 +3145,19 @@ mod tests {
         build_exports(&fresh.0).unwrap_or_else(|error| panic!("{}", error.render()));
         assert_eq!(
             fs::read_to_string(fresh.0.join("package.json")).unwrap(),
+            bare
+        );
+        build_with(
+            &fresh.0,
+            &BuildFlags {
+                exports: true,
+                export_all: true,
+                ..BuildFlags::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{}", error.render()));
+        assert_eq!(
+            fs::read_to_string(fresh.0.join("package.json")).unwrap(),
             "{\n  \"name\": \"@algosail/shelf\",\n  \"ply\": { \"source\": \"src\", \"out\": \"out\", \"language\": 1 },\n  \"exports\": {\n    \"./Age\": {\n      \"ply\": \"./out/Age.d.ply\",\n      \"import\": \"./out/Age.js\"\n    }\n  }\n}\n"
         );
         assert!(fresh.0.join("out/Age.js").is_file());
@@ -3099,10 +3168,11 @@ mod tests {
             "{\n  \"ply\": { \"source\": \"src\", \"out\": \"dist\", \"language\": 1 }\n}\n",
         );
         fs::create_dir(empty.0.join("src")).unwrap();
+        let empty_text = fs::read_to_string(empty.0.join("package.json")).unwrap();
         build_exports(&empty.0).unwrap_or_else(|error| panic!("{}", error.render()));
         assert_eq!(
             fs::read_to_string(empty.0.join("package.json")).unwrap(),
-            "{\n  \"ply\": { \"source\": \"src\", \"out\": \"dist\", \"language\": 1 },\n  \"exports\": {}\n}\n"
+            empty_text
         );
 
         let broken = Temp::new("exports-broken");
@@ -3186,6 +3256,7 @@ mod tests {
         let written = fs::read_to_string(last.0.join("package.json")).unwrap();
         assert!(written.contains("./Old"), "{written}");
         assert!(!written.contains("./Older"), "{written}");
+        assert!(!written.contains("./App"), "{written}");
         let value: serde_json::Value = serde_json::from_str(&written).unwrap();
         let keys: Vec<_> = value
             .get("exports")
@@ -3194,7 +3265,7 @@ mod tests {
             .keys()
             .cloned()
             .collect();
-        assert_eq!(keys, vec!["./App".to_string()], "{written}");
+        assert!(keys.is_empty(), "{written}");
     }
 
     #[test]
@@ -3403,6 +3474,62 @@ mod tests {
             &temp.0,
             "import { use as aliased } from \"./dist/Alias.js\";\nimport { use as renamed } from \"./dist/Rename.js\";\nimport { busSend } from \"./dist/Again.js\";\nif (aliased(1n) !== 1n) throw new Error(String(aliased(1n)));\nif (renamed(2n) !== 2n) throw new Error(String(renamed(2n)));\nif (busSend(3n) !== 3n) throw new Error(String(busSend(3n)));\n",
         );
+    }
+
+    #[test]
+    fn a_reexported_constructor_stays_bound_for_a_private_word() {
+        let temp = Temp::new("ctor-bind");
+        temp.write(
+            "package.json",
+            &package_json(
+                r#"
+    "./Data/Part": { "ply": "./dist/Data/Part.d.ply", "import": "./dist/Data/Part.js" },
+    "./Part": { "ply": "./dist/Part.d.ply", "import": "./dist/Part.js" }
+"#,
+            ),
+        );
+        temp.write("src/Data/Part.ply", "@ Leaf\n\n; Leaf = Leaf\n");
+        temp.write(
+            "src/Part.ply",
+            "@ Leaf, read\n~ \"Data/Part\" Leaf\n\n: noted ( -- Leaf )\n  Leaf\n\n: read ( -- Leaf )\n  noted\n",
+        );
+        build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let js = fs::read_to_string(temp.0.join("dist/Part.js")).unwrap();
+        assert!(
+            js.contains("import { Leaf } from \"./Data/Part.js\";"),
+            "{js}"
+        );
+        assert!(!js.contains("export { Leaf } from"), "{js}");
+        node(
+            &temp.0,
+            "import { read } from \"./dist/Part.js\";\nif (read().tag !== \"Leaf\") throw new Error(String(read().tag));\n",
+        );
+    }
+
+    #[test]
+    fn a_private_instance_does_not_break_an_importer() {
+        let temp = Temp::new("private-instance");
+        temp.write(
+            "package.json",
+            &package_json(
+                r#"
+    "./Lib": { "ply": "./dist/Lib.d.ply", "import": "./dist/Lib.js" },
+    "./App": { "ply": "./dist/App.d.ply", "import": "./dist/App.js" }
+"#,
+            ),
+        );
+        temp.write(
+            "src/Lib.ply",
+            "@ answer\n\n& Hold a\n  hold ( a -- a )\n\n; Panel = Panel\n\n: held ( Panel -- Panel )\n  dup drop\n\n# Hold Panel\n  hold = held\n\n: answer ( -- Num )\n  1\n",
+        );
+        temp.write(
+            "src/App.ply",
+            "@ use\n~ \"Lib\" answer\n\n: use ( -- Num )\n  answer\n",
+        );
+        build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let iface = fs::read_to_string(temp.0.join("dist/Lib.d.ply")).unwrap();
+        assert!(!iface.contains("Panel"), "{iface}");
+        assert!(!iface.contains("held"), "{iface}");
     }
 
     #[test]
@@ -3763,7 +3890,9 @@ mod tests {
             "@\n~ \"Data/Eq\" Eq, eq\n\n; Box a = Mk a\n\n: eqBox ( a. (Box a) (Box a) -- Bool )\n  drop drop true\n\n# Eq (Box a)\n  eq = eqBox\n\n: use ( (Box Int) (Box Int) -- Bool )\n  eq\n",
         );
         build(&local.0).unwrap_or_else(|error| panic!("{}", error.render()));
-        let js = fs::read_to_string(local.0.join("dist/App.js")).unwrap();
+        assert!(!local.0.join("dist/App.js").is_file());
+        let js = super::javascript_file(&local.0.join("src/App.ply"))
+            .unwrap_or_else(|error| panic!("{}", error.render()));
         assert!(js.contains("eqBox("), "{js}");
 
         let both = Temp::new("two-classes-one-method");
@@ -3910,8 +4039,8 @@ mod tests {
         let tool = fs::read_to_string(temp.0.join("dist/Tool.js")).unwrap();
         assert!(tool.contains("export function main("), "{tool}");
         assert!(tool.contains("if (plyIsEntry) main();"), "{tool}");
-        let other = fs::read_to_string(temp.0.join("dist/Other.js")).unwrap();
-        assert!(!other.contains("import.meta.main"), "{other}");
+        assert!(!temp.0.join("dist/Other.js").is_file());
+        assert!(!temp.0.join("dist/Other.d.ply").is_file());
         assert!(!temp.0.join("dist/run.js").exists());
         assert!(!temp.0.join("dist/script.js").exists());
 
@@ -3983,8 +4112,8 @@ mod tests {
         temp.write("src/App.ply", "@\n\n: start ( -- Unit )\n  Unit\n");
         check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
-        let js = fs::read_to_string(temp.0.join("dist/App.js")).unwrap();
-        assert!(!js.contains("import.meta.main"), "{js}");
+        assert!(!temp.0.join("dist/App.js").is_file());
+        assert!(!temp.0.join("dist/App.d.ply").is_file());
 
         temp.write("src/App.ply", "@\n\n: main ( -- Num )\n  1\n");
         let error = check_package(&temp.0).unwrap_err();
@@ -4071,10 +4200,7 @@ mod tests {
         assert!(!door_iface.contains("~ public"), "{door_iface}");
         assert!(!door_iface.contains("# Eq"), "{door_iface}");
         let app = fs::read_to_string(temp.0.join("dist/App.js")).unwrap();
-        assert!(
-            app.contains("import { answer } from \"./Door.js\";"),
-            "{app}"
-        );
+        assert!(!app.contains("answer"), "{app}");
         assert!(app.contains("import { eqNum } from \"./Lib.js\";"), "{app}");
         assert!(app.contains("eq: eqNum"), "{app}");
         let wide = fs::read_to_string(temp.0.join("dist/UseAll.js")).unwrap();
@@ -4322,17 +4448,10 @@ mod tests {
                 .get(".")
                 .and_then(|item| item.get("ply"))
                 .and_then(|item| item.as_str()),
-            Some("./dist/App.d.ply"),
+            Some("./dist/Old.d.ply"),
             "{written}"
         );
-        assert_eq!(
-            exports
-                .get("./App")
-                .and_then(|item| item.get("ply"))
-                .and_then(|item| item.as_str()),
-            Some("./dist/App.d.ply"),
-            "{written}"
-        );
+        assert!(exports.get("./App").is_none(), "{written}");
         assert!(exports.get("./Old").is_none(), "{written}");
 
         let root = Temp::new("keep-dot");
@@ -4353,12 +4472,12 @@ mod tests {
             Some("./dist/Stream.d.ply"),
             "{written}"
         );
-        assert!(exports.get("./App").is_some(), "{written}");
+        assert!(exports.get("./App").is_none(), "{written}");
         assert!(exports.get("./Old").is_none(), "{written}");
     }
 
     #[test]
-    fn tests_import_helpers_and_source_cannot_use_a_dev_dependency() {
+    fn source_cannot_use_a_dev_dependency_and_a_check_runs_in_the_source_file() {
         let temp = Temp::new("helpers");
         temp.write(
             "package.json",
@@ -4376,23 +4495,19 @@ mod tests {
             "node_modules/@demo/onlydev/dist/Door.js",
             "export function answer() { return 1; }\n",
         );
-        temp.write("src/Lib.ply", "@ answer\n\n: answer ( -- Num )\n  1\n");
         temp.write(
-            "test/Support/Session.ply",
-            "@ twice\n~ \"Lib\" answer\n\n: twice ( -- Num )\n  answer\n",
+            "src/Lib.ply",
+            "\
+@ answer
+
+: answer ( -- Num )
+  1
+
+? \"kept\" < 1 > [
+  answer
+]
+",
         );
-        let pass = "\
-~ \"Support/Session\" twice
-~ \"@demo/onlydev\" answer
-
-; Verdict = Verdict ok : Bool, name : Str, text : Str
-
-: yes ( -- Verdict )
-  twice drop
-  answer drop
-  true \"\" \"\" Verdict
-";
-        temp.write("test/Pass.ply", pass);
         temp.write(
             "src/Bad.ply",
             "@ use\n~ \"@demo/onlydev\" answer\n\n: use ( -- Num )\n  answer\n",
@@ -4401,81 +4516,19 @@ mod tests {
         assert_eq!(error.code, "PL0121", "{}", error.message);
         assert_eq!(error.message, "~ \"@demo/onlydev\" is a devDependency");
         fs::remove_file(temp.0.join("src/Bad.ply")).unwrap();
-        temp.write(
-            "src/Bad.ply",
-            "@ use\n~ \"Support/Session\" twice\n\n: use ( -- Num )\n  twice\n",
-        );
-        let error = build(&temp.0).unwrap_err();
-        assert_eq!(error.message, "cannot resolve ~ \"Support/Session\"");
-        fs::remove_file(temp.0.join("src/Bad.ply")).unwrap();
 
-        check_buffer(&temp.0.join("test/Pass.ply"), pass)
-            .unwrap_or_else(|error| panic!("{}", error.render("test/Pass.ply", pass)));
         let blocked = "~ \"Support/Session\" twice\n\n: use ( -- Num )\n  twice\n";
         let error = check_buffer(&temp.0.join("src/Lib.ply"), blocked).unwrap_err();
         assert_eq!(error.message, "cannot resolve ~ \"Support/Session\"");
 
-        let report = crate::test_run::test_package(&temp.0, "test/**/*.ply")
+        let report = crate::test_run::test_package(&temp.0, "**/*.ply")
             .unwrap_or_else(|error| panic!("{}", error.render()));
         assert!(!report.failed(), "{report:?}");
         assert_eq!(report.files.len(), 1);
-
-        let shadow = Temp::new("shadow");
-        shadow.write(
-            "package.json",
-            "{\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1 }\n}\n",
-        );
-        shadow.write(
-            "src/Data/State.ply",
-            "@ current\n\n: current ( -- Num )\n  1\n",
-        );
-        shadow.write(
-            "test/Data/State.ply",
-            "@ helper\n\n: helper ( -- Num )\n  2\n",
-        );
-        shadow.write(
-            "test/Pass.ply",
-            "\
-; Verdict = Verdict ok : Bool, name : Str, text : Str
-
-: yes ( -- Verdict )
-  true \"\" \"\" Verdict
-",
-        );
-        let error = crate::test_run::test_package(&shadow.0, "test/**/*.ply").unwrap_err();
-        assert_eq!(error.code, "PL0122", "{}", error.render());
-        assert_eq!(
-            error.message,
-            "test module Data/State is already a source module"
-        );
-
-        let entry = Temp::new("test-entry");
-        entry.write(
-            "package.json",
-            "{\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1 }\n}\n",
-        );
-        entry.write(
-            "src/Data/State.ply",
-            "@ current\n\n: current ( -- Num )\n  1\n",
-        );
-        entry.write(
-            "test/Data/State.ply",
-            "\
-~ \"Data/State\" current
-
-; Verdict = Verdict ok : Bool, name : Str, text : Str
-
-: reads ( -- Verdict )
-  current drop
-  true \"\" \"\" Verdict
-",
-        );
-        let report = crate::test_run::test_package(&entry.0, "test/**/*.ply")
-            .unwrap_or_else(|error| panic!("{}", error.render()));
-        assert!(!report.failed(), "{report:?}");
-        assert_eq!(report.files.len(), 1);
-        assert_eq!(report.files[0].checks[0].name, "reads");
+        assert_eq!(report.files[0].checks[0].name, "kept");
         assert!(report.files[0].checks[0].ok);
+        let js = fs::read_to_string(temp.0.join("dist/Lib.js")).unwrap();
+        assert!(!js.contains("ply_check_"), "{js}");
     }
 
     #[test]
@@ -4932,10 +4985,12 @@ mod tests {
                 out: Some("built".to_string()),
                 foreign: Some("host".to_string()),
                 exports: true,
+                ..BuildFlags::default()
             },
         )
         .unwrap_or_else(|error| panic!("{}", error.render()));
         let written = fs::read_to_string(temp.0.join("package.json")).unwrap();
+        assert_eq!(written, original);
         let value: serde_json::Value = serde_json::from_str(&written).unwrap();
         assert_eq!(
             value
@@ -4966,15 +5021,185 @@ mod tests {
             exports.get("./keep").and_then(|item| item.as_str()),
             Some("./keep.js")
         );
+        assert!(exports.get(".").is_none(), "{written}");
+        assert!(exports.get("./App").is_none(), "{written}");
+        assert!(exports.get("./Data/Num").is_none(), "{written}");
+        assert!(temp.0.join("built/Data/Num.js").is_file());
+    }
+
+    #[test]
+    fn exports_check_leaves_the_file_until_the_map_is_settled() {
+        let temp = Temp::new("exports-check");
+        let original = "{\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1, \"out\": \"dist\" },\n  \"exports\": {\n    \"./Css\": {\n      \"ply\": \"./dist/Css.d.ply\",\n      \"import\": \"./dist/Old.js\",\n      \"default\": \"./dist/Css.js\"\n    },\n    \"./Old\": {\n      \"ply\": \"./dist/Old.d.ply\",\n      \"import\": \"./dist/Old.js\"\n    },\n    \"./KitLive\": {\n      \"import\": \"./foreign/Data/KitLive.js\"\n    }\n  }\n}\n";
+        temp.write("package.json", original);
+        temp.write(
+            "src/Css.ply",
+            "@ color\n\n: color ( Num -- Num )\n  dup drop\n",
+        );
+        temp.write("src/Hidden.ply", "@\n\n: step ( Num -- Num )\n  dup drop\n");
+        let flags = BuildFlags {
+            exports: true,
+            export_check: true,
+            ..BuildFlags::default()
+        };
+        let drift =
+            build_with(&temp.0, &flags).unwrap_or_else(|error| panic!("{}", error.render()));
+        assert!(drift);
         assert_eq!(
-            exports
-                .get(".")
-                .and_then(|item| item.get("ply"))
-                .and_then(|item| item.as_str()),
-            Some("./built/Data/Num.d.ply"),
+            fs::read_to_string(temp.0.join("package.json")).unwrap(),
+            original
+        );
+        assert!(temp.0.join("dist/Css.js").is_file());
+        assert!(!temp.0.join("dist/Hidden.js").is_file());
+        assert!(!temp.0.join("dist/Hidden.d.ply").is_file());
+
+        build_exports(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let expected = "{\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1, \"out\": \"dist\" },\n  \"exports\": {\n    \"./Css\": {\n      \"ply\": \"./dist/Css.d.ply\",\n      \"import\": \"./dist/Css.js\",\n      \"default\": \"./dist/Css.js\"\n    },\n    \"./KitLive\": {\n      \"import\": \"./foreign/Data/KitLive.js\"\n    }\n  }\n}\n";
+        assert_eq!(
+            fs::read_to_string(temp.0.join("package.json")).unwrap(),
+            expected
+        );
+        let settled =
+            build_with(&temp.0, &flags).unwrap_or_else(|error| panic!("{}", error.render()));
+        assert!(!settled);
+        assert_eq!(
+            fs::read_to_string(temp.0.join("package.json")).unwrap(),
+            expected
+        );
+        let added = build_with(
+            &temp.0,
+            &BuildFlags {
+                exports: true,
+                export_all: true,
+                export_check: true,
+                ..BuildFlags::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{}", error.render()));
+        assert!(!added);
+        assert_eq!(
+            fs::read_to_string(temp.0.join("package.json")).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn exports_paths_come_from_disk_out() {
+        let temp = Temp::new("exports-disk-out");
+        temp.write(
+            "package.json",
+            "{\n  \"ply\": { \"language\": 1, \"out\": \"out\" },\n  \"exports\": {\n    \"./App\": { \"ply\": \"./dist/App.d.ply\", \"import\": \"./dist/App.js\" }\n  }\n}\n",
+        );
+        temp.write("src/App.ply", "@ id\n\n: id ( Num -- Num )\n  dup drop\n");
+        build_with(
+            &temp.0,
+            &BuildFlags {
+                out: Some("built".to_string()),
+                exports: true,
+                ..BuildFlags::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{}", error.render()));
+        let written = fs::read_to_string(temp.0.join("package.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(
+            value["exports"]["./App"]["ply"].as_str(),
+            Some("./out/App.d.ply"),
             "{written}"
         );
-        assert!(temp.0.join("built/Data/Num.js").is_file());
+        assert_eq!(
+            value["exports"]["./App"]["import"].as_str(),
+            Some("./out/App.js"),
+            "{written}"
+        );
+        assert_eq!(value["ply"]["out"].as_str(), Some("out"), "{written}");
+        assert!(temp.0.join("built/App.js").is_file());
+        assert!(!temp.0.join("out").exists());
+    }
+
+    #[test]
+    fn exports_root_follows_a_listed_entry() {
+        let listed = Temp::new("exports-dot");
+        listed.write(
+            "package.json",
+            "{\n  \"type\": \"module\",\n  \"ply\": { \"language\": 1, \"entry\": \"App\" },\n  \"exports\": {\n    \"./App\": { \"ply\": \"./dist/App.d.ply\", \"import\": \"./dist/App.js\" },\n    \".\": { \"ply\": \"./dist/Old.d.ply\", \"import\": \"./dist/Old.js\" }\n  }\n}\n",
+        );
+        listed.write("src/App.ply", "@ id\n\n: id ( Num -- Num )\n  dup drop\n");
+        build_exports(&listed.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let written = fs::read_to_string(listed.0.join("package.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(
+            value["exports"]["."]["ply"].as_str(),
+            Some("./dist/App.d.ply"),
+            "{written}"
+        );
+        assert_eq!(
+            value["exports"]["."]["import"].as_str(),
+            Some("./dist/App.js"),
+            "{written}"
+        );
+        assert_eq!(
+            value["exports"]["./App"]["ply"].as_str(),
+            Some("./dist/App.d.ply"),
+            "{written}"
+        );
+        assert_eq!(value["ply"]["entry"].as_str(), Some("App"), "{written}");
+
+        let added = Temp::new("exports-dot-add");
+        added.write(
+            "package.json",
+            "{\n  \"ply\": { \"language\": 1, \"entry\": \"App\" },\n  \"exports\": {\n    \"./keep\": \"./keep.js\"\n  }\n}\n",
+        );
+        added.write("src/App.ply", "@ id\n\n: id ( Num -- Num )\n  dup drop\n");
+        build_with(
+            &added.0,
+            &BuildFlags {
+                exports: true,
+                export_modules: vec!["./App".to_string()],
+                ..BuildFlags::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{}", error.render()));
+        let written = fs::read_to_string(added.0.join("package.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(
+            value["exports"]["./keep"].as_str(),
+            Some("./keep.js"),
+            "{written}"
+        );
+        assert_eq!(
+            value["exports"]["./App"]["import"].as_str(),
+            Some("./dist/App.js"),
+            "{written}"
+        );
+        assert_eq!(
+            value["exports"]["."]["ply"].as_str(),
+            Some("./dist/App.d.ply"),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn exports_reject_a_missing_module_before_writing() {
+        let temp = Temp::new("exports-missing");
+        let original = "{\n  \"ply\": { \"language\": 1 }\n}\n";
+        temp.write("package.json", original);
+        temp.write("src/App.ply", "@ id\n\n: id ( Num -- Num )\n  dup drop\n");
+        let error = build_with(
+            &temp.0,
+            &BuildFlags {
+                exports: true,
+                export_modules: vec!["Missing".to_string()],
+                ..BuildFlags::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.message, "module Missing is not a source file");
+        assert_eq!(
+            fs::read_to_string(temp.0.join("package.json")).unwrap(),
+            original
+        );
+        assert!(!temp.0.join("dist").exists());
     }
 
     #[test]
@@ -5268,8 +5493,18 @@ if (base() !== 10) throw new Error(\"facade leaked\");
         let app_after = fs::read_to_string(temp.0.join("dist/App.js")).unwrap();
         let lib_after = fs::read_to_string(temp.0.join("dist/Lib.js")).unwrap();
         assert!(lib_after.contains("extra"), "{lib_after}");
-        assert!(app_after.contains("extra"), "{app_after}");
-        assert_ne!(app_before, app_after);
+        assert!(!app_after.contains("extra"), "{app_after}");
+        assert_eq!(app_before, app_after);
+        temp.write("src/Lib.ply", "@ extra\n\n: extra ( -- Num )\n  3\n");
+        let error = session
+            .refresh_path(&temp.0.join("src/Lib.ply"))
+            .unwrap_err();
+        assert_eq!(error.code, "PL0054", "{}", error.render());
+        assert!(error.message.contains("Lib:answer"), "{}", error.render());
+        assert_eq!(
+            fs::read_to_string(temp.0.join("dist/App.js")).unwrap(),
+            app_before
+        );
     }
 
     #[test]

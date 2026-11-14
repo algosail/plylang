@@ -97,7 +97,7 @@ impl Parser {
 
     /// Imports, one `@` list, and declarations, in any order. The list may
     /// stand anywhere. A second `@` is a duplicate definition. Imports stay
-    /// before the first `:`, `;`, `-`, `&`, `#`, or `=`. A bare `@` publishes
+    /// before the first `:`, `;`, `-`, `&`, `#`, `?`, or `=`. A bare `@` publishes
     /// nothing. Commas separate names. A newline does not, so the list ends
     /// at the next column-0 declaration.
     fn parse_contents(&mut self) -> Result<(Exports, Vec<Import>, Vec<Item>), Diagnostic> {
@@ -142,6 +142,7 @@ impl Parser {
                 Item::Place(place) => place.doc = doc,
                 Item::Class(class) => class.doc = doc,
                 Item::Instance(_) => {}
+                Item::Probe(probe) => probe.doc = doc,
             }
             items.push(item);
         }
@@ -187,6 +188,7 @@ impl Parser {
             || self.is(TokenKind::Colon)
             || self.is(TokenKind::Export)
             || self.is(TokenKind::Language)
+            || self.is(TokenKind::Probe)
             || (self.is(TokenKind::Eq) && self.at_column_0())
     }
 
@@ -279,6 +281,7 @@ impl Parser {
             || self.is(TokenKind::Instance)
             || self.is(TokenKind::Export)
             || self.is(TokenKind::Language)
+            || self.is(TokenKind::Probe)
             || (self.is(TokenKind::Colon) && self.at_column_0())
             || (self.is(TokenKind::Eq) && self.at_column_0())
     }
@@ -367,7 +370,58 @@ impl Parser {
         if self.is(TokenKind::Eq) {
             return self.parse_place().map(Item::Place);
         }
+        if self.is(TokenKind::Probe) {
+            return self.parse_probe().map(Item::Probe);
+        }
         Err(self.error(Error::ExpectedDeclaration))
+    }
+
+    /// `? "name" < picture > [ program ]` at column 0.
+    /// The name is a string literal. Both programs start from an empty stack.
+    fn parse_probe(&mut self) -> Result<Probe, Diagnostic> {
+        let start = self.cur().span;
+        self.bump();
+        let name_span = self.cur().span;
+        let TokenKind::String(name) = self.cur().kind.clone() else {
+            return Err(self.error(Error::ExpectedProbeName));
+        };
+        self.bump();
+        self.skip_newlines();
+        if !self.eat(&TokenKind::LAngle) {
+            return Err(self.error(Error::ExpectedProbePicture));
+        }
+        self.group_depth += 1;
+        let mut picture = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.eat(&TokenKind::RAngle) {
+                break;
+            }
+            if self.is_eof() {
+                return Err(self.error_at(start, Error::UnterminatedArray));
+            }
+            if !self.starts_term() {
+                return Err(self.error(Error::ExpectedTerm));
+            }
+            picture.push(self.parse_term()?);
+        }
+        self.group_depth -= 1;
+        self.skip_newlines();
+        if !self.is(TokenKind::LBrack) {
+            return Err(self.error(Error::ExpectedProbeProgram));
+        }
+        let term = self.parse_term()?;
+        let TermNode::Quote(body) = term.node else {
+            return Err(self.error_at(term.span, Error::ExpectedProbeProgram));
+        };
+        Ok(Probe {
+            span: start.merge(self.last_span),
+            name_span,
+            name,
+            picture,
+            body,
+            doc: String::new(),
+        })
     }
 
     fn parse_data(&mut self) -> Result<Data, Diagnostic> {
@@ -748,6 +802,7 @@ impl Parser {
                 | TokenKind::Colon
                 | TokenKind::Export
                 | TokenKind::Eq
+                | TokenKind::Probe
         ) {
             return true;
         }
@@ -1085,6 +1140,16 @@ impl Parser {
             if self.stops_method_list() {
                 break;
             }
+            let checkpoint = self.pos;
+            let doc = self.take_indented_doc();
+            self.skip_newlines();
+            if !doc.is_empty() && !self.starts_method() {
+                self.pos = checkpoint;
+                break;
+            }
+            if self.stops_method_list() {
+                break;
+            }
             let name_span = self.cur().span;
             let method = self.expect_ident(Error::ExpectedMethodName)?;
             self.expect(&TokenKind::LParen, Error::ExpectedLParen)?;
@@ -1096,6 +1161,7 @@ impl Parser {
                 name: method,
                 name_span,
                 scheme,
+                doc,
             });
         }
         Ok(Class {
@@ -1842,9 +1908,51 @@ impl Parser {
         self.item_start_at(self.pos)
     }
 
-    /// A column-0 `..` documents the next declaration, so it is not a method name.
+    /// A column-0 `..` documents the next declaration, so it ends the method list.
+    /// An indented `..` is the next method's text.
     fn stops_method_list(&self) -> bool {
-        self.is_eof() || self.is_item_start() || self.is(TokenKind::Doc(String::new()))
+        self.is_eof() || self.is_item_start() || self.is_column_0_doc()
+    }
+
+    fn is_column_0_doc(&self) -> bool {
+        self.is(TokenKind::Doc(String::new())) && self.at_column_0()
+    }
+
+    fn starts_method(&self) -> bool {
+        matches!(self.cur().kind, TokenKind::Ident(_))
+    }
+
+    /// Indented `..` lines directly above a method. A column-0 `..` stays for
+    /// the next declaration. A blank line throws the block away.
+    fn take_indented_doc(&mut self) -> String {
+        let mut lines = Vec::new();
+        while self.is(TokenKind::Doc(String::new())) && !self.at_column_0() {
+            let TokenKind::Doc(text) = self.bump() else {
+                break;
+            };
+            lines.push(text);
+            let mut breaks = 0;
+            while self.is(TokenKind::Newline) {
+                breaks += 1;
+                self.bump();
+            }
+            let next_indented = self.is(TokenKind::Doc(String::new())) && !self.at_column_0();
+            if next_indented {
+                if breaks >= 2 {
+                    lines.clear();
+                }
+                continue;
+            }
+            if breaks >= 2 {
+                return String::new();
+            }
+            break;
+        }
+        if lines.iter().all(|line| line.is_empty()) {
+            String::new()
+        } else {
+            lines.join("\n")
+        }
     }
 
     fn skip_newlines(&mut self) {
@@ -1976,7 +2084,7 @@ fn check_duplicates(module: &Module) -> Result<(), Diagnostic> {
             Item::Def(def) => claim(&mut words, &def.name, def.name_span)?,
             Item::Place(place) => claim(&mut words, &place.name, place.name_span)?,
             Item::Class(class) => claim(&mut classes, &class.name, class.name_span)?,
-            Item::Instance(_) => {}
+            Item::Instance(_) | Item::Probe(_) => {}
         }
     }
     Ok(())
@@ -2202,7 +2310,7 @@ mod tests {
     #[test]
     fn a_doc_comment_sticks_to_the_next_declaration() {
         let text =
-            ok(".. Copy the top.\n..\n.. Again.\n: double ( Int -- Int )\n  .. note\n  dup\n");
+            ok(".. Copy the top.\n..\n.. Again.\n: double ( Int -- Int )\n  . note\n  dup\n");
         assert!(
             text.starts_with(".. Copy the top.\n..\n.. Again.\n: double"),
             "{text}"
@@ -2244,6 +2352,72 @@ mod tests {
         let lost = ok(".. lost\n# Eq Int\n  eq = eqInt\n");
         assert!(!lost.contains("lost"), "{lost}");
         assert!(lost.starts_with("# Eq Int"), "{lost}");
+    }
+
+    #[test]
+    fn an_indented_doc_belongs_to_the_method() {
+        let source = ".. Equality.\n& Eq a\n  .. Two values are the same.\n  ..\n  .. The top two.\n  eq ( a a -- Bool )\n  differ ( a a -- Bool )\n.. Next.\n: id ( Int -- Int )\n  dup\n";
+        let module = parse(source, ParseMode::Source)
+            .unwrap_or_else(|error| panic!("{}", render(source, &error)));
+        let class = module
+            .items
+            .iter()
+            .find_map(|item| match item {
+                crate::ast::Item::Class(class) => Some(class),
+                _ => None,
+            })
+            .expect("class");
+        assert_eq!(class.doc, "Equality.");
+        assert_eq!(
+            class.methods[0].doc,
+            "Two values are the same.\n\nThe top two."
+        );
+        assert_eq!(class.methods[1].doc, "");
+        let word = module
+            .items
+            .iter()
+            .find_map(|item| match item {
+                crate::ast::Item::Def(def) => Some(def),
+                _ => None,
+            })
+            .expect("word");
+        assert_eq!(word.doc, "Next.");
+        let printed = module.to_string();
+        assert!(
+            printed.contains(
+                "  .. Two values are the same.\n  ..\n  .. The top two.\n  eq ( a a -- Bool )"
+            ),
+            "{printed}"
+        );
+        let again = parse(&printed, ParseMode::Source)
+            .unwrap_or_else(|error| panic!("{}", render(&printed, &error)));
+        let again_class = again
+            .items
+            .iter()
+            .find_map(|item| match item {
+                crate::ast::Item::Class(class) => Some(class),
+                _ => None,
+            })
+            .expect("class");
+        assert_eq!(again_class.methods[0].doc, class.methods[0].doc);
+        assert_eq!(again_class.methods[1].doc, "");
+        let iface = format!("language 1\n{class}");
+        let interface = parse(&iface, ParseMode::Interface)
+            .unwrap_or_else(|error| panic!("{}", error.render("Eq.d.ply", &iface)));
+        let iface_class = interface
+            .items
+            .iter()
+            .find_map(|item| match item {
+                crate::ast::Item::Class(class) => Some(class),
+                _ => None,
+            })
+            .expect("class");
+        assert_eq!(iface_class.doc, "Equality.");
+        assert_eq!(iface_class.methods[0].doc, class.methods[0].doc);
+        assert_eq!(iface_class.methods[1].doc, "");
+        let moved = ok("& Eq a\n  .. For the word.\n: id ( Int -- Int )\n  dup\n");
+        assert!(moved.contains(".. For the word.\n: id"), "{moved}");
+        assert!(!moved.contains("& Eq a\n  .. For the word."), "{moved}");
     }
 
     #[test]

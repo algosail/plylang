@@ -201,15 +201,113 @@ impl Checker {
                 _ => None,
             })
             .collect();
+        let checks = if self.check_probes {
+            self.lower_checks(module)?
+        } else {
+            Vec::new()
+        };
         let mut anf = AnfModule {
             datas,
             defs,
             places,
+            checks,
             needs_unit: false,
             method_homes: std::mem::take(&mut self.method_homes),
         };
         anf.needs_unit = module_uses_unit(&anf);
         Ok(anf)
+    }
+
+    /// Picture and program, each a function of no arguments. Source order.
+    fn lower_checks(&mut self, module: &Module) -> Result<Vec<crate::anf::AnfCheck>, Diagnostic> {
+        let mut checks = Vec::new();
+        let probes: Vec<crate::ast::Probe> = module
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Probe(probe) => Some(probe.clone()),
+                _ => None,
+            })
+            .collect();
+        for (index, probe) in probes.iter().enumerate() {
+            let want = self.lower_check_def(&format!("ply_want_{index}"), &probe.picture)?;
+            let body = self.lower_check_def(&format!("ply_check_{index}"), &probe.body)?;
+            if want.body.result.len() != body.body.result.len() {
+                return Err(self.error(
+                    probe.name_span,
+                    Error::TypeMismatch {
+                        expected: format!("{} values", want.body.result.len()),
+                        found: format!("{} values", body.body.result.len()),
+                    },
+                ));
+            }
+            checks.push(crate::anf::AnfCheck { want, body });
+        }
+        Ok(checks)
+    }
+
+    fn lower_check_def(
+        &mut self,
+        name: &str,
+        terms: &[crate::ast::Term],
+    ) -> Result<AnfDef, Diagnostic> {
+        self.use_dicts.clear();
+        self.deferred.clear();
+        let first = self.lower_check_pass(name, terms)?;
+        if self.use_dicts.is_empty() {
+            return Ok(first);
+        }
+        let second = self.lower_check_pass(name, terms)?;
+        self.use_dicts.clear();
+        Ok(second)
+    }
+
+    fn lower_check_pass(
+        &mut self,
+        name: &str,
+        terms: &[crate::ast::Term],
+    ) -> Result<AnfDef, Diagnostic> {
+        self.assumption_locals.clear();
+        self.assumptions.clear();
+        let saved = self.ambient.take();
+        self.deferred.clear();
+        let mut frame = Frame {
+            stack: Vec::new(),
+            params: Vec::new(),
+            flexible: false,
+            lets: Vec::new(),
+            env: vec![HashMap::new()],
+        };
+        self.locals.push(HashMap::new());
+        let input = self.stack_empty();
+        let lowered = self.lower_terms(terms, input, &mut frame);
+        self.locals.pop();
+        let end = match lowered {
+            Ok(end) => end,
+            Err(error) => {
+                self.deferred.clear();
+                self.ambient = saved;
+                self.assumptions.clear();
+                self.assumption_locals.clear();
+                return Err(error);
+            }
+        };
+        let _ = end;
+        let finished = self.finish_deferred();
+        self.ambient = saved;
+        self.assumptions.clear();
+        self.assumption_locals.clear();
+        finished?;
+        let result = drain_results(self, &mut frame)?;
+        Ok(AnfDef {
+            name: name.to_string(),
+            export: true,
+            params: Vec::new(),
+            body: Expr {
+                lets: frame.lets,
+                result,
+            },
+        })
     }
 
     fn lower_def(
@@ -2216,6 +2314,10 @@ fn module_uses_unit(module: &AnfModule) -> bool {
             .places
             .iter()
             .any(|place| expr_uses_unit(&place.init.body))
+        || module
+            .checks
+            .iter()
+            .any(|check| expr_uses_unit(&check.want.body) || expr_uses_unit(&check.body.body))
 }
 
 fn expr_uses_unit(expr: &Expr) -> bool {

@@ -76,6 +76,7 @@ fn module_anchor(module: &Module) -> Span {
             Item::Place(place) => return place.name_span,
             Item::Class(class) => return class.name_span,
             Item::Instance(instance) => return instance.span,
+            Item::Probe(probe) => return probe.span,
         }
     }
     Span::new(0, 0)

@@ -6,8 +6,8 @@
 use std::path::Path;
 
 use crate::ast::{
-    method_line, scheme_string, type_string, Ctor, Data, Def, Item, Module, Place, Scheme, Stack,
-    StackEffect, StackTail, Synonym, Type,
+    method_doc, method_line, scheme_string, type_string, Ctor, Data, Def, Item, Module, Place,
+    Scheme, Stack, StackEffect, StackTail, Synonym, Type,
 };
 use crate::build::{load_surface, stack_sites};
 use crate::builtin;
@@ -344,7 +344,7 @@ fn declared_found(found: &Found, name: &str) -> Option<Declared> {
                 .find(|method| method.name == name)
                 .map(|method| Declared {
                     line: method_line(class, method),
-                    doc: class.doc.clone(),
+                    doc: method_doc(class, method).to_string(),
                 })
         }
         Found::Def(_) | Found::Synonym(_) | Found::Place(_) => None,
@@ -423,7 +423,7 @@ fn class_scheme(module: &Module, name: &str) -> Option<Declared> {
             if let Some(method) = class.methods.iter().find(|method| method.name == name) {
                 return Some(Declared {
                     line: method_line(class, method),
-                    doc: class.doc.clone(),
+                    doc: method_doc(class, method).to_string(),
                 });
             }
         }
@@ -538,6 +538,32 @@ mod tests {
         assert_eq!(
             used.contents,
             "```ply\neq ( Eq a => a a -- Bool )\n```\n\nEquality.\n\n```ply\nInt Int -- Bool\n```"
+        );
+    }
+
+    #[test]
+    fn hovers_a_method_doc_instead_of_the_class_text() {
+        let source = ".. Equality.\n& Eq a\n  .. Two values are the same.\n  ..\n  .. The top two.\n  eq ( a a -- Bool )\n  differ ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  drop drop true\n\n: differInt ( Int Int -- Bool )\n  drop drop false\n\n# Eq Int\n  eq = eqInt\n  differ = differInt\n\n: use ( Int Int -- Bool )\n  eq\n";
+        let eq_at = at(source, "eq (");
+        let eq = hover(source, Path::new("M.ply"), eq_at.0, eq_at.1).unwrap();
+        assert_eq!(
+            eq.contents,
+            "```ply\neq ( Eq a => a a -- Bool )\n```\n\nTwo values are the same.\n\nThe top two."
+        );
+        let differ_at = at(source, "differ");
+        let differ = hover(source, Path::new("M.ply"), differ_at.0, differ_at.1).unwrap();
+        assert_eq!(
+            differ.contents,
+            "```ply\ndiffer ( Eq a => a a -- Bool )\n```\n\nEquality."
+        );
+        let class_at = at(source, "Eq a");
+        let class = hover(source, Path::new("M.ply"), class_at.0, class_at.1).unwrap();
+        assert_eq!(class.contents, "```ply\n& Eq a\n```\n\nEquality.");
+        let use_at = at_offset(source, source.rfind("\n  eq").unwrap() + 3);
+        let used = hover(source, Path::new("M.ply"), use_at.0, use_at.1).unwrap();
+        assert_eq!(
+            used.contents,
+            "```ply\neq ( Eq a => a a -- Bool )\n```\n\nTwo values are the same.\n\nThe top two.\n\n```ply\nInt Int -- Bool\n```"
         );
     }
 
