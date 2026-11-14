@@ -1,15 +1,17 @@
-// Assemble `@plylang/plylang-<os>-<arch>` from a Cargo release directory.
-// The launcher looks for `bin/plylang` and `bin/plylang-ls` inside that package.
+// Assemble one platform package from a Cargo release directory.
+// `plylang` becomes `@plylang/plylang-<os>-<arch>` with `bin/plylang`.
+// `plylang-ls` becomes `@plylang/language-server-<os>-<arch>` with `bin/plylang-ls`.
 
 import { chmodSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { platformId } from "../bin/native.js";
+import { platformId, platformPackage } from "../bin/native.js";
 
 const root = join(import.meta.dirname, "..");
 
-export function stageNative(platform, binaryDir, outDir, version) {
+export function stageNative(platform, binaryDir, outDir, version, command) {
+  const pkgName = platformPackage(command, platform);
   const dash = platform.indexOf("-");
   const os = platform.slice(0, dash);
   const cpu = platform.slice(dash + 1);
@@ -18,23 +20,21 @@ export function stageNative(platform, binaryDir, outDir, version) {
   }
   const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
   const suffix = os === "win32" ? ".exe" : "";
+  const name = `${command}${suffix}`;
+  const dest = join(outDir, "bin", name);
   mkdirSync(join(outDir, "bin"), { recursive: true });
-  for (const command of ["plylang", "plylang-ls"]) {
-    const name = `${command}${suffix}`;
-    const dest = join(outDir, "bin", name);
-    copyFileSync(join(binaryDir, name), dest);
-    if (suffix === "") {
-      chmodSync(dest, 0o755);
-    }
+  copyFileSync(join(binaryDir, name), dest);
+  if (suffix === "") {
+    chmodSync(dest, 0o755);
   }
   copyFileSync(join(root, "LICENSE"), join(outDir, "LICENSE"));
   writeFileSync(
     join(outDir, "package.json"),
     JSON.stringify(
       {
-        name: `@plylang/plylang-${platform}`,
+        name: pkgName,
         version,
-        description: `plylang binaries for ${platform}`,
+        description: `${command} binary for ${platform}`,
         license: "MIT",
         repository: pkg.repository,
         publishConfig: { access: "public" },
@@ -51,11 +51,13 @@ export function stageNative(platform, binaryDir, outDir, version) {
 
 const invoked = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (invoked) {
-  const [platform, binaryDir, outDir] = process.argv.slice(2);
-  if (!platform || !binaryDir || !outDir) {
-    console.error("usage: node script/stage-native.js <platform> <binary-dir> <out-dir>");
+  const [platform, binaryDir, outDir, command] = process.argv.slice(2);
+  if (!platform || !binaryDir || !outDir || !command) {
+    console.error(
+      "usage: node script/stage-native.js <platform> <binary-dir> <out-dir> <plylang|plylang-ls>",
+    );
     process.exit(2);
   }
   const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-  stageNative(platform, binaryDir, outDir, pkg.version);
+  stageNative(platform, binaryDir, outDir, pkg.version, command);
 }

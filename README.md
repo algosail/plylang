@@ -6,7 +6,7 @@ The compiler translates a module into JavaScript. There is no separate virtual m
 
 This text walks through the language once, with a short example of each feature.
 
-The repository contains the `plylang` compiler and the `plylang-ls` server. Words that work on ready-made values are not built into the compiler: they are imported. The neighboring package `@plylang/prelude` is one such place, and it has its own documentation. The import lines below name that package. They check in a package that depends on it.
+The repository contains the `plylang` compiler and the `plylang-ls` server. They are separate npm packages. `@plylang/plylang` is the compiler. `@plylang/language-server` is the server. The server command remains `plylang-ls`. A library depends on the compiler. The server is installed by the editor. Words that work on ready-made values are not built into the compiler: they are imported. The neighboring package `@plylang/prelude` is one such place, and it has its own documentation. The import lines below name that package. They check in a package that depends on it.
 
 ## Stack
 
@@ -377,8 +377,10 @@ cargo build --release
 
 `target/release/plylang` and `target/release/plylang-ls` are the compiler and the server. The server speaks LSP over stdio. In a package with a `ply` field it resolves imports the same way `plylang build` does.
 
-The npm package is named `@plylang/plylang` and installs the same two commands. Version `1.x` of that package is language `1`. A minor or a patch of the compiler does not change the language number. `PLYLANG_BIN` and `PLYLANG_LS_BIN` supply a binary of their own.
+`@plylang/plylang` installs the `plylang` command. `@plylang/language-server` installs `plylang-ls` and depends on the same version of the compiler. Publish the compiler and its six platform packages before the server package and its six platform packages. `.github/workflows/publish.yml` does that when a GitHub release is published. Version `1.x` is language `1`. A minor or a patch of the compiler does not change the language number. `PLYLANG_BIN` and `PLYLANG_LS_BIN` supply a binary of their own.
 
-Highlighting is the [tree-sitter-ply](https://github.com/algosail/tree-sitter-ply) grammar. The Zed extension is the neighboring repository `zed-ply`: install it as a dev extension after `cargo build -p plylang-ls`.
+`node script/stage-native.js <platform> <binary-dir> <out-dir> plylang` writes one compiler platform package. The same command with `plylang-ls` writes `@plylang/language-server-<os>-<arch>`. Each archive holds one binary.
+
+Highlighting is the [tree-sitter-ply](https://github.com/algosail/tree-sitter-ply) grammar. The Zed extension is the neighboring repository `zed-ply`. It installs `@plylang/language-server` for the editor. In this repository, `cargo build -p plylang-ls` is what the extension runs.
 
 The license is MIT.

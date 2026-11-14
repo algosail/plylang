@@ -1,7 +1,10 @@
 # Publishes when a GitHub release is published.
 # The tag must be `v` plus the version in package.json.
-# npm authenticates with GitHub OIDC. Each of the seven packages needs a
-# trusted publisher for this file, publish.yml, with direct npm publish allowed.
+# npm authenticates with GitHub OIDC. Each of the fourteen packages needs a
+# trusted publisher for this filename, publish.yml, with direct npm publish
+# allowed. This file publishes compiler platform packages, then server platform
+# packages, then @plylang/plylang, then @plylang/language-server.
+# Do not set NODE_AUTH_TOKEN on a publish step. OIDC supplies the token.
 
 name: Publish
 
@@ -59,11 +62,15 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release -p plylang -p plylang-ls
-      - run: node script/stage-native.js ${{ matrix.platform }} target/release staging
+      - run: node script/stage-native.js ${{ matrix.platform }} target/release staging/compiler plylang
+      - run: node script/stage-native.js ${{ matrix.platform }} target/release staging/server plylang-ls
       - run: npm publish --provenance --access public
-        working-directory: staging
+        working-directory: staging/compiler
+      - run: npm publish --provenance --access public
+        working-directory: staging/server
 
   package:
     needs: native
@@ -76,7 +83,10 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
       - run: node script/check-release.js
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
       - run: npm publish --provenance --access public
+      - run: npm publish --provenance --access public
+        working-directory: server

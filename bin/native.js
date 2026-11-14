@@ -1,6 +1,9 @@
-// The npm commands `plylang` and `plylang-ls` start here and run the Rust
-// binary. An installed optional package `@plylang/plylang-<os>-<arch>` wins.
-// A checkout of this repository uses `target/release`, then `target/debug`.
+// The npm commands start here and run the Rust binary. `plylang` looks for
+// `@plylang/plylang-<os>-<arch>`. `plylang-ls` looks for
+// `@plylang/language-server-<os>-<arch>`. The command name and the package
+// name differ on purpose. A caller can pass `resolvePackage` so the lookup
+// starts from its own package. A checkout of this repository uses
+// `target/release`, then `target/debug`.
 
 import { spawnSync } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
@@ -24,6 +27,20 @@ export function platformId(platform = process.platform, arch = process.arch) {
   return PLATFORMS.has(id) ? id : null;
 }
 
+export function npmPackage(command) {
+  if (command === "plylang") {
+    return "@plylang/plylang";
+  }
+  if (command === "plylang-ls") {
+    return "@plylang/language-server";
+  }
+  throw new Error(`unknown command ${command}`);
+}
+
+export function platformPackage(command, id) {
+  return `${npmPackage(command)}-${id}`;
+}
+
 export function resolveBinary(command, options = {}) {
   if (command !== "plylang" && command !== "plylang-ls") {
     throw new Error(`unknown command ${command}`);
@@ -44,7 +61,7 @@ export function resolveBinary(command, options = {}) {
 
   const id = platformId(platform, arch);
   if (id) {
-    const pkgName = `@plylang/plylang-${id}`;
+    const pkgName = platformPackage(command, id);
     const pkgJson = resolvePackage(pkgName);
     if (pkgJson) {
       const name = fileName(command, platform);
@@ -70,7 +87,7 @@ function missing(command, id) {
   throw new Error(
     `${command} was not found for ${id}.\n` +
       "From a checkout, run `cargo build --release -p plylang -p plylang-ls`.\n" +
-      `From npm, install the optional package @plylang/plylang-${id}.`,
+      `From npm, install the optional package ${platformPackage(command, id)}.`,
   );
 }
 
@@ -97,10 +114,10 @@ function defaultResolvePackage(name) {
   }
 }
 
-export function run(command) {
+export function run(command, options = {}) {
   let bin;
   try {
-    bin = resolveBinary(command);
+    bin = resolveBinary(command, options);
   } catch (error) {
     console.error(error.message);
     process.exit(1);

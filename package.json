@@ -1,7 +1,7 @@
 {
   "name": "@plylang/plylang",
-  "version": "1.0.26",
-  "description": "Ply compiler and language server",
+  "version": "1.0.27",
+  "description": "Ply compiler",
   "license": "MIT",
   "author": "Algosail",
   "type": "module",
@@ -14,8 +14,7 @@
   "keywords": [
     "ply",
     "plylang",
-    "compiler",
-    "language-server"
+    "compiler"
   ],
   "engines": {
     "node": ">=24"
@@ -24,21 +23,19 @@
     "access": "public"
   },
   "bin": {
-    "plylang": "bin/plylang.js",
-    "plylang-ls": "bin/plylang-ls.js"
+    "plylang": "bin/plylang.js"
   },
   "files": [
     "bin/plylang.js",
-    "bin/plylang-ls.js",
     "bin/native.js"
   ],
   "optionalDependencies": {
-    "@plylang/plylang-darwin-arm64": "1.0.26",
-    "@plylang/plylang-darwin-x64": "1.0.26",
-    "@plylang/plylang-linux-arm64": "1.0.26",
-    "@plylang/plylang-linux-x64": "1.0.26",
-    "@plylang/plylang-win32-arm64": "1.0.26",
-    "@plylang/plylang-win32-x64": "1.0.26"
+    "@plylang/plylang-darwin-arm64": "1.0.27",
+    "@plylang/plylang-darwin-x64": "1.0.27",
+    "@plylang/plylang-linux-arm64": "1.0.27",
+    "@plylang/plylang-linux-x64": "1.0.27",
+    "@plylang/plylang-win32-arm64": "1.0.27",
+    "@plylang/plylang-win32-x64": "1.0.27"
   },
   "scripts": {
     "build": "cargo build --release",

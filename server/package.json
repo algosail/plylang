@@ -1,0 +1,42 @@
+{
+  "name": "@plylang/language-server",
+  "version": "1.0.27",
+  "description": "Ply language server",
+  "license": "MIT",
+  "author": "Algosail",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/algosail/plylang.git"
+  },
+  "homepage": "https://github.com/algosail/plylang#readme",
+  "bugs": "https://github.com/algosail/plylang/issues",
+  "keywords": [
+    "ply",
+    "plylang",
+    "language-server"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "plylang-ls": "bin/plylang-ls.js"
+  },
+  "files": [
+    "bin/plylang-ls.js"
+  ],
+  "dependencies": {
+    "@plylang/plylang": "1.0.27"
+  },
+  "optionalDependencies": {
+    "@plylang/language-server-darwin-arm64": "1.0.27",
+    "@plylang/language-server-darwin-x64": "1.0.27",
+    "@plylang/language-server-linux-arm64": "1.0.27",
+    "@plylang/language-server-linux-x64": "1.0.27",
+    "@plylang/language-server-win32-arm64": "1.0.27",
+    "@plylang/language-server-win32-x64": "1.0.27"
+  }
+}

@@ -5,9 +5,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { platformId, resolveBinary } from "./native.js";
+import { npmPackage, platformId, platformPackage, resolveBinary } from "./native.js";
 
 const root = join(import.meta.dirname, "..");
+
+test("names the server package apart from the command", () => {
+  assert.equal(npmPackage("plylang"), "@plylang/plylang");
+  assert.equal(npmPackage("plylang-ls"), "@plylang/language-server");
+  assert.equal(platformPackage("plylang", "linux-x64"), "@plylang/plylang-linux-x64");
+  assert.equal(
+    platformPackage("plylang-ls", "darwin-arm64"),
+    "@plylang/language-server-darwin-arm64",
+  );
+  assert.throws(() => npmPackage("other"), /unknown command/);
+});
 
 test("names a supported platform", () => {
   assert.equal(platformId("darwin", "arm64"), "darwin-arm64");
@@ -66,6 +77,25 @@ test("a missing override is an error", () => {
     () => resolveBinary("plylang", { env: { PLYLANG_BIN: "/no/such/plylang" } }),
     /PLYLANG_BIN is not an executable file/,
   );
+});
+
+test("the language server uses its own platform package", () => {
+  const dir = mkdtempSync(join(tmpdir(), "plylang-ls-pkg-"));
+  mkdirSync(join(dir, "bin"));
+  const file = join(dir, "bin", "plylang-ls");
+  writeFileSync(file, "#!/bin/sh\n");
+  chmodSync(file, 0o755);
+  writeFileSync(join(dir, "package.json"), "{}\n");
+  const found = resolveBinary("plylang-ls", {
+    env: {},
+    platform: "darwin",
+    arch: "arm64",
+    resolvePackage(name) {
+      assert.equal(name, "@plylang/language-server-darwin-arm64");
+      return join(dir, "package.json");
+    },
+  });
+  assert.equal(found, file);
 });
 
 test("a platform package wins over the checkout", () => {
