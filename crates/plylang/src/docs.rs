@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::ast::{
-    method_line, type_string, Class, Data, Def, Exports, Instance, Item, Module, Synonym, Type,
+    method_line, type_string, Class, Data, Def, Exports, Instance, Item, Module, Synonym,
 };
 use crate::build::{
     io_error, located, module_path_of, open_package, os_error, walk_ply, BuildError,
@@ -106,19 +106,12 @@ fn render_pages(package_name: Option<&str>, pages: &[Page]) -> String {
     }
     for (index, page) in pages.iter().enumerate() {
         let (title, _) = &headings[index];
-        render_page(&mut out, title, page, pages, index, &mut seen);
+        render_page(&mut out, title, page, &mut seen);
     }
     out
 }
 
-fn render_page(
-    out: &mut String,
-    title: &str,
-    page: &Page,
-    pages: &[Page],
-    index: usize,
-    seen: &mut HashMap<String, usize>,
-) {
+fn render_page(out: &mut String, title: &str, page: &Page, seen: &mut HashMap<String, usize>) {
     out.push_str("## ");
     out.push_str(title);
     out.push_str("\n\n");
@@ -141,7 +134,7 @@ fn render_page(
                 push_class(&mut classes, class);
             }
             Item::Instance(instance) if !matches!(page.module.exports, Exports::Closed) => {
-                instances.push(instance_head(instance))
+                push_instance(&mut instances, instance);
             }
             Item::Def(def) if docs_def(&page.module, def) => {
                 words.push((def.name.clone(), format_word(def), def.doc.clone()))
@@ -158,14 +151,8 @@ fn render_page(
             &page.module,
             &mut types,
             &mut classes,
-            &mut instances,
             &mut words,
         );
-    }
-    for head in heads_defined_here(pages, index) {
-        if !instances.iter().any(|have| have == &head) {
-            instances.push(head);
-        }
     }
     render_group(out, "Types", &types, seen);
     render_group(out, "Classes", &classes, seen);
@@ -204,7 +191,6 @@ fn append_published(
     module: &Module,
     types: &mut Vec<(String, String, String)>,
     classes: &mut Vec<(String, String, String)>,
-    instances: &mut Vec<String>,
     words: &mut Vec<(String, String, String)>,
 ) {
     let names = crate::surface::public_names(module);
@@ -251,13 +237,6 @@ fn append_published(
             crate::surface::Found::Place(place) => {
                 words.push((place.name.clone(), format_place(&place), place.doc.clone()));
             }
-        }
-    }
-    let mut load = |from: &Path, path: &str| crate::build::load_surface(from, path);
-    for instance in crate::surface::instances(module, file, &mut load) {
-        let head = instance_head(&instance);
-        if !instances.iter().any(|have| have == &head) {
-            instances.push(head);
         }
     }
 }
@@ -443,68 +422,21 @@ fn format_class_head(class: &Class) -> String {
     out
 }
 
-/// Instances written in another module whose head type is declared here.
-fn heads_defined_here(pages: &[Page], index: usize) -> Vec<String> {
-    let defined = defined_types(&pages[index].module);
-    if defined.is_empty() {
-        return Vec::new();
+/// One line per class written on this `#`. `Comparable, Sortable Bool` is two lines.
+fn push_instance(instances: &mut Vec<String>, instance: &Instance) {
+    let mut tail = String::new();
+    for arg in &instance.args {
+        tail.push(' ');
+        tail.push_str(&type_string(arg));
     }
-    let mut heads = Vec::new();
-    for (other, page) in pages.iter().enumerate() {
-        if other == index {
+    for name in &instance.class_names {
+        let mut head = name.clone();
+        head.push_str(&tail);
+        if instances.iter().any(|have| have == &head) {
             continue;
         }
-        for item in &page.module.items {
-            let Item::Instance(instance) = item else {
-                continue;
-            };
-            let mentions = instance
-                .args
-                .iter()
-                .any(|ty| type_head(ty).is_some_and(|name| defined.contains(name)));
-            if !mentions {
-                continue;
-            }
-            let head = instance_head(instance);
-            if !heads.iter().any(|have| have == &head) {
-                heads.push(head);
-            }
-        }
+        instances.push(head);
     }
-    heads
-}
-
-fn defined_types(module: &Module) -> HashSet<String> {
-    let mut names = HashSet::new();
-    for item in &module.items {
-        match item {
-            Item::Data(data) => {
-                names.insert(data.name.clone());
-            }
-            Item::Synonym(synonym) => {
-                names.insert(synonym.name.clone());
-            }
-            _ => {}
-        }
-    }
-    names
-}
-
-fn type_head(ty: &Type) -> Option<&str> {
-    match ty {
-        Type::Ctor(name) => Some(name),
-        Type::App(head, _) => type_head(head),
-        Type::Var(_) | Type::Fun(_) | Type::Record(_) => None,
-    }
-}
-
-fn instance_head(instance: &Instance) -> String {
-    let mut out = instance.class_names.join(", ");
-    for arg in &instance.args {
-        out.push(' ');
-        out.push_str(&type_string(arg));
-    }
-    out
 }
 
 fn anchor(title: &str, seen: &mut HashMap<String, usize>) -> String {
@@ -655,26 +587,34 @@ mod tests {
     }
 
     #[test]
-    fn an_instance_is_listed_on_the_module_that_defines_the_head() {
+    fn instances_are_the_classes_written_in_this_file() {
         let temp = Temp::new("head");
         temp.write("package.json", &package_json("head"));
         temp.write(
             "src/Data/Maybe.ply",
             "@ Maybe, Nothing, Just\n\n; Maybe a = Nothing | Just a\n",
         );
+        temp.write("src/NumShow.ply", "@\n\n# Show Num\n  show = showNum\n");
         temp.write(
             "src/Show.ply",
-            "@ Show, show\n\n& Show a\n  show ( a -- Str )\n\n# Show (Maybe a)\n  show = showMaybe\n\n# Show Num\n  show = showNum\n",
+            "@ Show, show\n\n~ \"NumShow\"\n\n& Show a\n  show ( a -- Str )\n\n# Show, Print (Maybe a)\n  show = showMaybe\n  print = printMaybe\n",
         );
         write_docs(&temp.0, None).unwrap_or_else(|error| panic!("{}", error.render()));
         let page = fs::read_to_string(temp.0.join("DOCS.md")).unwrap();
         let maybe_at = page.find("## head/Data/Maybe\n").expect("Maybe section");
         let maybe = page[maybe_at..].split("\n## ").next().unwrap();
-        assert!(maybe.contains("- Show (Maybe a)\n"), "{maybe}");
-        assert!(!maybe.contains("- Show Num\n"), "{maybe}");
-        assert!(page.contains("## head/Show\n"), "{page}");
-        assert!(page.contains("- Show (Maybe a)\n"), "{page}");
-        assert!(page.contains("- Show Num\n"), "{page}");
+        assert!(!maybe.contains("### Instances"), "{maybe}");
+        let show_at = page.find("## head/Show\n").expect("Show section");
+        let show = page[show_at..].split("\n## ").next().unwrap();
+        assert!(
+            show.contains("- Show (Maybe a)\n- Print (Maybe a)\n"),
+            "{show}"
+        );
+        assert!(!show.contains("Show Num"), "{show}");
+        let num_at = page.find("## head/NumShow\n").expect("NumShow section");
+        let num = page[num_at..].split("\n## ").next().unwrap();
+        assert!(num.contains("- Show Num\n"), "{num}");
+        assert!(!num.contains("Maybe"), "{num}");
     }
 
     #[test]
@@ -770,7 +710,8 @@ eq ( Equal a => a a -- Bool )
 ### Instances
 
 - Equal Num
-- Equal, Sortable Int
+- Equal Int
+- Sortable Int
 
 ## shelf/Data/List
 
