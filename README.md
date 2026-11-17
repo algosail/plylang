@@ -96,7 +96,7 @@ The same permutations as in Factor follow, with names made of letters: `dupd`, `
 `cons` pushes a value and then runs a quotation. The value sits under the quotation, so `5 [ 1 add ] cons` is a quotation of type `(-- Num)` that pushes five and then adds one. The call site does not name that value.
 
 ```ply
-~ "@plylang/prelude/Classes/Comparable" equal
+~ "@plylang/prelude/Classes/Eq" equal
 ~ "@plylang/prelude/Classes/Subtractable" subtract
 ~ "@plylang/prelude/Classes/Arithmetic" multiply
 ~ "@plylang/prelude/Data/Num"
@@ -192,7 +192,7 @@ The text between the angles is a program. It starts from an empty stack and does
 A word that walks an array is imported. In the example the quotation sits on top. The name comes from one module, and the instance for the array comes from another.
 
 ```ply
-~ "@plylang/prelude/Classes/Mappable" map
+~ "@plylang/prelude/Classes/Functor" map
 ~ "@plylang/prelude/Classes/Arithmetic" add
 ~ "@plylang/prelude/Data/Num"
 ~ "@plylang/prelude/Data/Array"
@@ -259,10 +259,10 @@ The order in the example is the dictionary, the key, and the value on top.
 ```
 
 ```ply
-~ "@plylang/prelude/Classes/Comparable" Comparable, equal
+~ "@plylang/prelude/Classes/Eq" Eq, equal
 ~ "@plylang/prelude/Data/Num"
 
-: same ( Comparable a => a a -- Bool )
+: same ( Eq a => a a -- Bool )
   equal
 ```
 

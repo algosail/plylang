@@ -390,6 +390,7 @@ impl Parser {
         if !self.eat(&TokenKind::LAngle) {
             return Err(self.error(Error::ExpectedProbePicture));
         }
+        let picture_start = self.last_span;
         self.group_depth += 1;
         let mut picture = Vec::new();
         loop {
@@ -406,11 +407,13 @@ impl Parser {
             picture.push(self.parse_term()?);
         }
         self.group_depth -= 1;
+        let picture_span = picture_start.merge(self.last_span);
         self.skip_newlines();
         if !self.is(TokenKind::LBrack) {
             return Err(self.error(Error::ExpectedProbeProgram));
         }
         let term = self.parse_term()?;
+        let body_span = term.span;
         let TermNode::Quote(body) = term.node else {
             return Err(self.error_at(term.span, Error::ExpectedProbeProgram));
         };
@@ -418,7 +421,9 @@ impl Parser {
             span: start.merge(self.last_span),
             name_span,
             name,
+            picture_span,
             picture,
+            body_span,
             body,
             doc: String::new(),
         })

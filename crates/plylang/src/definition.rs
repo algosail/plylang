@@ -393,6 +393,21 @@ mod tests {
     }
 
     #[test]
+    fn jumps_to_a_constructor_in_a_check() {
+        let source = "; Box = Box Int\n\n? \"made\" <\n  1n Box\n> [\n  dup\n]\n";
+        let type_name = jump(source, at(source, "Box"));
+        let ctor = jump(source, at_offset(source, source.find("= Box").unwrap() + 2));
+        let used = jump(
+            source,
+            at_offset(source, source.find("1n Box").unwrap() + 3),
+        );
+        assert_eq!(slice(source, type_name.span), "Box");
+        assert_eq!(ctor.span, used.span);
+        assert_ne!(type_name.span, used.span);
+        assert_eq!(slice(source, used.span), "Box Int");
+    }
+
+    #[test]
     fn splits_a_type_and_its_constructor() {
         let source = "; Maybe a = Nothing | Just a\n\n: none ( -- (Maybe Int) )\n  Nothing\n";
         let declared = jump(source, at(source, "Maybe"));

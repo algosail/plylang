@@ -3224,16 +3224,16 @@ if (useBoth(1n, 2n) !== false) throw new Error("both neq");
         let body = r#"
 ; Ordering = LT | EQ | GT
 
-& Comparable a
+& Eq a
   eq ( a a -- Bool )
 
-& Showable a
+& Show a
   show ( a -- Str )
 
-& Comparable a => Sortable a
+& Eq a => Ord a
   compare ( a a -- Ordering )
 
-& Comparable a => Hashable a
+& Eq a => Hash a
   hash ( a -- Int )
 
 : foreign showInt ( Int -- Str )
@@ -3245,16 +3245,16 @@ if (useBoth(1n, 2n) !== false) throw new Error("both neq");
 : hashInt ( Int -- Int )
   dup drop
 
-# Comparable Int
+# Eq Int
   eq = eqInt
 
-# Showable Int
+# Show Int
   show = showInt
 
-# Sortable Int
+# Ord Int
   compare = compareInt
 
-# Hashable Int
+# Hash Int
   hash = hashInt
 
 ; Answer = No | Yes Int

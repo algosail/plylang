@@ -151,6 +151,8 @@ fn context_of(walked: &Walk, partial: Option<&Token>, at_column_0: bool) -> Cont
             vars: walked.params.clone(),
         },
         Place::Body if !at_column_0 => Context::Word,
+        // A term at column 0 is still a term. The brackets are not a new declaration.
+        Place::ProbePicture | Place::ProbeProgram => Context::Word,
         Place::Top | Place::Body | Place::DataGap if at_column_0 => Context::Keyword,
         _ => Context::None,
     }
@@ -860,6 +862,14 @@ enum Place {
     DefParen,
     Signature,
     Body,
+    /// After `?`, before `<`.
+    ProbeHead,
+    /// Inside the picture, including a nested array.
+    ProbePicture,
+    /// After `>`, before the program quotation.
+    ProbeBetween,
+    /// Inside the program, including a nested quotation.
+    ProbeProgram,
     DataName,
     DataParams,
     DataCtor,
@@ -880,12 +890,20 @@ pub(crate) fn name_space_at(tokens: &[Token], index: usize) -> NameSpace {
         Place::Signature | Place::DataFields | Place::DataName | Place::DataParams => {
             NameSpace::Type
         }
-        Place::Body | Place::DefName | Place::DataCtor | Place::Vis | Place::DefParen => {
-            NameSpace::Value
-        }
-        Place::Top | Place::Import | Place::ImportString | Place::ImportList | Place::DataGap => {
-            NameSpace::Either
-        }
+        Place::Body
+        | Place::DefName
+        | Place::DataCtor
+        | Place::Vis
+        | Place::DefParen
+        | Place::ProbePicture
+        | Place::ProbeProgram => NameSpace::Value,
+        Place::Top
+        | Place::Import
+        | Place::ImportString
+        | Place::ImportList
+        | Place::DataGap
+        | Place::ProbeHead
+        | Place::ProbeBetween => NameSpace::Either,
     }
 }
 
@@ -918,6 +936,16 @@ fn walk(tokens: &[&Token]) -> Walk {
     while index < tokens.len() {
         let token = tokens[index];
         let next = tokens.get(index + 1);
+        // A word body already completes. Leave it, so a place after the check
+        // keeps the body state it had. Anywhere else, `< >` and `[ ]` are words.
+        if is_probe_start(token) && walked.state != Place::Body {
+            walked.state = Place::ProbeHead;
+            walked.depth = 0;
+            walked.saw_foreign = false;
+            walked.rename = false;
+            index += 1;
+            continue;
+        }
         if resets(walked.state, token) {
             walked.state = Place::Top;
             walked.depth = 0;
@@ -950,7 +978,15 @@ fn resets(state: Place, token: &Token) -> bool {
             | Place::DataCtor
             | Place::DataFields
             | Place::DataGap
+            | Place::ProbeHead
+            | Place::ProbePicture
+            | Place::ProbeBetween
+            | Place::ProbeProgram
     )
+}
+
+fn is_probe_start(token: &Token) -> bool {
+    token.col == 0 && token.line_start && matches!(token.kind, TokenKind::Probe)
 }
 
 fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
@@ -1055,6 +1091,48 @@ fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
             _ => {}
         },
         Place::Body => {}
+        Place::ProbeHead => {
+            if matches!(token.kind, TokenKind::LAngle) {
+                walked.depth = 1;
+                walked.state = Place::ProbePicture;
+            }
+        }
+        Place::ProbePicture => match &token.kind {
+            TokenKind::LParen | TokenKind::LBrack | TokenKind::LBrace | TokenKind::LAngle => {
+                walked.depth += 1;
+            }
+            TokenKind::RParen | TokenKind::RBrack | TokenKind::RBrace => {
+                walked.depth = walked.depth.saturating_sub(1);
+            }
+            TokenKind::RAngle => {
+                walked.depth = walked.depth.saturating_sub(1);
+                if walked.depth == 0 {
+                    walked.state = Place::ProbeBetween;
+                }
+            }
+            _ => {}
+        },
+        Place::ProbeBetween => {
+            if matches!(token.kind, TokenKind::LBrack) {
+                walked.depth = 1;
+                walked.state = Place::ProbeProgram;
+            }
+        }
+        Place::ProbeProgram => match &token.kind {
+            TokenKind::LParen | TokenKind::LBrack | TokenKind::LBrace | TokenKind::LAngle => {
+                walked.depth += 1;
+            }
+            TokenKind::RParen | TokenKind::RBrace | TokenKind::RAngle => {
+                walked.depth = walked.depth.saturating_sub(1);
+            }
+            TokenKind::RBrack => {
+                walked.depth = walked.depth.saturating_sub(1);
+                if walked.depth == 0 {
+                    walked.state = Place::Top;
+                }
+            }
+            _ => {}
+        },
         Place::DataName => match &token.kind {
             TokenKind::Ident(_) => walked.state = Place::DataParams,
             TokenKind::Newline => walked.state = Place::Top,
@@ -1310,7 +1388,10 @@ fn in_body(source: &str, hash: usize) -> bool {
         return false;
     };
     let before = tokens_before(&tokens, hash, None);
-    matches!(walk(&before).state, Place::Body)
+    matches!(
+        walk(&before).state,
+        Place::Body | Place::ProbePicture | Place::ProbeProgram
+    )
 }
 
 /// Fields of the one-constructor type under `>>name`. An unsolved top uses types in this def.
@@ -1993,6 +2074,75 @@ mod tests {
         assert!(items.iter().any(|label| label == "fork"), "{items:?}");
         assert!(items.iter().any(|label| label == "dup"), "{items:?}");
         assert!(!items.iter().any(|label| label == "Promise"), "{items:?}");
+    }
+
+    #[test]
+    fn completes_words_in_a_check() {
+        let picture = "\
+; Box = Box Int
+
+? \"made\" <
+  < 1n >
+  Bo
+> [
+  dup
+]
+";
+        let found = labels(picture, "Bo");
+        assert!(found.iter().any(|label| label == "Box"), "{found:?}");
+        assert!(found.iter().any(|label| label == "dup"), "{found:?}");
+        assert!(!found.iter().any(|label| label == "Int"), "{found:?}");
+
+        let after_quote = "\
+; Box = Box Int
+
+? \"made\" <
+  [ 1n ]
+  Bo
+> [
+  dup
+]
+";
+        let found = labels(after_quote, "Bo");
+        assert!(found.iter().any(|label| label == "Box"), "{found:?}");
+
+        let program = "\
+; Box = Box Int
+
+? \"made\" < 1n > [
+  < 1n >
+  Bo
+]
+";
+        let found = labels(program, "Bo");
+        assert!(found.iter().any(|label| label == "Box"), "{found:?}");
+        assert!(found.iter().any(|label| label == "dup"), "{found:?}");
+
+        let after = "\
+? \"made\" < 1n > [
+  dup
+]
+
+: next ( Int -- Int )
+  du
+";
+        let found = labels(after, "du");
+        assert!(found.iter().any(|label| label == "dup"), "{found:?}");
+        assert!(found.iter().any(|label| label == "next"), "{found:?}");
+
+        let kept = "\
+: hold ( Int -- Int )
+  dup drop
+
+? \"kept\" <
+  ho
+> [
+  dup
+]
+";
+        let found = labels(kept, "ho");
+        assert!(found.iter().any(|label| label == "hold"), "{found:?}");
+        assert!(found.iter().any(|label| label == "dup"), "{found:?}");
     }
 
     #[test]

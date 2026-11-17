@@ -1,8 +1,8 @@
-//! Derived instances for `Comparable`, `Showable`, `Sortable`, and `Hashable`.
+//! Derived instances for `Eq`, `Show`, `Ord`, and `Hash`.
 //!
 //! A module that can see the class receives an instance for each sum or product
 //! it declares, unless a handwritten instance or a `{method}{Type}` word is already
-//! there. Comparable's method name is the one that class declares, so a prelude
+//! there. Eq's method name is the one that class declares, so a prelude
 //! `equal` derives `equalPerson` and a test class whose method is `eq` still
 //! derives `eqPerson`. A function field, a `Ref` field, or a `Cell` field is left alone. `Num` and `Map` keep
 //! the instances written next to them, because those modules do not ask for a
@@ -22,8 +22,8 @@ use super::{Checker, TyNode};
 
 impl Checker {
     pub(super) fn derive_instances(&mut self, module: &Module) -> Result<(), Diagnostic> {
-        if let Some(method) = self.sole_class_method("Comparable") {
-            self.derive_class(module, "Comparable", &method, &method, eq_source)?;
+        if let Some(method) = self.sole_class_method("Eq") {
+            self.derive_class(module, "Eq", &method, &method, eq_source)?;
         }
         self.derive_showable(module)?;
         self.derive_sortable(module)?;
@@ -36,12 +36,12 @@ impl Checker {
             return Ok(());
         }
         let added = !self.words.contains_key("show");
-        if !self.class_method_ready("Showable", "show") {
+        if !self.class_method_ready("Show", "show") {
             return Ok(());
         }
         let added_cat = self.install_derive_word("ply_show_cat", "( Str Str -- Str )");
         let before = self.derived.len();
-        let derived = self.derive_pending(module, "Showable", "show", show_source);
+        let derived = self.derive_pending(module, "Show", "show", show_source);
         if added_cat {
             self.words.remove("ply_show_cat");
         }
@@ -61,7 +61,7 @@ impl Checker {
             return Ok(());
         }
         let added = !self.words.contains_key("compare");
-        if !self.class_method_ready("Sortable", "compare") {
+        if !self.class_method_ready("Ord", "compare") {
             return Ok(());
         }
         // The generated arms return LT, EQ, and GT. Without those constructors
@@ -73,7 +73,7 @@ impl Checker {
             return Ok(());
         }
         let before = self.derived.len();
-        self.derive_pending(module, "Sortable", "compare", compare_source)?;
+        self.derive_pending(module, "Ord", "compare", compare_source)?;
         if added && self.derived.len() == before {
             self.words.remove("compare");
         }
@@ -86,12 +86,12 @@ impl Checker {
             return Ok(());
         }
         let added = !self.words.contains_key("hash");
-        if !self.class_method_ready("Hashable", "hash") {
+        if !self.class_method_ready("Hash", "hash") {
             return Ok(());
         }
         let added_mix = self.install_derive_word("ply_hash_mix", "( Int Int -- Int )");
         let before = self.derived.len();
-        let derived = self.derive_pending(module, "Hashable", "hash", hash_source);
+        let derived = self.derive_pending(module, "Hash", "hash", hash_source);
         if added_mix {
             self.words.remove("ply_hash_mix");
         }
@@ -130,7 +130,7 @@ impl Checker {
         Ok(())
     }
 
-    /// Comparable declares one method. Its spelling is that method's name.
+    /// Eq declares one method. Its spelling is that method's name.
     fn sole_class_method(&self, class_name: &str) -> Option<String> {
         let class = self.classes.get(class_name)?;
         let [method] = class.methods.as_slice() else {
@@ -442,7 +442,7 @@ fn derived_scheme(data: &crate::ast::Data, class_name: &str, effect: &str) -> St
 fn eq_source(data: &crate::ast::Data, method: &str) -> String {
     let word = format!("{method}{}", data.name);
     let head = head_of(data);
-    let scheme = derived_scheme(data, "Comparable", &format!("{head} {head} -- Bool"));
+    let scheme = derived_scheme(data, "Eq", &format!("{head} {head} -- Bool"));
     let mut body = String::new();
     for ctor in &data.ctors {
         let left = ctor_pattern(&ctor.name, ctor.fields.len(), "l");
@@ -462,13 +462,13 @@ fn eq_source(data: &crate::ast::Data, method: &str) -> String {
     if data.ctors.len() > 1 {
         body.push_str("  _ _ ->\n    false\n");
     }
-    format!(": {word} {scheme}\n{body}\n# Comparable {head}\n  {method} = {word}\n")
+    format!(": {word} {scheme}\n{body}\n# Eq {head}\n  {method} = {word}\n")
 }
 
 fn show_source(data: &crate::ast::Data, _method: &str) -> String {
     let word = format!("show{}", data.name);
     let head = head_of(data);
-    let scheme = derived_scheme(data, "Showable", &format!("{head} -- Str"));
+    let scheme = derived_scheme(data, "Show", &format!("{head} -- Str"));
     let mut body = String::new();
     for ctor in &data.ctors {
         let pattern = ctor_pattern(&ctor.name, ctor.fields.len(), "l");
@@ -485,13 +485,13 @@ fn show_source(data: &crate::ast::Data, _method: &str) -> String {
         }
         body.push_str("    \")\" ply_show_cat\n");
     }
-    format!(": {word} {scheme}\n{body}\n# Showable {head}\n  show = {word}\n")
+    format!(": {word} {scheme}\n{body}\n# Show {head}\n  show = {word}\n")
 }
 
 fn compare_source(data: &crate::ast::Data, _method: &str) -> String {
     let word = format!("compare{}", data.name);
     let head = head_of(data);
-    let scheme = derived_scheme(data, "Sortable", &format!("{head} {head} -- Ordering"));
+    let scheme = derived_scheme(data, "Ord", &format!("{head} {head} -- Ordering"));
     let helper = format!("plyOrdering{}", data.name);
     let needs_helper = data.ctors.iter().any(|ctor| ctor.fields.len() > 1);
     let mut body = String::new();
@@ -515,7 +515,7 @@ fn compare_source(data: &crate::ast::Data, _method: &str) -> String {
         ));
     }
     source.push_str(&format!(
-        ": {word} {scheme}\n{body}\n# Sortable {head}\n  compare = {word}\n"
+        ": {word} {scheme}\n{body}\n# Ord {head}\n  compare = {word}\n"
     ));
     source
 }
@@ -544,7 +544,7 @@ fn field_step(helper: &str, index: usize, count: usize, indent: usize) -> String
 fn hash_source(data: &crate::ast::Data, _method: &str) -> String {
     let word = format!("hash{}", data.name);
     let head = head_of(data);
-    let scheme = derived_scheme(data, "Hashable", &format!("{head} -- Int"));
+    let scheme = derived_scheme(data, "Hash", &format!("{head} -- Int"));
     let mut body = String::new();
     for (index, ctor) in data.ctors.iter().enumerate() {
         let pattern = ctor_pattern(&ctor.name, ctor.fields.len(), "l");
@@ -554,7 +554,7 @@ fn hash_source(data: &crate::ast::Data, _method: &str) -> String {
             body.push_str(&format!("    l{field} hash ply_hash_mix\n"));
         }
     }
-    format!(": {word} {scheme}\n{body}\n# Hashable {head}\n  hash = {word}\n")
+    format!(": {word} {scheme}\n{body}\n# Hash {head}\n  hash = {word}\n")
 }
 
 fn ctor_pattern(name: &str, fields: usize, side: &str) -> String {

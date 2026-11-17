@@ -192,8 +192,12 @@ pub struct Probe {
     pub span: Span,
     pub name_span: Span,
     pub name: String,
+    /// `<` through `>`.
+    pub picture_span: Span,
     /// Terms between `<` and `>`. They run on an empty stack.
     pub picture: Vec<Term>,
+    /// `[` through `]` of the program.
+    pub body_span: Span,
     /// Terms inside the quotation. They run on an empty stack.
     pub body: Vec<Term>,
     /// Text of the `..` lines directly above this check. Empty if there are none.

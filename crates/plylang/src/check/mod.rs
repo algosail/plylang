@@ -6763,13 +6763,13 @@ mod tests {
     #[test]
     fn comparable_is_derived_for_a_product_of_ints() {
         ok("\
-& Comparable a
+& Eq a
   eq ( a a -- Bool )
 
 : eqInt ( Int Int -- Bool )
   drop drop true
 
-# Comparable Int
+# Eq Int
   eq = eqInt
 
 ; Person = Person name : Int, age : Int
@@ -6778,13 +6778,13 @@ mod tests {
   eq
 ");
         ok("\
-& Comparable a
+& Eq a
   eq ( a a -- Bool )
 
 : eqInt ( Int Int -- Bool )
   drop drop true
 
-# Comparable Int
+# Eq Int
   eq = eqInt
 
 ; Answer = No | Yes Int
@@ -6794,7 +6794,7 @@ mod tests {
 ");
         err(
             "\
-& Comparable a
+& Eq a
   eq ( a a -- Bool )
 
 ; Task = Task ( Int -- Int )
@@ -6802,11 +6802,11 @@ mod tests {
 : same ( Task Task -- Bool )
   eq
 ",
-            "no instance for Comparable Task",
+            "no instance for Eq Task",
         );
         err(
             "\
-& Comparable a
+& Eq a
   eq ( a a -- Bool )
 
 ; foreign Ref a
@@ -6816,11 +6816,11 @@ mod tests {
 : same ( Cell Cell -- Bool )
   eq
 ",
-            "no instance for Comparable Cell",
+            "no instance for Eq Cell",
         );
         err(
             "\
-& Comparable a
+& Eq a
   eq ( a a -- Bool )
 
 ; foreign Cell a
@@ -6830,20 +6830,20 @@ mod tests {
 : same ( Box Box -- Bool )
   eq
 ",
-            "no instance for Comparable Box",
+            "no instance for Eq Box",
         );
     }
 
     #[test]
     fn showable_and_sortable_and_hashable_are_derived() {
         ok("\
-& Showable a
+& Show a
   show ( a -- Str )
 
 : showInt ( Int -- Str )
   drop \"n\"
 
-# Showable Int
+# Show Int
   show = showInt
 
 ; Person = Person name : Int, age : Int
@@ -6852,13 +6852,13 @@ mod tests {
   show
 ");
         ok("\
-& Showable a
+& Show a
   show ( a -- Str )
 
 : showInt ( Int -- Str )
   drop \"n\"
 
-# Showable Int
+# Show Int
   show = showInt
 
 ; Answer = No | Yes Int
@@ -6867,7 +6867,7 @@ mod tests {
   show
 ");
         ok("\
-& Showable a
+& Show a
   show ( a -- Str )
 
 ; Wrap = Wrap Quiet
@@ -6877,13 +6877,13 @@ mod tests {
   show
 ");
         ok("\
-& Showable a
+& Show a
   show ( a -- Str )
 
 : showInt ( Int -- Str )
   drop \"n\"
 
-# Showable Int
+# Show Int
   show = showInt
 
 ; Person = Person Int
@@ -6891,7 +6891,7 @@ mod tests {
 : showPerson ( Person -- Str )
   drop \"hand\"
 
-# Showable Person
+# Show Person
   show = showPerson
 
 : shown ( Person -- Str )
@@ -6899,13 +6899,13 @@ mod tests {
 ");
         err(
             "\
-& Showable a
+& Show a
   show ( a -- Str )
 
 : showInt ( Int -- Str )
   drop \"n\"
 
-# Showable Int
+# Show Int
   show = showInt
 
 ; Person = Person Int
@@ -6917,7 +6917,7 @@ mod tests {
         );
         err(
             "\
-& Showable a
+& Show a
   show ( a -- Str )
 
 ; Task = Task ( Int -- Int )
@@ -6925,11 +6925,11 @@ mod tests {
 : same ( Task -- Str )
   show
 ",
-            "no instance for Showable Task",
+            "no instance for Show Task",
         );
         err(
             "\
-& Showable a
+& Show a
   show ( a -- Str )
 
 ; foreign Ref a
@@ -6939,15 +6939,15 @@ mod tests {
 : same ( Cell -- Str )
   show
 ",
-            "no instance for Showable Cell",
+            "no instance for Show Cell",
         );
         ok("\
 ; Ordering = LT | EQ | GT
 
-& Comparable a
+& Eq a
   eq ( a a -- Bool )
 
-& Comparable a => Sortable a
+& Eq a => Ord a
   compare ( a a -- Ordering )
 
 : eqInt ( Int Int -- Bool )
@@ -6956,10 +6956,10 @@ mod tests {
 : compareInt ( Int Int -- Ordering )
   drop drop EQ
 
-# Comparable Int
+# Eq Int
   eq = eqInt
 
-# Sortable Int
+# Ord Int
   compare = compareInt
 
 ; Answer = No | Yes Int
@@ -6969,16 +6969,16 @@ mod tests {
 ");
         err(
             "\
-& Comparable a
+& Eq a
   eq ( a a -- Bool )
 
-& Comparable a => Sortable a
+& Eq a => Ord a
   compare ( a a -- Int )
 
 : eqInt ( Int Int -- Bool )
   drop drop true
 
-# Comparable Int
+# Eq Int
   eq = eqInt
 
 ; Person = Person name : Int, age : Int
@@ -6986,13 +6986,13 @@ mod tests {
 : bad ( Person Person -- Int )
   compare
 ",
-            "no instance for Sortable Person",
+            "no instance for Ord Person",
         );
         ok("\
-& Comparable a
+& Eq a
   eq ( a a -- Bool )
 
-& Comparable a => Hashable a
+& Eq a => Hash a
   hash ( a -- Int )
 
 : eqInt ( Int Int -- Bool )
@@ -7001,10 +7001,10 @@ mod tests {
 : hashInt ( Int -- Int )
   dup drop
 
-# Comparable Int
+# Eq Int
   eq = eqInt
 
-# Hashable Int
+# Hash Int
   hash = hashInt
 
 ; Person = Person name : Int, age : Int

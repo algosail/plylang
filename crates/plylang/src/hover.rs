@@ -1,13 +1,13 @@
 //! Hover is markdown. A named `ply` block is the declared scheme. Prose from the `..`
 //! lines above that declaration sits under it. One unwrapped line with `--` and no
 //! name is this use. A field word has no scheme, so that line is its whole hover.
-//! A gap shows only the stack.
+//! A gap shows only the stack. A `?` check shows that stack inside `< >` and `[ ]`.
 
 use std::path::Path;
 
 use crate::ast::{
     method_doc, method_line, scheme_string, type_string, Ctor, Data, Def, Item, Module, Place,
-    Scheme, Stack, StackEffect, StackTail, Synonym, Type,
+    Probe, Scheme, Stack, StackEffect, StackTail, Synonym, Type,
 };
 use crate::build::{load_surface, stack_sites};
 use crate::builtin;
@@ -164,7 +164,7 @@ fn gap_hover(source: &str, module: &Module, offset: u32, sites: &[StackAt]) -> O
         let text = stack_at_gap(&place_sites, offset)?;
         return Some(blocks(&[text]));
     }
-    let def = module.items.iter().find_map(|item| match item {
+    if let Some(def) = module.items.iter().find_map(|item| match item {
         Item::Def(def)
             if (!def.body.is_empty() || !def.clauses.is_empty())
                 && def.span.start <= offset
@@ -173,17 +173,49 @@ fn gap_hover(source: &str, module: &Module, offset: u32, sites: &[StackAt]) -> O
             Some(def)
         }
         _ => None,
-    })?;
-    let (window_start, window_end) = body_window(source, def)?;
-    if offset < window_start || offset > window_end {
-        return None;
+    }) {
+        let (window_start, window_end) = body_window(source, def)?;
+        if offset < window_start || offset > window_end {
+            return None;
+        }
+        let def_sites: Vec<&StackAt> = sites
+            .iter()
+            .filter(|site| def.span.start <= site.span.start && site.span.end <= def.span.end)
+            .collect();
+        let text = stack_at_gap(&def_sites, offset)?;
+        return Some(blocks(&[text]));
     }
-    let def_sites: Vec<&StackAt> = sites
-        .iter()
-        .filter(|site| def.span.start <= site.span.start && site.span.end <= def.span.end)
-        .collect();
-    let text = stack_at_gap(&def_sites, offset)?;
+    let probe = module.items.iter().find_map(|item| match item {
+        Item::Probe(probe) if covers(probe.span, offset) => Some(probe),
+        _ => None,
+    })?;
+    let text = probe_gap(probe, offset, sites)?;
     Some(blocks(&[text]))
+}
+
+/// The picture and the program are separate windows. A nested array stays in
+/// the picture, and a nested quotation stays in the program.
+fn probe_gap(probe: &Probe, offset: u32, sites: &[StackAt]) -> Option<String> {
+    let window = if covers(probe.picture_span, offset) {
+        probe.picture_span
+    } else if covers(probe.body_span, offset) {
+        probe.body_span
+    } else {
+        return None;
+    };
+    let window_sites: Vec<&StackAt> = sites
+        .iter()
+        .filter(|site| window.start <= site.span.start && site.span.end <= window.end)
+        .collect();
+    match stack_at_gap(&window_sites, offset) {
+        Some(text) => Some(text),
+        None if window_sites.is_empty() => Some(".".to_string()),
+        None => None,
+    }
+}
+
+fn covers(span: Span, offset: u32) -> bool {
+    span.start <= offset && offset < span.end
 }
 
 fn body_window(source: &str, def: &Def) -> Option<(u32, u32)> {
@@ -719,6 +751,76 @@ mod tests {
     }
 
     #[test]
+    fn hovers_the_stack_in_a_check() {
+        let source = "\
+: hold ( Int -- Int )
+  dup drop
+
+? \"one\" <
+  2n
+> [
+  1n hold
+]
+";
+        let picture = source.find("\n  2n").unwrap();
+        assert_eq!(gap_at(source, picture + 1), "```ply\n.\n```");
+        assert_eq!(
+            gap_at(source, source.find("2n").unwrap() + 2),
+            "```ply\n. Int\n```"
+        );
+        let program = source.find("1n hold").unwrap();
+        assert_eq!(gap_at(source, program - 1), "```ply\n.\n```");
+        assert_eq!(gap_at(source, program + 2), "```ply\n. Int\n```");
+        assert_eq!(
+            gap_at(source, program + "1n hold".len()),
+            "```ply\n. Int\n```"
+        );
+        let (line, character) = at_offset(source, program + "1n ".len());
+        let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert_eq!(
+            hovered.contents,
+            "```ply\n: hold ( Int -- Int )\n```\n\n```ply\n. Int -- . Int\n```"
+        );
+
+        let nested = "\
+? \"called\" <
+  1n
+> [
+  1n [ dup drop ] call
+]
+";
+        let dup = nested.rfind("dup").unwrap();
+        let (line, character) = at_offset(nested, dup);
+        let hovered = hover(nested, Path::new("M.ply"), line, character).unwrap();
+        assert_eq!(
+            hovered.contents,
+            "```ply\n: dup ( ..s a -- ..s a a )\n```\n\nCopies the top value. On `x y` the result is `x y y`.\n\n```ply\n. Int -- . Int Int\n```"
+        );
+        assert_eq!(gap_at(nested, dup + "dup".len()), "```ply\n. Int Int\n```");
+
+        let empty = "? \"empty\" <> [\n]\n";
+        assert_eq!(gap_at(empty, empty.find("<>").unwrap()), "```ply\n.\n```");
+        assert_eq!(
+            gap_at(empty, empty.find("[\n").unwrap() + 1),
+            "```ply\n.\n```"
+        );
+
+        let array = "\
+? \"rows\" <
+  < 1n 2n >
+> [
+  < 1n 2n >
+]
+";
+        let inside = array.find("1n 2n").unwrap() + "1n".len();
+        assert_eq!(gap_at(array, inside), "```ply\n. Int\n```");
+        let after = array.find("1n 2n").unwrap() + "1n 2n".len();
+        assert_eq!(gap_at(array, after), "```ply\n. Int Int\n```");
+        let picture_end = array.find(">\n>").unwrap() + 1;
+        assert_eq!(gap_at(array, picture_end), "```ply\n. (Array Int)\n```");
+    }
+
+    #[test]
     fn hovers_the_stack_in_the_gap() {
         let source = ": double ( Int -- Int )\n  dup drop\n";
         let between = at(source, "dup drop");
@@ -915,6 +1017,13 @@ mod tests {
             "{}",
             hovered.contents
         );
+    }
+
+    fn gap_at(source: &str, offset: usize) -> String {
+        let (line, character) = at_offset(source, offset);
+        hover(source, Path::new("M.ply"), line, character)
+            .unwrap_or_else(|| panic!("no hover at {offset}"))
+            .contents
     }
 
     fn at(source: &str, needle: &str) -> (u32, u32) {
