@@ -771,9 +771,9 @@ Fix: check the spelling. A local module is `Data/Maybe`. A package module is the
 
 `import cycle: A, B, A`
 
-The named modules import one another in a loop. Names in the message use dots where the path uses slashes.
+The named modules import one another in a loop that JavaScript would have to load. A word call, a constructed value, a place, or a re-exported value is such an edge. A type, a class, a synonym, a constructor used only as a pattern, or a name used only in `?` is not. Names in the message use dots where the path uses slashes.
 
-Fix: move the shared declarations so each import points one way.
+Fix: move the words those modules call so each JavaScript import points one way.
 
 ## PL0094
 

@@ -242,11 +242,62 @@ impl Session {
         }
     }
 
+    /// Unit ids this module's JavaScript imports: a referenced value, a
+    /// re-exported value, a place helper, or the module that defined an instance word.
+    pub(super) fn javascript_deps(&self, id: usize, anf: &AnfModule) -> Vec<usize> {
+        let referenced: HashSet<String> = referenced_words(anf).into_iter().collect();
+        let listed: HashSet<String> = self.units[id]
+            .module
+            .exports
+            .list()
+            .map(|list| list.names.iter().map(|item| item.name.clone()).collect())
+            .unwrap_or_default();
+        let closed = self.units[id].module.exports.list().is_none();
+        let mut found = Vec::new();
+        let mut seen = HashSet::new();
+        let mut push = |dep: usize| {
+            if dep != id && seen.insert(dep) {
+                found.push(dep);
+            }
+        };
+        for (import, dep) in self.units[id]
+            .module
+            .imports
+            .iter()
+            .zip(&self.units[id].deps)
+        {
+            for (_, local_name) in self.imported_values(*dep, import) {
+                let mentioned = referenced.contains(&local_name);
+                let reexport = !closed && listed.contains(&local_name) && !mentioned;
+                if mentioned || reexport {
+                    push(*dep);
+                }
+            }
+        }
+        let local = local_runtime_names(&self.units[id].module);
+        let mut extra: Vec<String> = referenced
+            .iter()
+            .filter(|name| !local.contains(*name))
+            .cloned()
+            .collect();
+        extra.sort();
+        extra.dedup();
+        for name in extra {
+            if let Some((home, _)) = self.place_helper(id, &name) {
+                push(home);
+            }
+            if let Some(home) = self.method_unit(&name, &anf.method_homes) {
+                push(home);
+            }
+        }
+        found
+    }
+
     /// Published JavaScript values of every unit.
     ///
-    /// `visit` has already rejected an import cycle, so a module's list does not
-    /// depend on the caller. One pass, dependencies first, keeps a facade from
-    /// walking the same module on every import path.
+    /// JavaScript edges are acyclic, so a module's list does not depend on the
+    /// caller. One pass, dependencies first, keeps a facade from walking the
+    /// same module on every import path.
     pub(super) fn fill_surfaces(&mut self) {
         self.surfaces = vec![Vec::new(); self.units.len()];
         for index in 0..self.topo.len() {

@@ -120,8 +120,16 @@ pub(crate) fn check_with_imports_key(
     with_checker(|checker| {
         checker.module_key = module_key.to_string();
         checker.check_probes = check_probes;
+        // Local arities first, so an imported class can name a type of this
+        // module. Classes of this module are registered before imported
+        // instances, so a `#` in the other file can see the class it implements.
+        checker.stage_local_types(module)?;
         for imported in imports {
             checker.import_resolved(imported.provider, imported.import, imported.known)?;
+        }
+        checker.register_local_classes(module)?;
+        for imported in imports {
+            checker.import_instances(imported.known)?;
         }
         checker.prepare(module)?;
         checker.check_ready(module)?;
@@ -160,10 +168,30 @@ pub(crate) fn check_and_note(
     with_checker(|checker| {
         checker.module_key = module_key.to_string();
         checker.check_probes = true;
+        if let Err(error) = checker.stage_local_types(module) {
+            return ImportNotes {
+                error: Some(error),
+                sites: Vec::new(),
+            };
+        }
         for imported in imports {
             if let Err(error) =
                 checker.import_resolved(imported.provider, imported.import, imported.known)
             {
+                return ImportNotes {
+                    error: Some(error),
+                    sites: Vec::new(),
+                };
+            }
+        }
+        if let Err(error) = checker.register_local_classes(module) {
+            return ImportNotes {
+                error: Some(error),
+                sites: Vec::new(),
+            };
+        }
+        for imported in imports {
+            if let Err(error) = checker.import_instances(imported.known) {
                 return ImportNotes {
                     error: Some(error),
                     sites: Vec::new(),
@@ -790,7 +818,11 @@ impl Checker {
                         self.type_arity.insert(data.name.clone(), data.params.len());
                     }
                 }
-                Item::Synonym(synonym) => self.register_synonym(synonym)?,
+                Item::Synonym(synonym) => {
+                    if !self.synonyms.contains_key(&synonym.name) {
+                        self.register_synonym(synonym)?;
+                    }
+                }
                 Item::Def(_)
                 | Item::Class(_)
                 | Item::Instance(_)
@@ -805,7 +837,11 @@ impl Checker {
                     self.defined_data.insert(data.name.clone());
                     self.install_data(data)?;
                 }
-                Item::Class(class) => self.register_class(class)?,
+                Item::Class(class) => {
+                    if !self.defined_classes.contains(&class.name) {
+                        self.register_class(class)?;
+                    }
+                }
                 Item::Def(def) => self.register_def(def)?,
                 Item::Place(place) => self.register_place(place)?,
                 Item::Synonym(_) | Item::Instance(_) | Item::Probe(_) => {}
@@ -1337,7 +1373,74 @@ impl Checker {
         for (remote, local) in import.bindings(&surface) {
             self.export_surface_name(origin, &remote, &local, &remote, import, known)?;
         }
-        self.import_instance_surface(origin, known)?;
+        Ok(())
+    }
+
+    /// Instances of `known`, after this module's classes exist.
+    /// A `#` in an imported file can implement a class declared here.
+    pub(crate) fn import_instances(&mut self, known: &[KnownModule]) -> Result<(), Diagnostic> {
+        let saved = std::mem::take(&mut self.extra_arity);
+        for known_module in known {
+            for item in &known_module.module.items {
+                match item {
+                    Item::Data(data) => {
+                        self.extra_arity
+                            .entry(data.name.clone())
+                            .or_insert(data.params.len());
+                    }
+                    Item::Synonym(synonym) => {
+                        self.extra_arity
+                            .entry(synonym.name.clone())
+                            .or_insert(synonym.params.len());
+                    }
+                    Item::Def(_)
+                    | Item::Class(_)
+                    | Item::Instance(_)
+                    | Item::Place(_)
+                    | Item::Probe(_) => {}
+                }
+            }
+        }
+        let origin = known
+            .first()
+            .map(|known_module| known_module.origin.as_str())
+            .unwrap_or("");
+        let result = self.import_instance_surface(origin, known);
+        self.extra_arity = saved;
+        result
+    }
+
+    /// Arity of every type and synonym in this file, before imports.
+    /// An imported class scheme can name one of them.
+    fn stage_local_types(&mut self, module: &Module) -> Result<(), Diagnostic> {
+        for item in &module.items {
+            match item {
+                Item::Data(data) => {
+                    if !self.builtin_types.contains(&data.name) {
+                        self.type_arity.insert(data.name.clone(), data.params.len());
+                    }
+                }
+                Item::Synonym(synonym) => {
+                    if !self.synonyms.contains_key(&synonym.name) {
+                        self.register_synonym(synonym)?;
+                    }
+                }
+                Item::Def(_)
+                | Item::Class(_)
+                | Item::Instance(_)
+                | Item::Place(_)
+                | Item::Probe(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn register_local_classes(&mut self, module: &Module) -> Result<(), Diagnostic> {
+        for item in &module.items {
+            if let Item::Class(class) = item {
+                self.register_class(class)?;
+            }
+        }
         Ok(())
     }
 

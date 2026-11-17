@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::ast::{Exports, Item, Module};
+use crate::ast::{Exports, Item, Module, Term, TermNode};
 use crate::check::{
     check_and_note, check_with_imports_key, collect_sites, collect_sites_with_imports_key,
     module_notes, KnownModule, ResolvedImport, StackAt,
@@ -110,7 +110,16 @@ struct Unit {
     module_path: Option<String>,
     kind: Kind,
     color: Color,
+    /// One entry per `~`, including a type or a class. Header generation zips
+    /// this with the import list.
     deps: Vec<usize>,
+    /// Parallel to `deps`. True when the import is a JavaScript edge: a word
+    /// call, a constructed value, a place, or a re-exported value.
+    value_edge: Vec<bool>,
+    /// True once `deps` has been filled. A cycle stops the walk from re-entering.
+    linked: bool,
+    /// JavaScript modules this unit imports. Filled after check.
+    js_deps: Vec<usize>,
     /// A deleted file stays in the vector so later units keep their ids.
     live: bool,
 }
@@ -121,6 +130,9 @@ struct UnitSnap {
     module: Module,
     module_path: Option<String>,
     deps: Vec<usize>,
+    value_edge: Vec<bool>,
+    linked: bool,
+    js_deps: Vec<usize>,
     color: Color,
     surface: Vec<String>,
 }
@@ -547,7 +559,8 @@ pub(crate) fn compile_checks(
             file.display()
         )));
     };
-    session.visit(id, &mut Vec::new())?;
+    session.link_unit(id)?;
+    session.order_from(id)?;
     session.fill_surfaces();
     let order = session.topo.clone();
     let mut js = String::new();
@@ -571,6 +584,7 @@ pub(crate) fn compile_checks(
             }
         }
     }
+    session.reject_js_cycles()?;
     Ok((js, plans))
 }
 
@@ -699,7 +713,7 @@ pub fn buffer_notes_open(path: &Path, source: &str, open: &[(&Path, &str)]) -> B
         touched: Vec::new(),
     };
     doc.push_buffer(path, module.clone());
-    if let Err(error) = doc.visit(0, &mut Vec::new(), None) {
+    if let Err(error) = doc.visit(0, None) {
         return BufferNotes {
             error: entry_error.or(Some(error)),
             sites: collect_sites(&module),
@@ -876,16 +890,14 @@ fn source_beside_interface(root: &Path, manifest: &Value, file: &Path) -> Option
 
 impl Session {
     fn check_all(&mut self) -> Result<(), BuildError> {
-        let ids: Vec<usize> = (0..self.units.len()).collect();
-        for id in ids {
-            self.visit(id, &mut Vec::new())?;
-        }
+        self.link_live()?;
+        self.order_live()?;
         self.fill_surfaces();
         let order = self.topo.clone();
         for id in order {
             self.check_unit(id)?;
         }
-        Ok(())
+        self.reject_js_cycles()
     }
 
     /// `plylang compile` writes one page. `ply.entry` names its module.
@@ -1007,32 +1019,34 @@ impl Session {
 
     fn relink_and_check(&mut self, id: usize) -> Result<bool, BuildError> {
         self.units[id].module = self.units[id].parsed.clone();
-        self.units[id].deps.clear();
         self.relink(id)?;
-        self.units[id].color = Color::Gray;
-        self.link_deps(id)?;
-        self.units[id].color = Color::Black;
+        self.fill_missing_surfaces(id);
         self.refresh_surface(id);
+        self.units[id].color = Color::Black;
         self.check_unit(id)?;
+        self.reject_js_cycles()?;
         self.commit_latest(true)
     }
 
     fn relink(&mut self, id: usize) -> Result<(), BuildError> {
         self.units[id].deps.clear();
-        let count = self.units[id].module.imports.len();
-        for index in 0..count {
-            let path = self.units[id].module.imports[index].path.clone();
-            let span = self.units[id].module.imports[index].span;
-            let target = self.resolve(id, &path, span)?;
-            if target == id || self.reaches(target, id) {
-                return Err(self.fail(id, span, self.cycle_from(id, target)));
+        self.units[id].value_edge.clear();
+        self.units[id].js_deps.clear();
+        self.units[id].linked = false;
+        self.link_unit(id)?;
+        let mut reach = HashSet::new();
+        let mut pending = vec![id];
+        while let Some(current) = pending.pop() {
+            if !reach.insert(current) {
+                continue;
             }
-            self.units[id].deps.push(target);
+            pending.extend(self.units[current].deps.iter().copied());
         }
-        Ok(())
+        self.reject_value_cycles(&reach)
     }
 
-    fn reaches(&self, from: usize, goal: usize) -> bool {
+    /// `from` can reach `goal` by any import, including a type or a class.
+    fn name_reaches(&self, from: usize, goal: usize) -> bool {
         let mut seen = HashSet::new();
         let mut stack = vec![from];
         while let Some(id) = stack.pop() {
@@ -1047,62 +1061,50 @@ impl Session {
         false
     }
 
-    fn cycle_from(&self, id: usize, target: usize) -> Error {
-        let mut stack = vec![id];
-        if target != id {
-            stack.push(target);
-            let mut cursor = target;
-            let mut guard = 0;
-            while cursor != id && guard < self.units.len() {
-                guard += 1;
-                let Some(next) = self.units[cursor]
-                    .deps
-                    .iter()
-                    .copied()
-                    .find(|dep| *dep == id || self.reaches(*dep, id))
-                else {
-                    break;
-                };
-                if next == id {
-                    break;
-                }
-                stack.push(next);
-                cursor = next;
-            }
-        }
-        cycle_message(&self.units, &stack, id)
+    fn value_deps(&self, id: usize) -> Vec<usize> {
+        self.units[id]
+            .deps
+            .iter()
+            .copied()
+            .zip(self.units[id].value_edge.iter().copied())
+            .filter_map(|(dep, value)| value.then_some(dep))
+            .collect()
     }
 
-    /// Units loaded while relinking may still be white. Visit them so their
-    /// surfaces exist before the saved module is checked. The saved module is
-    /// gray for this walk, which makes a cycle back to it visible.
-    fn link_deps(&mut self, id: usize) -> Result<(), BuildError> {
-        let mut pending = self.units[id].deps.clone();
-        let mut seen = HashSet::new();
-        while let Some(dep) = pending.pop() {
-            if !seen.insert(dep) {
-                continue;
-            }
-            if self.units[dep].color == Color::White {
-                self.visit(dep, &mut Vec::new())?;
-            }
-            pending.extend(self.units[dep].deps.iter().copied());
-        }
+    /// Surfaces of modules loaded while relinking. A module that already has
+    /// one keeps it. Value dependencies are filled first.
+    fn fill_missing_surfaces(&mut self, id: usize) {
         if self.surfaces.len() < self.units.len() {
             self.surfaces.resize(self.units.len(), Vec::new());
         }
-        let order = self.topo.clone();
-        for unit in order {
-            if unit == id {
-                continue;
-            }
-            let missing = self.surfaces.get(unit).is_none_or(Vec::is_empty);
+        let order = self.value_surface_order(id);
+        for dep in order {
+            let missing = self.surfaces.get(dep).is_none_or(Vec::is_empty);
             if missing {
-                let surface = self.surface_of(unit);
-                self.surfaces[unit] = surface;
+                let surface = self.surface_of(dep);
+                self.surfaces[dep] = surface;
             }
         }
-        Ok(())
+    }
+
+    /// Value-dependency order of every module `id` imports, `id` itself left out.
+    fn value_surface_order(&self, id: usize) -> Vec<usize> {
+        let mut order = Vec::new();
+        let mut seen = HashSet::from([id]);
+        for root in self.units[id].deps.clone() {
+            self.push_value_order(root, &mut seen, &mut order);
+        }
+        order
+    }
+
+    fn push_value_order(&self, id: usize, seen: &mut HashSet<usize>, order: &mut Vec<usize>) {
+        if !seen.insert(id) {
+            return;
+        }
+        for dep in self.value_deps(id) {
+            self.push_value_order(dep, seen, order);
+        }
+        order.push(id);
     }
 
     fn refresh_surface(&mut self, id: usize) {
@@ -1250,6 +1252,9 @@ impl Session {
             kind: Kind::Local,
             color: Color::White,
             deps: Vec::new(),
+            value_edge: Vec::new(),
+            linked: false,
+            js_deps: Vec::new(),
             live: true,
         });
         if self.surfaces.len() < self.units.len() {
@@ -1275,6 +1280,9 @@ impl Session {
         }
         self.units[id].live = false;
         self.units[id].deps.clear();
+        self.units[id].value_edge.clear();
+        self.units[id].js_deps.clear();
+        self.units[id].linked = false;
         for importer in importers {
             self.recheck_one(importer)?;
         }
@@ -1343,6 +1351,9 @@ impl Session {
             module: unit.module.clone(),
             module_path: unit.module_path.clone(),
             deps: unit.deps.clone(),
+            value_edge: unit.value_edge.clone(),
+            linked: unit.linked,
+            js_deps: unit.js_deps.clone(),
             color: unit.color,
             surface: self.surfaces.get(id).cloned().unwrap_or_default(),
         }
@@ -1355,6 +1366,9 @@ impl Session {
         unit.module = snap.module;
         unit.module_path = snap.module_path;
         unit.deps = snap.deps;
+        unit.value_edge = snap.value_edge;
+        unit.linked = snap.linked;
+        unit.js_deps = snap.js_deps;
         unit.color = snap.color;
         if self.surfaces.len() <= id {
             self.surfaces.resize(id + 1, Vec::new());
@@ -1367,18 +1381,23 @@ impl Session {
             if self.units[id].color != Color::Black {
                 self.units[id].color = Color::White;
                 self.units[id].deps.clear();
+                self.units[id].value_edge.clear();
+                self.units[id].js_deps.clear();
+                self.units[id].linked = false;
             }
         }
     }
 
     /// Check one local module and the imports it reaches, then return its JavaScript.
     fn emit_one(&mut self, id: usize) -> Result<String, BuildError> {
-        self.visit(id, &mut Vec::new())?;
+        self.link_unit(id)?;
+        self.order_from(id)?;
         self.fill_surfaces();
         let order = self.topo.clone();
         for unit in order {
             self.check_unit(unit)?;
         }
+        self.reject_js_cycles()?;
         let module_path = self.units[id].module_path.clone().expect("local module");
         let js_path = self.package.out.join(module_path).with_extension("js");
         Ok(self
@@ -1427,32 +1446,180 @@ impl Session {
                 kind: Kind::Local,
                 color: Color::White,
                 deps: Vec::new(),
+                value_edge: Vec::new(),
+                linked: false,
+                js_deps: Vec::new(),
                 live: true,
             });
         }
         Ok(())
     }
 
-    fn visit(&mut self, id: usize, stack: &mut Vec<usize>) -> Result<(), BuildError> {
-        if self.units[id].color != Color::White {
-            return Ok(());
-        }
-        self.units[id].color = Color::Gray;
-        stack.push(id);
-        let count = self.units[id].module.imports.len();
-        for index in 0..count {
-            let path = self.units[id].module.imports[index].path.clone();
-            let span = self.units[id].module.imports[index].span;
-            let target = self.resolve(id, &path, span)?;
-            if self.units[target].color == Color::Gray {
-                return Err(self.fail(id, span, cycle_message(&self.units, stack, target)));
+    fn link_live(&mut self) -> Result<(), BuildError> {
+        let mut index = 0;
+        while index < self.units.len() {
+            if self.units[index].live {
+                self.link_unit(index)?;
             }
-            self.units[id].deps.push(target);
-            self.visit(target, stack)?;
+            index += 1;
+        }
+        Ok(())
+    }
+
+    fn order_live(&mut self) -> Result<(), BuildError> {
+        let reach: HashSet<usize> = (0..self.units.len())
+            .filter(|id| self.units[*id].live)
+            .collect();
+        self.order_ids(&reach)
+    }
+
+    fn order_from(&mut self, root: usize) -> Result<(), BuildError> {
+        let mut reach = HashSet::new();
+        let mut pending = vec![root];
+        while let Some(id) = pending.pop() {
+            if !self.units[id].live || !reach.insert(id) {
+                continue;
+            }
+            pending.extend(self.units[id].deps.iter().copied());
+        }
+        self.order_ids(&reach)
+    }
+
+    /// Check order: JavaScript dependencies first, then a one-way type or class
+    /// import whose target cannot import this module back. A mutual name cycle
+    /// stays unordered so each side reads the other's parse.
+    fn order_ids(&mut self, reach: &HashSet<usize>) -> Result<(), BuildError> {
+        self.reject_value_cycles(reach)?;
+        let mut edges = vec![Vec::new(); self.units.len()];
+        for id in reach.iter().copied() {
+            for (index, dep) in self.units[id].deps.iter().copied().enumerate() {
+                let value = self.units[id]
+                    .value_edge
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false);
+                if value || !self.name_reaches(dep, id) {
+                    edges[id].push(dep);
+                }
+            }
+        }
+        let mut color = vec![Color::White; self.units.len()];
+        self.topo.clear();
+        for id in 0..self.units.len() {
+            if reach.contains(&id) {
+                self.topo_visit(id, &edges, &mut color)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn reject_value_cycles(&self, reach: &HashSet<usize>) -> Result<(), BuildError> {
+        let mut color = vec![Color::White; self.units.len()];
+        for id in 0..self.units.len() {
+            if reach.contains(&id) {
+                self.walk_value(id, &mut color, &mut Vec::new())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn walk_value(
+        &self,
+        id: usize,
+        color: &mut [Color],
+        stack: &mut Vec<usize>,
+    ) -> Result<(), BuildError> {
+        match color[id] {
+            Color::Black => return Ok(()),
+            Color::Gray => return Ok(()),
+            Color::White => {}
+        }
+        color[id] = Color::Gray;
+        stack.push(id);
+        for (index, dep) in self.units[id].deps.iter().copied().enumerate() {
+            let value = self.units[id]
+                .value_edge
+                .get(index)
+                .copied()
+                .unwrap_or(false);
+            if !value {
+                continue;
+            }
+            if color[dep] == Color::Gray {
+                let span = self.units[id].module.imports[index].span;
+                return Err(self.fail(id, span, cycle_message(&self.units, stack, dep)));
+            }
+            self.walk_value(dep, color, stack)?;
         }
         stack.pop();
-        self.units[id].color = Color::Black;
+        color[id] = Color::Black;
+        Ok(())
+    }
+
+    fn topo_visit(
+        &mut self,
+        id: usize,
+        edges: &[Vec<usize>],
+        color: &mut [Color],
+    ) -> Result<(), BuildError> {
+        match color[id] {
+            Color::Black => return Ok(()),
+            Color::Gray => {
+                return Err(self.fail(
+                    id,
+                    self.units[id].module.span,
+                    cycle_message(&self.units, &[id], id),
+                ));
+            }
+            Color::White => {}
+        }
+        color[id] = Color::Gray;
+        let deps = edges[id].clone();
+        for dep in deps {
+            if color[dep] == Color::Gray {
+                let span = self
+                    .units[id]
+                    .module
+                    .imports
+                    .iter()
+                    .zip(self.units[id].deps.iter())
+                    .find(|(_, target)| **target == dep)
+                    .map(|(import, _)| import.span)
+                    .unwrap_or(self.units[id].module.span);
+                return Err(self.fail(id, span, cycle_message(&self.units, &[id, dep], id)));
+            }
+            self.topo_visit(dep, edges, color)?;
+        }
+        color[id] = Color::Black;
         self.topo.push(id);
+        Ok(())
+    }
+
+    /// Resolve every import. A type or a class edge is recorded and is not a cycle.
+    /// A module that imports itself is a cycle. `linked` stops a name cycle from looping.
+    fn link_unit(&mut self, id: usize) -> Result<(), BuildError> {
+        if !self.units[id].live || self.units[id].linked {
+            return Ok(());
+        }
+        self.units[id].linked = true;
+        let module = self.units[id].module.clone();
+        let used = runtime_words(&module);
+        let exported = export_name_set(&module);
+        for import in &module.imports {
+            let target = self.resolve(id, &import.path, import.span)?;
+            if target == id {
+                return Err(self.fail(
+                    id,
+                    import.span,
+                    cycle_message(&self.units, &[id], id),
+                ));
+            }
+            let value =
+                import_carries_value(&used, &exported, import, &self.units[target].module);
+            self.units[id].deps.push(target);
+            self.units[id].value_edge.push(value);
+            self.link_unit(target)?;
+        }
         Ok(())
     }
 
@@ -1583,6 +1750,9 @@ impl Session {
             kind: Kind::External,
             color: Color::White,
             deps: Vec::new(),
+            value_edge: Vec::new(),
+            linked: false,
+            js_deps: Vec::new(),
             live: true,
         });
         Ok(id)
@@ -1613,7 +1783,9 @@ impl Session {
         for index in 0..import_count {
             let dep = self.units[id].deps[index];
             providers.push(self.units[dep].module.clone());
-            knowns.push(self.closure(dep));
+            // Leave this module out. Its types are staged locally, and pulling
+            // it back would install its data and its instances twice.
+            knowns.push(self.closure_without(dep, Some(id)));
             imports.push(self.units[id].module.imports[index].clone());
         }
         let resolved: Vec<ResolvedImport<'_>> = (0..import_count)
@@ -1633,6 +1805,7 @@ impl Session {
         );
         let checked = check_with_imports_key(&module, &resolved, &key, self.check_probes)
             .map_err(|error| self.fail_diagnostic(id, error))?;
+        self.units[id].js_deps = self.javascript_deps(id, &checked.anf);
         if self.units[id].kind == Kind::External {
             return Ok(());
         }
@@ -1680,20 +1853,63 @@ impl Session {
         Ok(())
     }
 
-    fn closure(&self, id: usize) -> Vec<KnownModule> {
+    fn closure_without(&self, id: usize, skip: Option<usize>) -> Vec<KnownModule> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         let mut pending = vec![id];
-        while let Some(id) = pending.pop() {
-            if !seen.insert(id) {
+        while let Some(current) = pending.pop() {
+            if skip == Some(current) || !seen.insert(current) {
                 continue;
             }
-            out.push(known_at(&self.units, id));
-            for dep in &self.units[id].deps {
+            out.push(known_at(&self.units, current));
+            for dep in &self.units[current].deps {
                 pending.push(*dep);
             }
         }
         out
+    }
+
+    fn reject_js_cycles(&self) -> Result<(), BuildError> {
+        let mut color = vec![Color::White; self.units.len()];
+        for id in 0..self.units.len() {
+            if self.units[id].live {
+                self.walk_js(id, &mut color, &mut Vec::new())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn walk_js(
+        &self,
+        id: usize,
+        color: &mut [Color],
+        stack: &mut Vec<usize>,
+    ) -> Result<(), BuildError> {
+        match color[id] {
+            Color::Black => return Ok(()),
+            Color::Gray => return Ok(()),
+            Color::White => {}
+        }
+        color[id] = Color::Gray;
+        stack.push(id);
+        for dep in self.units[id].js_deps.clone() {
+            if color[dep] == Color::Gray {
+                let span = self
+                    .units[id]
+                    .module
+                    .imports
+                    .iter()
+                    .zip(self.units[id].deps.iter())
+                    .find(|(_, target)| **target == dep)
+                    .map(|(import, _)| import.span)
+                    .unwrap_or(self.units[id].module.span);
+                return Err(self.fail(id, span, cycle_message(&self.units, stack, dep)));
+            }
+            self.walk_js(dep, color, stack)?;
+        }
+        stack.pop();
+        color[id] = Color::Black;
+        Ok(())
     }
 
     fn check_foreign(&self, id: usize, arities: &[(String, usize)]) -> Result<(), BuildError> {
@@ -1776,8 +1992,9 @@ struct DocUnit {
     module_path: Option<String>,
     /// `Data.Num` from the path, or the file name for a package outside this one.
     label: String,
-    color: Color,
     deps: Vec<usize>,
+    value_edge: Vec<bool>,
+    linked: bool,
 }
 
 struct OpenDoc<'a> {
@@ -1825,38 +2042,111 @@ impl<'a> OpenDoc<'a> {
             package_root,
             module_path,
             label,
-            color: Color::White,
             deps: Vec::new(),
+            value_edge: Vec::new(),
+            linked: false,
         });
         id
     }
 
-    fn visit(
-        &mut self,
-        id: usize,
-        stack: &mut Vec<usize>,
-        blame: Option<Span>,
-    ) -> Result<(), Diagnostic> {
-        if self.units[id].color != Color::White {
+    /// Load the import graph. A JavaScript edge that returns to a module already
+    /// on the stack is a cycle. A type or a class edge is recorded either way.
+    fn visit(&mut self, id: usize, blame: Option<Span>) -> Result<(), Diagnostic> {
+        self.link_doc(id, blame)?;
+        let mut color = vec![Color::White; self.units.len()];
+        for current in 0..self.units.len() {
+            self.walk_doc_value(current, &mut color, &mut Vec::new())?;
+        }
+        Ok(())
+    }
+
+    fn link_doc(&mut self, id: usize, blame: Option<Span>) -> Result<(), Diagnostic> {
+        if self.units[id].linked {
             return Ok(());
         }
-        self.units[id].color = Color::Gray;
-        stack.push(id);
-        let count = self.units[id].module.imports.len();
-        for index in 0..count {
-            let path = self.units[id].module.imports[index].path.clone();
-            let span = self.units[id].module.imports[index].span;
-            let here = if id == 0 { span } else { blame.unwrap_or(span) };
-            let target = self.resolve(id, &path, here)?;
-            if self.units[target].color == Color::Gray {
-                return Err(Diagnostic::new(here, doc_cycle(&self.units, stack, target)));
+        self.units[id].linked = true;
+        let module = self.units[id].module.clone();
+        let used = runtime_words(&module);
+        let exported = export_name_set(&module);
+        for import in &module.imports {
+            let here = if id == 0 {
+                import.span
+            } else {
+                blame.unwrap_or(import.span)
+            };
+            let target = self.resolve(id, &import.path, here)?;
+            if target == id {
+                return Err(Diagnostic::new(here, doc_cycle(&self.units, &[id], id)));
             }
+            let value = import_carries_value(&used, &exported, import, &self.units[target].module);
             self.units[id].deps.push(target);
-            self.visit(target, stack, Some(here))?;
+            self.units[id].value_edge.push(value);
+            self.link_doc(target, Some(here))?;
+        }
+        Ok(())
+    }
+
+    fn walk_doc_value(
+        &self,
+        id: usize,
+        color: &mut [Color],
+        stack: &mut Vec<usize>,
+    ) -> Result<(), Diagnostic> {
+        match color[id] {
+            Color::Black => return Ok(()),
+            Color::Gray => return Ok(()),
+            Color::White => {}
+        }
+        color[id] = Color::Gray;
+        stack.push(id);
+        for (index, dep) in self.units[id].deps.iter().copied().enumerate() {
+            let value = self.units[id]
+                .value_edge
+                .get(index)
+                .copied()
+                .unwrap_or(false);
+            if !value {
+                continue;
+            }
+            if color[dep] == Color::Gray {
+                let here = if id == 0 {
+                    self.units[id].module.imports[index].span
+                } else {
+                    self.buffer_import_span(id)
+                };
+                return Err(Diagnostic::new(here, doc_cycle(&self.units, stack, dep)));
+            }
+            self.walk_doc_value(dep, color, stack)?;
         }
         stack.pop();
-        self.units[id].color = Color::Black;
+        color[id] = Color::Black;
         Ok(())
+    }
+
+    /// Span of the buffer import that reaches `id`, so a cycle below the buffer
+    /// is reported on the import the editor can see.
+    fn buffer_import_span(&self, id: usize) -> Span {
+        for (index, dep) in self.units[0].deps.iter().copied().enumerate() {
+            if dep == id || self.doc_reaches(dep, id) {
+                return self.units[0].module.imports[index].span;
+            }
+        }
+        self.units[0].module.span
+    }
+
+    fn doc_reaches(&self, from: usize, goal: usize) -> bool {
+        let mut seen = HashSet::new();
+        let mut stack = vec![from];
+        while let Some(id) = stack.pop() {
+            if id == goal {
+                return true;
+            }
+            if !seen.insert(id) {
+                continue;
+            }
+            stack.extend(self.units[id].deps.iter().copied());
+        }
+        false
     }
 
     fn resolve(&mut self, from: usize, import_path: &str, span: Span) -> Result<usize, Diagnostic> {
@@ -2032,7 +2322,7 @@ impl<'a> OpenDoc<'a> {
         for index in 0..import_count {
             let dep = self.units[0].deps[index];
             providers.push(self.units[dep].module.clone());
-            knowns.push(self.closure(dep));
+            knowns.push(self.closure_without(dep, Some(0)));
             imports.push(self.units[0].module.imports[index].clone());
         }
         let resolved: Vec<ResolvedImport<'_>> = (0..import_count)
@@ -2085,7 +2375,7 @@ impl<'a> OpenDoc<'a> {
         for index in 0..import_count {
             let dep = self.units[0].deps[index];
             providers.push(self.units[dep].module.clone());
-            knowns.push(self.closure(dep));
+            knowns.push(self.closure_without(dep, Some(0)));
             imports.push(self.units[0].module.imports[index].clone());
         }
         let resolved: Vec<ResolvedImport<'_>> = (0..import_count)
@@ -2107,16 +2397,16 @@ impl<'a> OpenDoc<'a> {
         }
     }
 
-    fn closure(&self, id: usize) -> Vec<KnownModule> {
+    fn closure_without(&self, id: usize, skip: Option<usize>) -> Vec<KnownModule> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         let mut pending = vec![id];
-        while let Some(id) = pending.pop() {
-            if !seen.insert(id) {
+        while let Some(current) = pending.pop() {
+            if skip == Some(current) || !seen.insert(current) {
                 continue;
             }
-            out.push(known_at(&self.units, id));
-            for dep in &self.units[id].deps {
+            out.push(known_at(&self.units, current));
+            for dep in &self.units[current].deps {
                 pending.push(*dep);
             }
         }
@@ -2669,6 +2959,147 @@ fn package_rel(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .map(|rel| rel.to_string_lossy().replace('\\', "/"))
         .unwrap_or_default()
+}
+
+/// A bound name is a JavaScript edge when this module calls it, builds it,
+/// reads or writes it as a place, or publishes it again. A type, a class, a
+/// method, a pattern, and a `?` check are not.
+fn import_carries_value(
+    used: &HashSet<String>,
+    exported: &HashSet<String>,
+    import: &crate::ast::Import,
+    target: &Module,
+) -> bool {
+    if let Some(alias) = &import.alias {
+        let prefix = format!("{alias}:");
+        for remote in published_names(target) {
+            let local = format!("{prefix}{remote}");
+            if name_is_value(&local, used, exported, bound_kind(target, &remote)) {
+                return true;
+            }
+        }
+        for word in used {
+            if let Some(remote) = word.strip_prefix(&prefix) {
+                if !published_names(target).iter().any(|name| name == remote)
+                    && name_is_value(word, used, exported, BoundKind::Unknown)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    for name in &import.names {
+        if name_is_value(
+            &name.local,
+            used,
+            exported,
+            bound_kind(target, &name.remote),
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+fn name_is_value(
+    local: &str,
+    used: &HashSet<String>,
+    exported: &HashSet<String>,
+    kind: BoundKind,
+) -> bool {
+    if !used.contains(local) && !exported.contains(local) {
+        return false;
+    }
+    matches!(kind, BoundKind::Value | BoundKind::Unknown)
+}
+
+enum BoundKind {
+    Value,
+    TypeOnly,
+    Unknown,
+}
+
+fn bound_kind(module: &Module, name: &str) -> BoundKind {
+    for item in &module.items {
+        match item {
+            Item::Data(data) if data.ctors.iter().any(|ctor| ctor.name == name) => {
+                return BoundKind::Value;
+            }
+            Item::Def(def) if def.name == name => return BoundKind::Value,
+            Item::Place(place) if place.name == name => return BoundKind::Value,
+            _ => {}
+        }
+    }
+    for item in &module.items {
+        match item {
+            Item::Data(data) if data.name == name => return BoundKind::TypeOnly,
+            Item::Synonym(synonym) if synonym.name == name => return BoundKind::TypeOnly,
+            Item::Class(class)
+                if class.name == name
+                    || class.methods.iter().any(|method| method.name == name) =>
+            {
+                return BoundKind::TypeOnly;
+            }
+            _ => {}
+        }
+    }
+    BoundKind::Unknown
+}
+
+fn published_names(module: &Module) -> Vec<String> {
+    module
+        .exports
+        .list()
+        .map(|list| list.names.iter().map(|item| item.name.clone()).collect())
+        .unwrap_or_default()
+}
+
+fn export_name_set(module: &Module) -> HashSet<String> {
+    published_names(module).into_iter().collect()
+}
+
+/// Words, place writes, and place frames outside `?`. Patterns are not walked.
+fn runtime_words(module: &Module) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for item in &module.items {
+        match item {
+            Item::Def(def) => {
+                collect_runtime(&def.body, &mut names);
+                for clause in &def.clauses {
+                    collect_runtime(&clause.body, &mut names);
+                }
+            }
+            Item::Place(place) => collect_runtime(&place.body, &mut names),
+            Item::Data(_)
+            | Item::Synonym(_)
+            | Item::Class(_)
+            | Item::Instance(_)
+            | Item::Probe(_) => {}
+        }
+    }
+    names
+}
+
+fn collect_runtime(terms: &[Term], names: &mut HashSet<String>) {
+    for term in terms {
+        match &term.node {
+            TermNode::Word(name) | TermNode::PlaceSet(name) | TermNode::PlaceBind(name) => {
+                names.insert(name.clone());
+            }
+            TermNode::Quote(body) | TermNode::Array(body) => collect_runtime(body, names),
+            TermNode::Record(fields) => {
+                for (_, term) in fields {
+                    collect_runtime(std::slice::from_ref(term), names);
+                }
+            }
+            TermNode::Lit(_)
+            | TermNode::Field(_)
+            | TermNode::FieldSet(_)
+            | TermNode::FieldInsert(_)
+            | TermNode::Bind(_) => {}
+        }
+    }
 }
 
 fn import_cycle(names: Vec<String>) -> Error {
@@ -3754,6 +4185,100 @@ mod tests {
         assert_eq!(
             error.message,
             "language version 2 is newer than this compiler (1)"
+        );
+    }
+
+    #[test]
+    fn type_pattern_and_check_imports_are_not_cycles() {
+        let types = Temp::new("type-cycle");
+        types.write(
+            "package.json",
+            &package_json(
+                r#"
+    "./Data/A": { "ply": "./dist/Data/A.d.ply", "import": "./dist/Data/A.js" },
+    "./Data/B": { "ply": "./dist/Data/B.d.ply", "import": "./dist/Data/B.js" }
+"#,
+            ),
+        );
+        types.write(
+            "src/Data/A.ply",
+            "@ A\n\n~ \"Data/B\" B\n\n; A = A\n\n: idA ( B -- B )\n  dup drop\n",
+        );
+        types.write(
+            "src/Data/B.ply",
+            "@ B\n\n~ \"Data/A\" A\n\n; B = B\n\n: idB ( A -- A )\n  dup drop\n",
+        );
+        build(&types.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let a_js = fs::read_to_string(types.0.join("dist/Data/A.js")).unwrap();
+        assert!(!a_js.contains("Data/B.js"), "{a_js}");
+
+        let patterns = Temp::new("pattern-cycle");
+        patterns.write(
+            "package.json",
+            &package_json(
+                r#"
+    "./Data/PatA": { "ply": "./dist/Data/PatA.d.ply", "import": "./dist/Data/PatA.js" },
+    "./Data/PatB": { "ply": "./dist/Data/PatB.d.ply", "import": "./dist/Data/PatB.js" }
+"#,
+            ),
+        );
+        patterns.write(
+            "src/Data/PatA.ply",
+            "@ use, Tok\n\n~ \"Data/PatB\" Leaf\n\n; Tok = Tok\n\n: use ( Leaf -- Int )\n  (Leaf ..) -> 1n\n",
+        );
+        patterns.write(
+            "src/Data/PatB.ply",
+            "@ Leaf, make\n\n~ \"Data/PatA\" Tok\n\n; Leaf = Leaf\n\n: make ( -- Tok )\n  Tok\n",
+        );
+        build(&patterns.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        let pat_a = fs::read_to_string(patterns.0.join("dist/Data/PatA.js")).unwrap();
+        let pat_b = fs::read_to_string(patterns.0.join("dist/Data/PatB.js")).unwrap();
+        assert!(!pat_a.contains("PatB.js"), "{pat_a}");
+        assert!(pat_b.contains("PatA.js"), "{pat_b}");
+
+        let checks = Temp::new("check-cycle");
+        checks.write(
+            "package.json",
+            &package_json(
+                r#"
+    "./Data/Pa": { "ply": "./dist/Data/Pa.d.ply", "import": "./dist/Data/Pa.js" },
+    "./Data/Pb": { "ply": "./dist/Data/Pb.d.ply", "import": "./dist/Data/Pb.js" }
+"#,
+            ),
+        );
+        checks.write(
+            "src/Data/Pa.ply",
+            "@ a\n\n~ \"Data/Pb\" b\n\n: a ( Int -- Int )\n  dup drop\n\n? \"calls b\" < 1n > [\n  1n b\n]\n",
+        );
+        checks.write(
+            "src/Data/Pb.ply",
+            "@ b\n\n~ \"Data/Pa\" a\n\n: b ( Int -- Int )\n  dup drop\n\n? \"calls a\" < 1n > [\n  1n a\n]\n",
+        );
+        check_package(&checks.0).unwrap_or_else(|error| panic!("{}", error.render()));
+        build(&checks.0).unwrap_or_else(|error| panic!("{}", error.render()));
+
+        let homes = Temp::new("method-home-cycle");
+        homes.write(
+            "package.json",
+            &package_json(
+                r#"
+    "./Data/HoldA": { "ply": "./dist/Data/HoldA.d.ply", "import": "./dist/Data/HoldA.js" },
+    "./Data/HoldB": { "ply": "./dist/Data/HoldB.d.ply", "import": "./dist/Data/HoldB.js" }
+"#,
+            ),
+        );
+        homes.write(
+            "src/Data/HoldA.ply",
+            "@ A, hold, fromA, useA\n\n~ \"Data/HoldB\" B\n\n& Hold a\n  hold ( a -- Int )\n\n# Hold A\n  hold = fromA\n\n; A = A\n\n: fromA ( A -- Int )\n  drop 1n\n\n: useA ( B -- Int )\n  hold\n",
+        );
+        homes.write(
+            "src/Data/HoldB.ply",
+            "@ B, fromB, useB\n\n~ \"Data/HoldA\" A, hold\n\n# Hold B\n  hold = fromB\n\n; B = B\n\n: fromB ( B -- Int )\n  drop 2n\n\n: useB ( A -- Int )\n  hold\n",
+        );
+        let error = build(&homes.0).unwrap_err();
+        assert_eq!(
+            error.message,
+            "import cycle: Data.HoldA, Data.HoldB, Data.HoldA"
         );
     }
 
