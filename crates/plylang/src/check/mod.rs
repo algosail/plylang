@@ -1862,7 +1862,7 @@ impl Checker {
         let checked = if def.clauses.is_empty() {
             self.check_terms(&def.body, input)
         } else {
-            self.check_clauses(def, input)
+            self.check_clauses(def, input, output)
         };
         self.locals.pop();
         let stack = match checked {
@@ -5935,11 +5935,11 @@ mod tests {
         );
         err(
             "; Option a = None | Some a\n\n: bad ( a. (Option a) -- a )\n  (Some (Array Num)) ->\n",
-            "type mismatch: expected a data type, found a",
+            "non-exhaustive match: None, Some",
         );
         err(
             "; Option a = None | Some a\n\n: bad ( a. (Option a) -- a )\n  (Some Array) ->\n",
-            "type mismatch: expected a data type, found a",
+            "non-exhaustive match: None, Some",
         );
         err(
             "; Response = Sent status : Num, body : Str | Failure code : Num, message : Str\n\n: bad ( Response -- Str )\n  [ body>> ] call\n",
@@ -5963,23 +5963,23 @@ mod tests {
 : normalizedItems ( (Option a) -- (Array Num) )
   (Some (Array Num) items) -> items
   (Some (Array Str) _) -> < 0 >
-  _ -> < >
+  _ -> drop < >
 
 : strings ( (Option a) -- (Array Str) )
   (Some (Array Str) text) -> text
-  _ -> < >
+  _ -> drop < >
 
 : amount ( (Option a) -- Num )
   (Some (Num) n) -> n
-  _ -> 0
+  _ -> drop 0
 
 : code ( (Option a) -- Int )
   (Some (Int) n) -> n
-  _ -> 0n
+  _ -> drop 0n
 
 : anyArray ( (Option a) -- Bool )
   (Some (Array _) _) -> true
-  _ -> false
+  _ -> drop false
 
 : take ( (Option (Array Num)) -- (Array Num) )
   (Some (Array Num) items) -> items
@@ -5988,7 +5988,7 @@ mod tests {
 : both ( (Option a) -- (Array Num) )
   (Some (Array Num) items) -> items
   (Some (Array Num) _) -> < >
-  _ -> < >
+  _ -> drop < >
 ");
         ok("\
 ; Option a = None | Some a
@@ -6001,7 +6001,7 @@ mod tests {
 
 : time ( (Option a) -- Num )
   (Some (Time) n) -> n
-  _ -> 0
+  _ -> drop 0
 ");
         ok("\
 ; Option a = None | Some a
@@ -6028,15 +6028,14 @@ mod tests {
             "pattern cannot test (Option Num)",
         );
         err(
-            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (StrMap Num) value) -> 0\n  _ -> 0\n",
+            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (StrMap Num) value) -> 0\n  _ -> drop 0\n",
             "pattern cannot test (StrMap Num)",
         );
-        err(
-            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Unit) value) -> 0\n  _ -> 0\n",
-            "pattern cannot test Unit",
+        ok(
+            "; Option a = None | Some a\n\n: unit ( (Option a) -- Num )\n  (Some (Unit) _) -> 0\n  _ -> drop 1\n",
         );
         err(
-            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Array) value) -> 0\n  _ -> 0\n",
+            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Array) value) -> 0\n  _ -> drop 0\n",
             "type constructor Array expects 1 argument",
         );
         err(
@@ -6058,15 +6057,15 @@ mod tests {
 
 : amount ( (Option a) -- Num )
   (Some (Num) ..) ->
-  _ -> 0
+  _ -> drop 0
 
 : items ( (Option a) -- (Array Num) )
   (Some (Array Num) ..) ->
-  _ -> < >
+  _ -> drop < >
 
 : halves ( a b. (Pair a b) -- Num Str )
   (Pair (Num) .. (Str) ..) ->
-  _ -> 0 \"\"
+  _ -> drop 0 \"\"
 
 : take ( (Option Num) -- Num )
   (Some (Num) ..) ->
@@ -6077,7 +6076,7 @@ mod tests {
 
 : checked ( (Option a) -- Num )
   (Some (Num) _) -> 1
-  _ -> 0
+  _ -> drop 0
 
 : plain ( a. a (Option a) -- a )
   spare (Some ..) -> spare drop
@@ -6100,17 +6099,128 @@ mod tests {
             "expected pattern",
         );
         err(
-            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Num) n ..) -> n\n  _ -> 0\n",
+            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Num) n ..) -> n\n  _ -> drop 0\n",
             "expected pattern",
         );
         err(
-            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Num) .. ..) ->\n  _ -> 0\n",
+            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Num) .. ..) ->\n  _ -> drop 0\n",
             "expected pattern",
         );
         err(
-            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Array (Num) ..) xs) -> 0\n  _ -> 0\n",
+            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Array (Num) ..) xs) -> 0\n  _ -> drop 0\n",
             "pattern cannot test that pattern",
         );
+    }
+
+    #[test]
+    fn a_shape_specializes_only_its_arm() {
+        ok("\
+: held ( a. a -- a )
+  Num ->
+  x -> x
+
+: fromNum ( -- Num )
+  1 held
+
+: fromStr ( -- Str )
+  \"hi\" held
+
+: foreign nadd ( Num Num -- Num )
+
+: sum ( a. a a -- a )
+  x Num -> x nadd
+  x y -> x
+
+: two ( -- Num )
+  1 2 sum
+
+: text ( -- Str )
+  \"a\" \"b\" sum
+");
+        ok("\
+; Option a = None | Some a
+
+: chosen ( a. a (Option a) -- a )
+  spare (Some (Num) n) -> n
+  spare (Some x) -> x
+  spare (None ..) -> spare
+
+: fromNum ( -- Num )
+  0 1 Some chosen
+
+: fromStr ( -- Str )
+  \"z\" \"hi\" Some chosen
+");
+        err(
+            "; Option a = None | Some a\n\n: bad ( a. a (Option a) -- a )\n  spare (Some (Num) n) -> n\n  spare (Some x) -> x\n  spare (None ..) -> 0\n",
+            "type mismatch: expected a, found Num",
+        );
+        ok("\
+& Foldable f
+  fold ( (f a) b (b a -- b) -- b )
+
+: foreign foldArray ( (Array a) b (b a -- b) -- b )
+: foreign size_array ( (Array a) -- Num )
+
+# Foldable Array
+  fold = foldArray
+
+: size ( Foldable f => (f a) -- Num )
+  Array -> size_array
+  _ -> 0 [ drop ] fold
+
+: counted ( (Array Num) -- Num )
+  size
+
+: take ( f a. (f a) -- (Array Num) )
+  (Array Num) ->
+  _ -> drop < >
+");
+        err(
+            "& Foldable f\n  fold ( (f a) b (b a -- b) -- b )\n\n: foreign foldArray ( (Array a) b (b a -- b) -- b )\n\n# Foldable Array\n  fold = foldArray\n\n: bad ( Foldable f => (f a) -- Num )\n  Array -> drop 0\n  _ -> fold\n",
+            "type mismatch: expected (.._ _ _ -- .._ _), found (f a)",
+        );
+        err(
+            "; Option a = None | Some a\n\n: bad ( a. (Option a) -- a )\n  Array ->\n  x -> x\n",
+            "type mismatch: expected (Option a), found (Array _)",
+        );
+        err(
+            ": bad ( a. (StrMap a) -- a )\n  StrMap ->\n  x -> x\n",
+            "type mismatch: expected a data type, found (StrMap a)",
+        );
+        ok("\
+: id ( Num -- Num )
+  1 -> 1
+  Num ->
+
+: flag ( Bool -- Bool )
+  Bool ->
+
+: nothing ( Unit -- Unit )
+  Unit ->
+
+: same ( (Array a) -- (Array a) )
+  Array ->
+");
+        err(
+            ": bad ( a. a -- a )\n  Num ->\n",
+            "non-exhaustive match: _",
+        );
+        err(
+            ": bad ( Num -- Num )\n  Num ->\n  _ -> drop 0\n",
+            "redundant pattern",
+        );
+        err(
+            ": foreign size_array ( (Array a) -- Num )\n\n: bad ( a. a -- Num )\n  (Array x) -> x\n  _ -> drop 0\n",
+            "undefined word x",
+        );
+        ok("\
+: foreign size_array ( (Array a) -- Num )
+
+: size ( a. a -- Num )
+  (Array _) -> size_array
+  _ -> drop 0
+");
     }
 
     #[test]
@@ -6246,6 +6356,16 @@ mod tests {
         let bigger = checker.stack_cons(tail, ty);
         let message = checker.unify_stack(tail, bigger).unwrap_err();
         assert_eq!(message.message(), "occurs check failed");
+    }
+
+    #[test]
+    fn a_wild_slot_leaves_the_value() {
+        ok(": kept ( a. a -- a )\n  Num ->\n  _ ->\n: fromNum ( -- Num )\n  1 kept\n: fromStr ( -- Str )\n  \"hi\" kept\n");
+        ok("; Option a = None | Some a\n: peek ( a. (Option a) -- Num )\n  (Some _) -> 0\n  (None ..) -> 1\n");
+        err(
+            ": bad ( a. a -- Num )\n  _ -> 0\n",
+            "type mismatch: expected .._, found a",
+        );
     }
 
     #[test]
@@ -7358,18 +7478,18 @@ mod tests {
     #[test]
     fn array_patterns_match_a_fixed_length() {
         ok(
-            ": foreign imul ( Int Int -- Int )\n\n: isEmpty ( (Array a) -- Bool )\n  <> -> true\n  _ -> false\n\n: takeFive ( (Array Int) -- Int )\n  < 0n 1n a b _ > -> a b imul\n  _ -> 0n\n\n: flags ( (Array Bool) -- Bool )\n  < true > -> true\n  < false > -> false\n  _ -> false\n\n; Maybe a = Nothing | Just a\n\n: onlyJust ( (Array (Maybe Int)) -- Int )\n  < (Just x) > -> x\n  _ -> 0n\n\n: nested ( (Array (Array Num)) -- Num )\n  < < a > > -> a\n  _ -> 0\n\n- Ages (Array Int)\n\n: oneAge ( Ages -- Int )\n  < 1n > -> 1n\n  _ -> 0n\n\n: pair ( (Array Int) Bool -- Bool )\n  < 0n > true -> true\n  < 0n > false -> false\n  _ _ -> false\n",
+            ": foreign imul ( Int Int -- Int )\n\n: isEmpty ( (Array a) -- Bool )\n  <> -> true\n  _ -> drop false\n\n: takeFive ( (Array Int) -- Int )\n  < 0n 1n a b _ > -> a b imul\n  _ -> drop 0n\n\n: flags ( (Array Bool) -- Bool )\n  < true > -> true\n  < false > -> false\n  _ -> drop false\n\n; Maybe a = Nothing | Just a\n\n: onlyJust ( (Array (Maybe Int)) -- Int )\n  < (Just x) > -> x\n  _ -> drop 0n\n\n: nested ( (Array (Array Num)) -- Num )\n  < < a > > -> a\n  _ -> drop 0\n\n- Ages (Array Int)\n\n: oneAge ( Ages -- Int )\n  < 1n > -> 1n\n  _ -> drop 0n\n\n: pair ( (Array Int) Bool -- Bool )\n  < 0n > true -> true\n  < 0n > false -> false\n  _ _ -> drop drop false\n",
         );
         err(
             ": bad ( (Array Int) -- Int )\n  <> -> 0n\n",
             "non-exhaustive match: Array",
         );
         err(
-            ": bad ( (Array Int) -- Int )\n  < 0n > -> 0n\n  < 0n > -> 1n\n  _ -> 0n\n",
+            ": bad ( (Array Int) -- Int )\n  < 0n > -> 0n\n  < 0n > -> 1n\n  _ -> drop 0n\n",
             "redundant pattern",
         );
         err(
-            ": bad ( (Array Int) -- Int )\n  < a > -> a\n  < 0n > -> 0n\n  _ -> 0n\n",
+            ": bad ( (Array Int) -- Int )\n  < a > -> a\n  < 0n > -> 0n\n  _ -> drop 0n\n",
             "redundant pattern",
         );
         err(
@@ -7380,9 +7500,9 @@ mod tests {
             ": bad ( (Array Int) Bool -- Bool )\n  < a > _ -> true\n  < 0n > true -> false\n",
             "redundant pattern",
         );
-        ok(": wider ( (Array Int) -- Int )\n  < 0n > -> 0n\n  < a > -> a\n  _ -> 0n\n");
+        ok(": wider ( (Array Int) -- Int )\n  < 0n > -> 0n\n  < a > -> a\n  _ -> drop 0n\n");
         err(
-            ": bad ( (Array Int) -- Int )\n  < 0 > -> 0n\n  _ -> 0n\n",
+            ": bad ( (Array Int) -- Int )\n  < 0 > -> 0n\n  _ -> drop 0n\n",
             "type mismatch: expected Num, found Int",
         );
         err(
@@ -7390,7 +7510,7 @@ mod tests {
             "type mismatch: expected (Array _), found Int",
         );
         err(
-            ": bad ( (Array Int) -- Int )\n  < a a > -> a\n  _ -> 0n\n",
+            ": bad ( (Array Int) -- Int )\n  < a a > -> a\n  _ -> drop 0n\n",
             "duplicate definition a",
         );
     }

@@ -40,7 +40,7 @@ JavaScript emits a boolean.
 
 No parameters. The only value is the word [`Unit`](Words.md#unit). JavaScript emits `undefined`.
 
-That word is also the constructor. `Unit ->` checks the value and leaves it. `(Unit ..)` checks it and leaves nothing.
+That word is also the constructor. `Unit ->` checks the value and leaves it. The check is `value === undefined`. `null` is not `Unit`. `(Unit ..)` checks it and leaves nothing.
 
 ## Array
 
@@ -58,7 +58,23 @@ One parameter, written `(Array a)`. A literal is a program between `<` and `>`. 
 
 JavaScript emits an array. `dup` shares that reference. A word that writes returns a new array, and the array it received stays as it was. A shared cell that a program passes is `Cell`, from the prelude.
 
-A pattern has one fixed length. `<>` matches only the empty array. One length does not cover every `Array`. A later `_` covers the other lengths.
+A pattern has one fixed length. `<>` matches only the empty array. One length does not cover every `Array`. A later `_` covers the other lengths. `Array ->` covers every array. It checks `Array.isArray` and leaves the array.
+
+## Matching a shape
+
+`Num`, `Int`, `Str`, `Bool`, `Array`, and `Unit` are patterns. JavaScript tests `typeof`, `Array.isArray`, or `=== undefined`. A bare name leaves the value. `(Array Num)` also tests every element. `(Array x)` does not bind `x`. `StrMap`, a record, and a `foreign` type have no shape test.
+
+The arm is checked against the word's signature with those variables filled in. The other arms and the caller keep the original signature.
+
+```ply
+: keep ( a. a -- a )
+  Num ->
+  _ ->
+```
+
+`Num ->` is `( Num -- Num )`. `_ ->` is `( a -- a )`. Both leave the value. `1 keep` is `Num`. `"hi" keep` is `Str`.
+
+`Array ->` in `( Foldable f => (f a) -- Num )` is `( (Array a) -- Num )`. `f` is `Array`. The element stays `a`. A shape does not cover a wider slot, so a later `_` is still required. `_` leaves the value.
 
 ## StrMap
 

@@ -121,7 +121,7 @@ This is an ordinary word of a module. It is not built into the compiler.
 
 ## Pattern matching
 
-When the first line of a body is patterns and `->`, the whole body is equations. The right-hand pattern is the top. A name binds a slot. A literal is compared with the value. `_` discards a value. The first match wins. A value cannot be matched in the middle of a body: write a separate word for that, and make its whole body equations.
+When the first line of a body is patterns and `->`, the whole body is equations. The right-hand pattern is the top. A name takes a slot. A literal is compared with the value and taken. `_` matches any value and leaves it. The first match wins. A value cannot be matched in the middle of a body: write a separate word for that, and make its whole body equations.
 
 ```ply
 : toString ( Bool -- Str )
@@ -129,16 +129,16 @@ When the first line of a body is patterns and `->`, the whole body is equations.
   false -> "false"
 ```
 
-`true` together with `false` covers `Bool`. `Num`, `Int`, and `Str` need a final branch with a name or `_`.
+`true` together with `false` covers `Bool`. A literal of `Num`, `Int`, or `Str` does not. `Num ->`, `Int ->`, `Str ->`, `Bool ->`, `Array ->`, and `Unit ->` test the JavaScript shape and leave the value. On a wider type they do not cover the slot, so a later name or `_` remains. The arm sees the word's signature with that shape filled in. The other arms do not.
 
-A bare constructor checks the tag and leaves the value. `(Ctor ..)` spills every field, last on top. `(Just x)` names the one field and does not put it until the name is mentioned. `(Person n _)` is positional: the first field is kept under `n` and the second is discarded. `(Person age name)` binds by name, in either order, when every name is a field. `(Person)` is an error. `(Some (Array Num) items)` checks that the field is an array of numbers and names that array. The check runs when the field's type is still open. `(Some (Array Num))` without a name is an error. `(Some (Num) ..)` checks and spills that number. `(Some (Num) _)` only checks.
+A bare constructor checks the tag and leaves the value. `(Ctor ..)` spills every field, last on top. `(Just x)` names the one field and does not put it until the name is mentioned. `(Person n _)` is positional: the first field is kept under `n` and the second stays off the stack. `(Person age name)` binds by name, in either order, when every name is a field. `(Person)` is an error. `(Some (Array Num) items)` checks that the field is an array of numbers and names that array. The check runs when the field's type is still open. `(Some (Num) ..)` checks and spills that number. `(Some (Num) _)` only checks. `(Array x)` does not bind `x`.
 
 An array in a pattern has a fixed length. `<>` matches only the empty array. One length does not cover every `Array`.
 
 ```ply
 : isEmpty ( (Array a) -- Bool )
   <> -> true
-  _ -> false
+  _ -> drop false
 ```
 
 ## Data

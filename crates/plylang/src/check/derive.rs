@@ -473,7 +473,7 @@ fn eq_source(data: &crate::ast::Data, method: &str) -> String {
         }
     }
     if data.ctors.len() > 1 {
-        body.push_str("  _ _ ->\n    false\n");
+        body.push_str("  _ _ ->\n    drop drop false\n");
     }
     format!(": {word} {scheme}\n{body}\n# Setoid {head}\n  {method} = {word}\n")
 }
@@ -515,8 +515,8 @@ fn lte_source(data: &crate::ast::Data, equal_method: &str) -> String {
     if data.ctors.len() > 1 {
         for ctor in data.ctors.iter().take(data.ctors.len() - 1) {
             let pattern = ctor_wild(&ctor.name, ctor.fields.len());
-            body.push_str(&format!("  {pattern} _ ->\n    true\n"));
-            body.push_str(&format!("  _ {pattern} ->\n    false\n"));
+            body.push_str(&format!("  {pattern} _ ->\n    drop true\n"));
+            body.push_str(&format!("  _ {pattern} ->\n    drop false\n"));
         }
     }
     format!(": {word} {scheme}\n{body}\n# Ord {head}\n  lte = {word}\n")

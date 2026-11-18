@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use crate::anf::{
     js_ident, Access, AnfCtor, AnfData, AnfDef, AnfModule, AnfPlace, Choice, Cond, DictField,
-    DictValue, Expr, Let, LocalId, MethodHome, PatTest, QuoteForm, Value,
+    DictValue, Expr, Let, LocalId, MethodHome, PatTest, QuoteForm, ShapeTest, Value,
 };
 use crate::ast::{Item, Lit, Module, Pattern, Term, TermNode};
 use crate::builtin::{self, Lowering};
@@ -363,7 +363,7 @@ impl Checker {
         let lowered = if def.clauses.is_empty() {
             self.lower_terms(&def.body, input, &mut frame)
         } else {
-            self.lower_clauses(def, input, &mut frame)
+            self.lower_clauses(def, input, output, &mut frame)
         };
         self.locals.pop();
         let end = match lowered {
@@ -1471,6 +1471,7 @@ impl Checker {
         &mut self,
         def: &crate::ast::Def,
         input: StackId,
+        output: StackId,
         frame: &mut Frame,
     ) -> Result<StackId, Diagnostic> {
         let prepared = self.prepare_clauses(&def.clauses, input, def.name_span)?;
@@ -1480,12 +1481,12 @@ impl Checker {
             roots.push(frame.force(self, operand)?);
         }
         let below = frame.stack.clone();
-        let mut outputs = Vec::new();
         let mut choices = Vec::new();
         for clause in &def.clauses {
             let mut conds = Vec::new();
             let mut binds = HashMap::new();
             let mut schemes = HashMap::new();
+            let mut learned = HashMap::new();
             let mut arm_stack = prepared.rest;
             let mut arm = Frame {
                 stack: below.clone(),
@@ -1499,6 +1500,13 @@ impl Checker {
                 .iter()
                 .zip(prepared.slots.iter().copied().zip(&roots))
             {
+                if matches!(pattern, Pattern::Wild) {
+                    let id = self.materialize(&mut arm, *root, &[]);
+                    self.note_fn(id, ty);
+                    arm_stack = self.stack_cons(arm_stack, ty);
+                    arm.stack.push(Operand::Local(id));
+                    continue;
+                }
                 self.lower_pattern(
                     pattern,
                     ty,
@@ -1507,16 +1515,52 @@ impl Checker {
                     &mut conds,
                     &mut binds,
                     &mut schemes,
+                    &mut learned,
                     &mut arm_stack,
                     &mut arm,
                     clause.span,
                 )?;
             }
+            let subst = super::clauses::arm_subst(&learned);
+            let saved = self.assumptions.clone();
+            let mut memo = super::Memo::default();
+            self.assumptions = saved
+                .iter()
+                .map(|constraint| super::SemConstraint {
+                    class_name: constraint.class_name.clone(),
+                    args: constraint
+                        .args
+                        .iter()
+                        .map(|arg| self.copy_ty(*arg, &subst, &mut memo))
+                        .collect(),
+                })
+                .collect();
+            arm_stack = self.copy_refined_stack(arm_stack, &subst, &mut memo);
+            let schemes = schemes
+                .into_iter()
+                .map(|(name, scheme)| {
+                    let field = self.binding_top(&scheme);
+                    let field = self.copy_ty(field, &subst, &mut memo);
+                    (name, self.binding_scheme(field))
+                })
+                .collect();
             arm.env.push(binds);
             self.locals.push(schemes);
             let checked = self.lower_terms(&clause.body, arm_stack, &mut arm);
             self.locals.pop();
-            outputs.push(checked?);
+            let checked = match checked {
+                Ok(checked) => checked,
+                Err(error) => {
+                    self.assumptions = saved;
+                    return Err(error);
+                }
+            };
+            let expected = self.copy_stack(output, &subst, &mut memo);
+            if let Err(message) = self.unify_stack(checked, expected) {
+                self.assumptions = saved;
+                return Err(self.error(clause.span, message));
+            }
+            self.assumptions = saved;
             let result = drain_results(self, &mut arm)?;
             choices.push(Choice {
                 conds,
@@ -1525,12 +1569,6 @@ impl Checker {
                     result,
                 },
             });
-        }
-        let mut acc = outputs[0];
-        for later in outputs.into_iter().skip(1) {
-            self.unify_stack(later, acc)
-                .map_err(|message| self.error(def.name_span, message))?;
-            acc = self.find_stack(acc);
         }
         let width = choices
             .first()
@@ -1551,7 +1589,48 @@ impl Checker {
             value: Value::Choose { arms: choices },
         });
         frame.stack = binds.into_iter().map(Operand::Local).collect();
-        Ok(acc)
+        Ok(output)
+    }
+
+    /// Copy the arm and keep constructor notes. `>>field` reads those notes.
+    fn copy_refined_stack(
+        &mut self,
+        id: StackId,
+        subst: &super::Subst,
+        memo: &mut super::Memo,
+    ) -> StackId {
+        let from = self.find_stack(id);
+        let to = self.copy_stack(from, subst, memo);
+        self.carry_refinements(from, to);
+        to
+    }
+
+    fn carry_refinements(&mut self, mut from: StackId, mut to: StackId) {
+        for _ in 0..64 {
+            from = self.find_stack(from);
+            to = self.find_stack(to);
+            if let Some(ctor) = self.refinements.get(&from.0).cloned() {
+                self.refinements.insert(to.0, ctor);
+            }
+            match (
+                self.stacks[from.0 as usize].clone(),
+                self.stacks[to.0 as usize].clone(),
+            ) {
+                (StackNode::Cons(from_rest, _), StackNode::Cons(to_rest, _)) => {
+                    from = from_rest;
+                    to = to_rest;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    /// The value a pattern name stands for. A binding scheme stores it above a template tail.
+    fn binding_top(&self, scheme: &super::SemScheme) -> TyId {
+        match &self.stacks[self.find_stack(scheme.output).0 as usize] {
+            StackNode::Cons(_, ty) => *ty,
+            _ => panic!("pattern binding has no value"),
+        }
     }
 
     fn lower_pattern(
@@ -1563,6 +1642,7 @@ impl Checker {
         conds: &mut Vec<Cond>,
         binds: &mut HashMap<String, LocalId>,
         schemes: &mut HashMap<String, super::SemScheme>,
+        learned: &mut HashMap<TyId, TyId>,
         arm_stack: &mut StackId,
         arm: &mut Frame,
         span: Span,
@@ -1588,32 +1668,51 @@ impl Checker {
                 });
                 Ok(())
             }
-            Pattern::Unpack(name) => {
-                let shape = self.ctor_shape(name, ty, span)?;
-                if !shape.newtype {
-                    conds.push(Cond {
-                        root,
-                        steps: steps.to_vec(),
-                        test: PatTest::Tag(shape.tag.clone()),
-                    });
+            Pattern::Unpack(name) => match self.ctor_shape(name, ty, span) {
+                Ok(shape) => {
+                    if !shape.newtype {
+                        conds.push(Cond {
+                            root,
+                            steps: steps.to_vec(),
+                            test: pat_tag(&shape.tag),
+                        });
+                    }
+                    let id = self.materialize(arm, root, steps);
+                    self.note_fn(id, ty);
+                    *arm_stack = self.stack_cons(*arm_stack, ty);
+                    self.note_refine(*arm_stack, &shape.tag);
+                    arm.stack.push(Operand::Local(id));
+                    Ok(())
                 }
-                let id = self.materialize(arm, root, steps);
-                self.note_fn(id, ty);
-                *arm_stack = self.stack_cons(*arm_stack, ty);
-                self.note_refine(*arm_stack, &shape.tag);
-                arm.stack.push(Operand::Local(id));
-                Ok(())
-            }
+                Err(error) => {
+                    if super::clauses::host_spec(pattern).is_none() {
+                        return Err(error);
+                    }
+                    self.lower_host(
+                        pattern, ty, root, steps, conds, learned, arm_stack, arm, span,
+                    )
+                }
+            },
             Pattern::Open(name) => {
                 self.spill_ctor(name, ty, root, steps, conds, arm_stack, arm, span)
             }
             Pattern::Ctor(name, patterns) => {
-                let shape = self.ctor_shape(name, ty, span)?;
+                let shape = match self.ctor_shape(name, ty, span) {
+                    Ok(shape) => shape,
+                    Err(error) => {
+                        if super::clauses::host_spec(pattern).is_none() {
+                            return Err(error);
+                        }
+                        return self.lower_host(
+                            pattern, ty, root, steps, conds, learned, arm_stack, arm, span,
+                        );
+                    }
+                };
                 if let Some(groups) = group_type_tests(patterns, shape.fields.len()) {
                     if self.type_test_heads(&groups) {
                         return self.lower_type_tests(
-                            &shape, &groups, root, steps, conds, binds, schemes, arm_stack, arm,
-                            span,
+                            &shape, &groups, root, steps, conds, binds, schemes, learned,
+                            arm_stack, arm, span,
                         );
                     }
                 }
@@ -1623,7 +1722,7 @@ impl Checker {
                     conds.push(Cond {
                         root,
                         steps: steps.to_vec(),
-                        test: PatTest::Tag(shape.tag.clone()),
+                        test: pat_tag(&shape.tag),
                     });
                 }
                 let width = shape.fields.len();
@@ -1641,7 +1740,8 @@ impl Checker {
                         child.push(Self::field_step(index, width, names.get(index)));
                     }
                     self.lower_pattern(
-                        pattern, field, root, &child, conds, binds, schemes, arm_stack, arm, span,
+                        pattern, field, root, &child, conds, binds, schemes, learned, arm_stack,
+                        arm, span,
                     )?;
                 }
                 Ok(())
@@ -1657,7 +1757,8 @@ impl Checker {
                     let mut child = steps.to_vec();
                     child.push(Access::Index(index));
                     self.lower_pattern(
-                        pattern, elem, root, &child, conds, binds, schemes, arm_stack, arm, span,
+                        pattern, elem, root, &child, conds, binds, schemes, learned, arm_stack,
+                        arm, span,
                     )?;
                 }
                 Ok(())
@@ -1668,8 +1769,8 @@ impl Checker {
                     let mut child = steps.to_vec();
                     child.push(Access::Prop(name.clone()));
                     self.lower_pattern(
-                        pattern, field_ty, root, &child, conds, binds, schemes, arm_stack, arm,
-                        span,
+                        pattern, field_ty, root, &child, conds, binds, schemes, learned, arm_stack,
+                        arm, span,
                     )?;
                 }
                 Ok(())
@@ -1677,8 +1778,8 @@ impl Checker {
         }
     }
 
-    /// Tag first, then a witness on each tested field. A name is the pattern type.
-    /// `..` pushes that value now.
+    /// Tag first, then a witness on each tested field. A name is the field type.
+    /// The arm substitution rewrites it before the body. `..` pushes that value now.
     fn lower_type_tests(
         &mut self,
         shape: &super::clauses::CtorShape,
@@ -1688,6 +1789,7 @@ impl Checker {
         conds: &mut Vec<Cond>,
         binds: &mut HashMap<String, LocalId>,
         schemes: &mut HashMap<String, super::SemScheme>,
+        learned: &mut HashMap<TyId, TyId>,
         arm_stack: &mut StackId,
         arm: &mut Frame,
         span: Span,
@@ -1696,7 +1798,7 @@ impl Checker {
             conds.push(Cond {
                 root,
                 steps: steps.to_vec(),
-                test: PatTest::Tag(shape.tag.clone()),
+                test: pat_tag(&shape.tag),
             });
         }
         let width = shape.fields.len();
@@ -1715,13 +1817,14 @@ impl Checker {
                         conds,
                         binds,
                         schemes,
+                        learned,
                         arm_stack,
                         arm,
                         span,
                     )?;
                 }
                 SlotPat::Test { ty, bind } => {
-                    let witness = self.check_type_test(ty, shape.fields[index], span)?;
+                    let witness = self.check_type_test(ty, shape.fields[index], span, learned)?;
                     if let Some(test) = witness.test {
                         conds.push(Cond {
                             root,
@@ -1755,6 +1858,36 @@ impl Checker {
         Ok(())
     }
 
+    /// A shape test leaves the value. No constructor tag is recorded.
+    fn lower_host(
+        &mut self,
+        pattern: &Pattern,
+        ty: TyId,
+        root: LocalId,
+        steps: &[Access],
+        conds: &mut Vec<Cond>,
+        learned: &mut HashMap<TyId, TyId>,
+        arm_stack: &mut StackId,
+        arm: &mut Frame,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let Some(shape) = super::clauses::host_spec(pattern) else {
+            return Err(self.error(span, Error::ExpectedPattern));
+        };
+        if let Some(test) = self.match_host(ty, &shape, span, learned)? {
+            conds.push(Cond {
+                root,
+                steps: steps.to_vec(),
+                test: PatTest::Shape(test),
+            });
+        }
+        let id = self.materialize(arm, root, steps);
+        self.note_fn(id, ty);
+        *arm_stack = self.stack_cons(*arm_stack, ty);
+        arm.stack.push(Operand::Local(id));
+        Ok(())
+    }
+
     /// `(Name ..)` puts every field on the stack. A newtype's one field is the value.
     fn spill_ctor(
         &mut self,
@@ -1773,7 +1906,7 @@ impl Checker {
             conds.push(Cond {
                 root,
                 steps: steps.to_vec(),
-                test: PatTest::Tag(shape.tag),
+                test: pat_tag(&shape.tag),
             });
         }
         let width = shape.fields.len();
@@ -2247,6 +2380,15 @@ impl Checker {
             current = self.stack_cons(current, ty);
         }
         Ok(current)
+    }
+}
+
+/// Unit is `undefined`. Reading `.tag` would throw.
+fn pat_tag(tag: &str) -> PatTest {
+    if tag == "Unit" {
+        PatTest::Shape(ShapeTest::Unit)
+    } else {
+        PatTest::Tag(tag.to_string())
     }
 }
 
@@ -2911,7 +3053,7 @@ if (mapped.tag !== "Just" || mapped.value !== 42n) throw new Error("map just " +
 : normalized ( (Option a) -- (Array Num) )
   (Some (Array Num) items) -> items
   (Some (Array (Array Num)) _) -> < >
-  _ -> < >
+  _ -> drop < >
 "#);
         assert!(
             code.contains("Array.isArray(v0.value)")
@@ -2926,7 +3068,7 @@ if (mapped.tag !== "Just" || mapped.value !== 42n) throw new Error("map just " +
 : normalized ( (Option a) -- (Array Num) )
   (Some (Array Num) items) -> items
   (Some (Array Str) _) -> < 1 >
-  _ -> < 2 >
+  _ -> drop < 2 >
 
 : kind ( (Option a) -- Num )
   (Some (Bool) _) -> 1
@@ -2934,7 +3076,7 @@ if (mapped.tag !== "Just" || mapped.value !== 42n) throw new Error("map just " +
   (Some (Str) _) -> 3
   (Some (Num) _) -> 4
   (Some (Array (Array Num)) _) -> 5
-  _ -> 0
+  _ -> drop 0
 "#,
             r#"
 const nums = normalized(Some([1, 2]));
@@ -2965,6 +3107,50 @@ if (kind(None) !== 0) throw new Error("kind none");
     }
 
     #[test]
+    fn javascript_tests_a_host_shape() {
+        let unit = js(
+            ": both ( Unit Bool -- Bool )\n  Unit true -> drop true\n  Unit false -> drop false\n",
+        );
+        assert!(unit.contains("=== undefined"), "{unit}");
+        assert!(!unit.contains(".tag"), "{unit}");
+        run(
+            r#"
+: held ( a. a -- a )
+  Num ->
+  x -> x
+
+: kind ( a. a -- Num )
+  Num -> drop 1
+  Int -> drop 2
+  Str -> drop 3
+  Bool -> drop 4
+  Array -> drop 5
+  Unit -> drop 6
+  _ -> drop 0
+
+: nums ( a. a -- Num )
+  (Array Num) -> drop 1
+  _ -> drop 0
+"#,
+            r#"
+if (held(1) !== 1) throw new Error("held num");
+if (held("hi") !== "hi") throw new Error("held str");
+if (kind(1) !== 1) throw new Error("num");
+if (kind(1n) !== 2) throw new Error("int");
+if (kind("a") !== 3) throw new Error("str");
+if (kind(true) !== 4) throw new Error("bool");
+if (kind(false) !== 4) throw new Error("bool false");
+if (kind([1, "a"]) !== 5) throw new Error("array");
+if (kind(undefined) !== 6) throw new Error("unit");
+if (kind(null) !== 0) throw new Error("null");
+if (nums([1, 2]) !== 1) throw new Error("nums");
+if (nums([1, "a"]) !== 0) throw new Error("mixed");
+if (nums("a") !== 0) throw new Error("not array");
+"#,
+        );
+    }
+
+    #[test]
     fn javascript_runs_a_spilled_type_test() {
         let concrete = js(r#"
 ; Option a = None | Some a
@@ -2986,15 +3172,15 @@ if (kind(None) !== 0) throw new Error("kind none");
 
 : amount ( (Option a) -- Num )
   (Some (Num) ..) ->
-  _ -> 0
+  _ -> drop 0
 
 : items ( (Option a) -- (Array Num) )
   (Some (Array Num) ..) ->
-  _ -> < 0 >
+  _ -> drop < 0 >
 
 : halves ( a b. (Pair a b) -- Num Str )
   (Pair (Num) .. (Str) ..) ->
-  _ -> 0 ""
+  _ -> drop 0 ""
 
 : take ( (Option Num) -- Num )
   (Some (Num) ..) ->
@@ -3024,6 +3210,27 @@ if (bad[0] !== 0 || bad[1] !== "") throw new Error("bad " + bad);
 if (take(Some(4)) !== 4) throw new Error("take");
 if (take(None) !== 0) throw new Error("take none");
 if (years(36) !== 36) throw new Error("years");
+"#,
+        );
+    }
+
+    #[test]
+    fn javascript_leaves_a_wild_slot() {
+        run(
+            r#"
+: kept ( a. a -- a )
+  Num ->
+  _ ->
+: tag ( a. a -- Num )
+  Num -> drop 1
+  _ -> drop 0
+"#,
+            r#"
+if (kept(1) !== 1) throw new Error("num");
+if (kept("hi") !== "hi") throw new Error("str");
+if (tag(1) !== 1) throw new Error("tag num");
+if (tag("hi") !== 0) throw new Error("tag str");
+if (tag(null) !== 0) throw new Error("tag null");
 "#,
         );
     }
@@ -3339,7 +3546,7 @@ if (hashed(Pair(1n, 2n)) !== 33n) throw new Error("hash " + hashed(Pair(1n, 2n))
   Just
 
 : bindMaybe ( (Maybe a) (a -- (Maybe b)) -- (Maybe b) )
-  (Nothing ..) _ -> Nothing
+  (Nothing ..) _ -> drop Nothing
   (Just x) f -> x f call
 
 # Liftable Maybe
@@ -3959,19 +4166,19 @@ if (olderAge(36) !== 37) throw new Error("age");
 
 : isEmpty ( (Array a) -- Bool )
   <> -> true
-  _ -> false
+  _ -> drop false
 
 : takeFive ( (Array Int) -- Int )
   < 0n 1n a b _ > -> a b imul
-  _ -> 0n
+  _ -> drop 0n
 
 : onlyJust ( (Array (Maybe Int)) -- Int )
   < (Just x) > -> x
-  _ -> 0n
+  _ -> drop 0n
 
 : nested ( (Array (Array Num)) -- Num )
   < < a > > -> a
-  _ -> 0
+  _ -> drop 0
 "#,
             r#"
 function isub(a, b) { return a - b; }

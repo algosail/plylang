@@ -289,7 +289,7 @@ Fix: put `->` between the patterns and the body: `Nothing ->` or `x ->`.
 
 An equation has no pattern, or a constructor-pattern slot is empty.
 
-Fix: write a pattern. The rightmost pattern is the top of the stack. `_` discards one value. Parentheses keep one slot: `(Just x)`.
+Fix: write a pattern. The rightmost pattern is the top of the stack. `_` matches any value and leaves it. A name takes the slot. Parentheses keep one slot: `(Just x)`.
 
 ## PL0034
 
@@ -1131,9 +1131,9 @@ Fix: keep the value with `Page`, spill every field with `(Page ..)`, or name the
 
 `pattern cannot test TYPE`
 
-`(Some (Option Num) value)` asks whether the field is `(Option Num)`. A number, an integer, a string, a boolean, or an array of those is a check the runtime can make. `TYPE` is not one of those, and the field is not already `TYPE`.
+`(Some (Option Num) value)` asks whether the field is `(Option Num)`. A number, an integer, a string, a boolean, a unit, or an array of those is a check the runtime can make. The same check can test the value itself: `Num ->`, `Unit ->`, `Array ->`. `TYPE` is not one of those, and the value is not already `TYPE`.
 
-Fix: test a shape the runtime can see, `(Some (Array Num) items)`. When the field is already `TYPE`, the name is that value and there is nothing to test.
+Fix: test a shape the runtime can see, `(Some (Array Num) items)` or `Array ->`. When the value is already `TYPE`, there is nothing to test.
 
 ## PL0138
 

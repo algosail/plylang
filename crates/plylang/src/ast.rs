@@ -233,11 +233,15 @@ pub struct Clause {
 /// A record reads the fields it names. The row tail stays in the type.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
+    /// Any value. A stack slot stays. A field was not on the stack, so it is not pushed.
     Wild,
     /// A name for this slot. The span is the name, so a hover can show its type.
     Bind(Span, String),
     Lit(Lit),
     /// Check the constructor and leave the value, narrowed to it.
+    /// A bare `Num`, `Int`, `Str`, `Bool`, `Array`, or `Unit` is a shape test
+    /// when that name is not a constructor of the slot. The value stays.
+    /// The arm's signature uses the shape; the other arms do not.
     Unpack(String),
     /// `(Name ..)`. Check the constructor and spill every field. Last is on top.
     Open(String),

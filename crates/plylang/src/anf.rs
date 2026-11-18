@@ -125,6 +125,8 @@ pub enum ShapeTest {
     Int,
     Str,
     Bool,
+    /// `undefined`. `null` is not Unit.
+    Unit,
     Array(Option<Box<ShapeTest>>),
 }
 
@@ -578,6 +580,7 @@ fn render_shape(path: &str, shape: &ShapeTest, depth: usize) -> String {
         ShapeTest::Int => format!("typeof {path} === \"bigint\""),
         ShapeTest::Str => format!("typeof {path} === \"string\""),
         ShapeTest::Bool => format!("typeof {path} === \"boolean\""),
+        ShapeTest::Unit => format!("{path} === undefined"),
         ShapeTest::Array(None) => format!("Array.isArray({path})"),
         ShapeTest::Array(Some(elem)) => {
             let name = format!("e{depth}");
