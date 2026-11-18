@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::ast::{Class, Instance, Item, Module, Type};
+use crate::ast::{type_string, Class, Instance, Item, Module, Type};
 use crate::builtin;
 use crate::codes::Error;
 use crate::diagnostic::Diagnostic;
@@ -382,7 +382,10 @@ impl Checker {
         origin: &str,
     ) -> Result<(), Diagnostic> {
         if local && self.orphan(class_name, &instance.args) {
-            return Err(self.error(instance.span, Error::OrphanInstance));
+            return Err(with_head(
+                self.error(instance.span, Error::OrphanInstance),
+                &written_head(class_name, &instance.args),
+            ));
         }
         if instance.args.len() != class.params.len() {
             let count = class.params.len();
@@ -426,12 +429,21 @@ impl Checker {
             .iter()
             .map(|binding| binding.name.as_str())
             .collect();
-        for method in &class.methods {
-            if !bound.contains(method.name.as_str()) {
-                return Err(
-                    self.error(instance.span, Error::MissingMethod(method.name.to_string()))
-                );
-            }
+        let missing: Vec<String> = class
+            .methods
+            .iter()
+            .filter(|method| !bound.contains(method.name.as_str()))
+            .map(|method| method.name.clone())
+            .collect();
+        let head_text = written_head(class_name, &instance.args);
+        if !missing.is_empty() {
+            return Err(self.error(
+                instance.span,
+                Error::MissingMethod {
+                    head: head_text,
+                    names: missing,
+                },
+            ));
         }
         let mut methods = Vec::new();
         for method in &class.methods {
@@ -440,9 +452,12 @@ impl Checker {
                 .iter()
                 .find(|binding| binding.name == method.name)
                 .expect("method was checked");
-            let word = self.lookup_word_scheme(module, &binding.word, binding.name_span)?;
-            let (context, extra) =
-                self.check_impl(class, method, &word, &head, binding.name_span)?;
+            let word = self
+                .lookup_word_scheme(module, &binding.word, binding.name_span)
+                .map_err(|diag| with_method(diag, &head_text, &method.name))?;
+            let (context, extra) = self
+                .check_impl(class, method, &word, &head, binding.name_span)
+                .map_err(|diag| with_method(diag, &head_text, &method.name))?;
             methods.push(InstanceMethod {
                 name: method.name.clone(),
                 word: binding.word.clone(),
@@ -452,7 +467,12 @@ impl Checker {
             });
         }
         let supers = self.substitute_constraints(&class.params, &head, &class.supers);
-        self.require_superclass_instances(&supers, instance.span)?;
+        self.require_superclass_instances(
+            &head_text,
+            &scope.quantified_tys,
+            &supers,
+            instance.span,
+        )?;
         let info = InstanceInfo {
             class_name: class_name.to_string(),
             vars: scope.quantified_tys,
@@ -470,7 +490,10 @@ impl Checker {
                 if !local && existing.origin == info.origin {
                     return Ok(());
                 }
-                return Err(self.error(instance.span, Error::IncoherentInstance));
+                return Err(with_head(
+                    self.error(instance.span, Error::IncoherentInstance),
+                    &written_head(class_name, &instance.args),
+                ));
             }
         }
         self.instances.push(info);
@@ -1038,7 +1061,15 @@ impl Checker {
         if let Some(error) = failure {
             return Err(error);
         }
-        found.ok_or_else(|| self.error(span, Error::NoInstance(self.show_constraint(constraint))))
+        found.ok_or_else(|| {
+            self.error(
+                span,
+                Error::NoInstance {
+                    constraint: self.show_constraint(constraint),
+                    needed_by: String::new(),
+                },
+            )
+        })
     }
 
     fn match_assumption(&mut self, wanted: &SemConstraint) -> Option<usize> {
@@ -1113,6 +1144,8 @@ impl Checker {
     /// dictionary is built, which is how `Comparable (Box a)` keeps `Comparable a`.
     fn require_superclass_instances(
         &mut self,
+        head: &str,
+        names: &[(String, TyId)],
         constraints: &[SemConstraint],
         span: Span,
     ) -> Result<(), Diagnostic> {
@@ -1123,7 +1156,13 @@ impl Checker {
                     && self.instance_head_matches(inst, &constraint.args)
             });
             if !matched {
-                return Err(self.error(span, Error::NoInstance(self.show_constraint(constraint))));
+                return Err(self.error(
+                    span,
+                    Error::NoInstance {
+                        constraint: self.show_constraint_named(constraint, names),
+                        needed_by: head.to_string(),
+                    },
+                ));
             }
         }
         Ok(())
@@ -1262,6 +1301,59 @@ impl Checker {
         out
     }
 
+    /// Like [`Self::show_constraint`], but a quantified variable keeps its name.
+    fn show_constraint_named(
+        &self,
+        constraint: &SemConstraint,
+        names: &[(String, TyId)],
+    ) -> String {
+        let mut out = constraint.class_name.clone();
+        for arg in &constraint.args {
+            out.push(' ');
+            out.push_str(&self.show_ty_named(*arg, names));
+        }
+        out
+    }
+
+    fn show_ty_named(&self, id: TyId, names: &[(String, TyId)]) -> String {
+        let id = self.find_ty(id);
+        if let Some((name, _)) = names.iter().find(|(_, var)| self.find_ty(*var) == id) {
+            if matches!(
+                self.tys[id.0 as usize],
+                TyNode::Var | TyNode::Template | TyNode::Rigid(_)
+            ) {
+                return name.clone();
+            }
+        }
+        match self.tys[id.0 as usize].clone() {
+            TyNode::Ctor(name, args) if args.is_empty() => name,
+            TyNode::Ctor(name, args) => {
+                let mut out = format!("({name}");
+                for arg in args {
+                    out.push(' ');
+                    out.push_str(&self.show_ty_named(arg, names));
+                }
+                out.push(')');
+                out
+            }
+            TyNode::App(head, args) => {
+                let mut out = format!("({}", self.show_ty_named(head, names));
+                for arg in args {
+                    out.push(' ');
+                    out.push_str(&self.show_ty_named(arg, names));
+                }
+                out.push(')');
+                out
+            }
+            TyNode::Alias { body, .. } => self.show_ty_named(body, names),
+            TyNode::Link(next) => self.show_ty_named(next, names),
+            TyNode::Rigid(name) => name,
+            TyNode::Fun(_, _, _) | TyNode::Record(_) | TyNode::Var | TyNode::Template => {
+                self.show_ty(id)
+            }
+        }
+    }
+
     fn show_constraints(&self, constraints: &[SemConstraint]) -> String {
         if constraints.is_empty() {
             return "no constraint".to_string();
@@ -1279,4 +1371,26 @@ impl Checker {
             .values()
             .any(|class| class.methods.iter().any(|method| method.name == name))
     }
+}
+
+/// The class and the types written on the instance: `Eq (Maybe a)`.
+fn written_head(class: &str, args: &[Type]) -> String {
+    let mut out = class.to_string();
+    for arg in args {
+        out.push(' ');
+        out.push_str(&type_string(arg));
+    }
+    out
+}
+
+fn with_head(diag: Diagnostic, head: &str) -> Diagnostic {
+    Diagnostic::with_code(diag.span, diag.code, format!("{} {head}", diag.message))
+}
+
+fn with_method(diag: Diagnostic, head: &str, method: &str) -> Diagnostic {
+    Diagnostic::with_code(
+        diag.span,
+        diag.code,
+        format!("{head} method {method}: {}", diag.message),
+    )
 }

@@ -91,7 +91,7 @@ fn resolve(
     space: NameSpace,
 ) -> Option<Definition> {
     match space {
-        NameSpace::Type => {
+        NameSpace::Type | NameSpace::Class => {
             local_type(path, module, name).or_else(|| imported(path, module, name, Target::Type))
         }
         NameSpace::Value => local_value(path, module, tokens, offset, name)

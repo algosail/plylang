@@ -3220,39 +3220,35 @@ if (useBoth(1n, 2n) !== false) throw new Error("both neq");
     }
 
     #[test]
-    fn derived_show_compare_and_hash_run() {
+    fn derived_show_lte_and_hash_run() {
         let body = r#"
-; Ordering = LT | EQ | GT
-
-& Eq a
+& Setoid a
   eq ( a a -- Bool )
 
 & Show a
   show ( a -- Str )
 
-& Eq a => Ord a
-  compare ( a a -- Ordering )
+& Setoid a => Ord a
+  lte ( a a -- Bool )
 
-& Eq a => Hash a
+& Setoid a => Hash a
   hash ( a -- Int )
 
 : foreign showInt ( Int -- Str )
-: foreign compareInt ( Int Int -- Ordering )
-
-: eqInt ( Int Int -- Bool )
-  drop drop true
+: foreign eqInt ( Int Int -- Bool )
+: foreign lteInt ( Int Int -- Bool )
 
 : hashInt ( Int -- Int )
   dup drop
 
-# Eq Int
+# Setoid Int
   eq = eqInt
 
 # Show Int
   show = showInt
 
 # Ord Int
-  compare = compareInt
+  lte = lteInt
 
 # Hash Int
   hash = hashInt
@@ -3266,11 +3262,11 @@ if (useBoth(1n, 2n) !== false) throw new Error("both neq");
 : paired ( Pair -- Str )
   show
 
-: ordered ( Answer Answer -- Ordering )
-  compare
+: ordered ( Answer Answer -- Bool )
+  lte
 
-: ranked ( Pair Pair -- Ordering )
-  compare
+: ranked ( Pair Pair -- Bool )
+  lte
 
 : hashed ( Pair -- Int )
   hash
@@ -3284,20 +3280,18 @@ if (useBoth(1n, 2n) !== false) throw new Error("both neq");
             body,
             r#"
 function showInt(n) { return n.toString() + "n"; }
-function compareInt(a, b) {
-  if (a < b) return LT;
-  if (a > b) return GT;
-  return EQ;
-}
+function eqInt(a, b) { return a === b; }
+function lteInt(a, b) { return a <= b; }
 if (shown(No) !== "No") throw new Error("show no " + shown(No));
 if (shown(Yes(1n)) !== "(Yes 1n)") throw new Error("show yes " + shown(Yes(1n)));
 if (paired(Pair(1n, 2n)) !== "(Pair 1n 2n)") throw new Error("show pair " + paired(Pair(1n, 2n)));
-if (ordered(No, No).tag !== "EQ") throw new Error("ord nn");
-if (ordered(No, Yes(1n)).tag !== "LT") throw new Error("ord ny");
-if (ordered(Yes(1n), No).tag !== "GT") throw new Error("ord yn");
-if (ranked(Pair(1n, 2n), Pair(1n, 3n)).tag !== "LT") throw new Error("rank lt");
-if (ranked(Pair(2n, 0n), Pair(1n, 9n)).tag !== "GT") throw new Error("rank gt");
-if (ranked(Pair(1n, 2n), Pair(1n, 2n)).tag !== "EQ") throw new Error("rank eq");
+if (ordered(No, No) !== true) throw new Error("ord nn");
+if (ordered(No, Yes(1n)) !== true) throw new Error("ord ny");
+if (ordered(Yes(1n), No) !== false) throw new Error("ord yn");
+if (ranked(Pair(1n, 2n), Pair(1n, 3n)) !== true) throw new Error("rank lt");
+if (ranked(Pair(2n, 0n), Pair(1n, 9n)) !== false) throw new Error("rank gt");
+if (ranked(Pair(1n, 2n), Pair(1n, 2n)) !== true) throw new Error("rank eq");
+if (ranked(Pair(1n, 9n), Pair(2n, 0n)) !== true) throw new Error("rank first");
 if (hashed(Pair(1n, 2n)) !== 33n) throw new Error("hash " + hashed(Pair(1n, 2n)));
 "#,
         );

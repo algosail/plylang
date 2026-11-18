@@ -1,10 +1,11 @@
-//! Derived instances for `Eq`, `Show`, `Ord`, and `Hash`.
+//! Derived instances for `Setoid`, `Show`, `Ord`, and `Hash`.
 //!
 //! A module that can see the class receives an instance for each sum or product
 //! it declares, unless a handwritten instance or a `{method}{Type}` word is already
-//! there. Eq's method name is the one that class declares, so a prelude
+//! there. Setoid's method name is the one that class declares, so a prelude
 //! `equal` derives `equalPerson` and a test class whose method is `eq` still
-//! derives `eqPerson`. A function field, a `Ref` field, or a `Cell` field is left alone. `Num` and `Map` keep
+//! derives `eqPerson`. Ord's method is `lte` and the result is `Bool`. A function
+//! field, a `Ref` field, or a `Cell` field is left alone. `Num` and `Map` keep
 //! the instances written next to them, because those modules do not ask for a
 //! derived one.
 //!
@@ -22,8 +23,8 @@ use super::{Checker, TyNode};
 
 impl Checker {
     pub(super) fn derive_instances(&mut self, module: &Module) -> Result<(), Diagnostic> {
-        if let Some(method) = self.sole_class_method("Eq") {
-            self.derive_class(module, "Eq", &method, &method, eq_source)?;
+        if let Some(method) = self.sole_class_method("Setoid") {
+            self.derive_class(module, "Setoid", &method, &method, eq_source)?;
         }
         self.derive_showable(module)?;
         self.derive_sortable(module)?;
@@ -41,7 +42,7 @@ impl Checker {
         }
         let added_cat = self.install_derive_word("ply_show_cat", "( Str Str -- Str )");
         let before = self.derived.len();
-        let derived = self.derive_pending(module, "Show", "show", show_source);
+        let derived = self.derive_pending(module, "Show", "show", "show", show_source);
         if added_cat {
             self.words.remove("ply_show_cat");
         }
@@ -60,22 +61,34 @@ impl Checker {
         if module.language.is_some() {
             return Ok(());
         }
-        let added = !self.words.contains_key("compare");
-        if !self.class_method_ready("Ord", "compare") {
+        let added = !self.words.contains_key("lte");
+        if !self.class_method_ready("Ord", "lte") {
             return Ok(());
         }
-        // The generated arms return LT, EQ, and GT. Without those constructors
-        // the body would be a hard error, so this class is skipped.
-        if !self.ordering_ready() {
+        // A field that is less but not equal stops. That calls Setoid's method.
+        // The class is installed with Ord. The word is only here while the body
+        // is checked, unless this module already had it.
+        let Some(equal_method) = self.sole_class_method("Setoid") else {
             if added {
-                self.words.remove("compare");
+                self.words.remove("lte");
+            }
+            return Ok(());
+        };
+        let added_equal = !self.words.contains_key(&equal_method);
+        if added_equal && !self.install_class_method("Setoid", &equal_method) {
+            if added {
+                self.words.remove("lte");
             }
             return Ok(());
         }
         let before = self.derived.len();
-        self.derive_pending(module, "Ord", "compare", compare_source)?;
+        let derived = self.derive_pending(module, "Ord", "lte", &equal_method, lte_source);
+        if added_equal {
+            self.words.remove(&equal_method);
+        }
+        derived?;
         if added && self.derived.len() == before {
-            self.words.remove("compare");
+            self.words.remove("lte");
         }
         self.use_dicts.clear();
         Ok(())
@@ -91,7 +104,7 @@ impl Checker {
         }
         let added_mix = self.install_derive_word("ply_hash_mix", "( Int Int -- Int )");
         let before = self.derived.len();
-        let derived = self.derive_pending(module, "Hash", "hash", hash_source);
+        let derived = self.derive_pending(module, "Hash", "hash", "hash", hash_source);
         if added_mix {
             self.words.remove("ply_hash_mix");
         }
@@ -122,7 +135,7 @@ impl Checker {
             return Ok(());
         }
         let before = self.derived.len();
-        self.derive_pending(module, class_name, prefix, source_for)?;
+        self.derive_pending(module, class_name, prefix, prefix, source_for)?;
         if added && self.derived.len() == before {
             self.words.remove(method);
         }
@@ -130,7 +143,7 @@ impl Checker {
         Ok(())
     }
 
-    /// Eq declares one method. Its spelling is that method's name.
+    /// Setoid declares one method. Its spelling is that method's name.
     fn sole_class_method(&self, class_name: &str) -> Option<String> {
         let class = self.classes.get(class_name)?;
         let [method] = class.methods.as_slice() else {
@@ -160,12 +173,19 @@ impl Checker {
         true
     }
 
-    fn ordering_ready(&self) -> bool {
-        ["LT", "EQ", "GT"].into_iter().all(|name| {
-            self.ctor_words
-                .get(name)
-                .is_some_and(|ctor| ctor.type_name == "Ordering")
-        })
+    /// Puts the class method into `words` when the class is installed. Visibility
+    /// does not matter: Ord's superclass brings Setoid in without exporting it.
+    fn install_class_method(&mut self, class_name: &str, method: &str) -> bool {
+        let Some(class) = self.classes.get(class_name).cloned() else {
+            return false;
+        };
+        let Some(info) = class.methods.iter().find(|item| item.name == method) else {
+            return false;
+        };
+        if !self.words.contains_key(method) {
+            self.words.insert(method.to_string(), info.scheme.clone());
+        }
+        true
     }
 
     /// A scheme used only while derived bodies are checked. `true` when this
@@ -194,6 +214,7 @@ impl Checker {
         module: &Module,
         class_name: &str,
         prefix: &str,
+        source_arg: &str,
         source_for: fn(&crate::ast::Data, &str) -> String,
     ) -> Result<(), Diagnostic> {
         let mut pending: Vec<usize> = module
@@ -213,7 +234,7 @@ impl Checker {
                     continue;
                 };
                 let data = data.clone();
-                let source = source_for(&data, prefix);
+                let source = source_for(&data, source_arg);
                 if let Some(items) = self.derive_generated(module, &data, &source)? {
                     progress = true;
                     self.derived.extend(items);
@@ -234,14 +255,6 @@ impl Checker {
             return false;
         }
         if self.words.contains_key(&format!("{prefix}{}", data.name)) {
-            return false;
-        }
-        if prefix == "compare"
-            && data.ctors.iter().any(|ctor| ctor.fields.len() > 1)
-            && self
-                .words
-                .contains_key(&format!("plyOrdering{}", data.name))
-        {
             return false;
         }
         data.ctors.iter().all(|ctor| {
@@ -442,7 +455,7 @@ fn derived_scheme(data: &crate::ast::Data, class_name: &str, effect: &str) -> St
 fn eq_source(data: &crate::ast::Data, method: &str) -> String {
     let word = format!("{method}{}", data.name);
     let head = head_of(data);
-    let scheme = derived_scheme(data, "Eq", &format!("{head} {head} -- Bool"));
+    let scheme = derived_scheme(data, "Setoid", &format!("{head} {head} -- Bool"));
     let mut body = String::new();
     for ctor in &data.ctors {
         let left = ctor_pattern(&ctor.name, ctor.fields.len(), "l");
@@ -462,7 +475,7 @@ fn eq_source(data: &crate::ast::Data, method: &str) -> String {
     if data.ctors.len() > 1 {
         body.push_str("  _ _ ->\n    false\n");
     }
-    format!(": {word} {scheme}\n{body}\n# Eq {head}\n  {method} = {word}\n")
+    format!(": {word} {scheme}\n{body}\n# Setoid {head}\n  {method} = {word}\n")
 }
 
 fn show_source(data: &crate::ast::Data, _method: &str) -> String {
@@ -488,57 +501,45 @@ fn show_source(data: &crate::ast::Data, _method: &str) -> String {
     format!(": {word} {scheme}\n{body}\n# Show {head}\n  show = {word}\n")
 }
 
-fn compare_source(data: &crate::ast::Data, _method: &str) -> String {
-    let word = format!("compare{}", data.name);
+fn lte_source(data: &crate::ast::Data, equal_method: &str) -> String {
+    let word = format!("lte{}", data.name);
     let head = head_of(data);
-    let scheme = derived_scheme(data, "Ord", &format!("{head} {head} -- Ordering"));
-    let helper = format!("plyOrdering{}", data.name);
-    let needs_helper = data.ctors.iter().any(|ctor| ctor.fields.len() > 1);
+    let scheme = derived_scheme(data, "Ord", &format!("{head} {head} -- Bool"));
     let mut body = String::new();
     for ctor in &data.ctors {
         let left = ctor_pattern(&ctor.name, ctor.fields.len(), "l");
         let right = ctor_pattern(&ctor.name, ctor.fields.len(), "r");
         body.push_str(&format!("  {left} {right} ->\n"));
-        body.push_str(&compare_fields(&helper, ctor.fields.len()));
+        body.push_str(&lte_fields(equal_method, ctor.fields.len()));
     }
     if data.ctors.len() > 1 {
         for ctor in data.ctors.iter().take(data.ctors.len() - 1) {
             let pattern = ctor_wild(&ctor.name, ctor.fields.len());
-            body.push_str(&format!("  {pattern} _ ->\n    LT\n"));
-            body.push_str(&format!("  _ {pattern} ->\n    GT\n"));
+            body.push_str(&format!("  {pattern} _ ->\n    true\n"));
+            body.push_str(&format!("  _ {pattern} ->\n    false\n"));
         }
     }
-    let mut source = String::new();
-    if needs_helper {
-        source.push_str(&format!(
-            ": {helper} ( Ordering ( -- Ordering ) -- Ordering )\n  (LT) _ -> LT\n  (GT) _ -> GT\n  (EQ) next -> next call\n\n"
-        ));
-    }
-    source.push_str(&format!(
-        ": {word} {scheme}\n{body}\n# Ord {head}\n  compare = {word}\n"
-    ));
-    source
+    format!(": {word} {scheme}\n{body}\n# Ord {head}\n  lte = {word}\n")
 }
 
-/// The first difference wins. Later fields stay in a quotation until the
-/// earlier comparison is EQ.
-fn compare_fields(helper: &str, count: usize) -> String {
+/// The first difference wins. An earlier field that is below and not equal is
+/// true. A field that is not below is false. The last field is `lte`.
+fn lte_fields(equal_method: &str, count: usize) -> String {
     if count == 0 {
-        return "    EQ\n".to_string();
+        return "    true\n".to_string();
     }
-    field_step(helper, 0, count, 2)
+    lte_step(equal_method, 0, count, 2)
 }
 
-fn field_step(helper: &str, index: usize, count: usize, indent: usize) -> String {
+fn lte_step(equal_method: &str, index: usize, count: usize, indent: usize) -> String {
     let pad = "  ".repeat(indent);
     if index + 1 == count {
-        return format!("{pad}l{index} r{index} compare\n");
+        return format!("{pad}l{index} r{index} lte\n");
     }
-    let mut out = format!("{pad}l{index} r{index} compare\n");
-    out.push_str(&format!("{pad}[\n"));
-    out.push_str(&field_step(helper, index + 1, count, indent + 1));
-    out.push_str(&format!("{pad}] {helper}\n"));
-    out
+    let rest = lte_step(equal_method, index + 1, count, indent + 2);
+    format!(
+        "{pad}l{index} r{index} lte\n{pad}[\n{pad}  l{index} r{index} {equal_method}\n{pad}  [\n{rest}{pad}  ]\n{pad}  [ true ]\n{pad}  if\n{pad}]\n{pad}[ false ]\n{pad}if\n"
+    )
 }
 
 fn hash_source(data: &crate::ast::Data, _method: &str) -> String {

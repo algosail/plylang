@@ -4402,7 +4402,7 @@ mod tests {
             "@\n~ \"Data/Eq\" Eq\n~ \"Data/Maybe\" Maybe\n\n: eqMaybe ( a. (Maybe a) (Maybe a) -- Bool )\n  drop drop true\n\n# Eq (Maybe a)\n  eq = eqMaybe\n",
         );
         let error = build(&orphan.0).unwrap_err();
-        assert_eq!(error.message, "orphan instance");
+        assert_eq!(error.message, "orphan instance Eq (Maybe a)");
 
         let local = Temp::new("local-head");
         local.write("package.json", &package_json(exports));
@@ -4799,7 +4799,7 @@ mod tests {
             "@\n~ \"Door\" Eq\n\n: eqNum ( Num Num -- Bool )\n  drop drop false\n\n# Eq Num\n  eq = eqNum\n",
         );
         let error = build(&clash.0).unwrap_err();
-        assert_eq!(error.message, "incoherent instance");
+        assert_eq!(error.message, "incoherent instance Eq Num");
 
         let stopped = Temp::new("public-stopped");
         stopped.write(

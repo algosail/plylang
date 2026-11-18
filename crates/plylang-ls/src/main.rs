@@ -38,6 +38,7 @@ fn serve(connection: Connection) -> Result<(), String> {
                 ",".to_string(),
                 "=".to_string(),
                 ":".to_string(),
+                "#".to_string(),
             ]),
             ..CompletionOptions::default()
         }),
@@ -870,6 +871,7 @@ mod tests {
             .clone();
         assert!(triggers.iter().any(|item| item == "="));
         assert!(triggers.iter().any(|item| item == ":"));
+        assert!(triggers.iter().any(|item| item == "#"));
 
         client
             .sender

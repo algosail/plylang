@@ -1,4 +1,5 @@
-//! Completions at the cursor: words, types, import paths, import names, alias members, and product fields.
+//! Completions at the cursor: words, types, import paths, import names, alias members,
+//! product fields, and the class, head, methods, and words of an instance.
 //! A file that does not parse still completes from the lines above the cursor.
 
 use std::collections::HashMap;
@@ -83,6 +84,37 @@ pub fn complete(source: &str, path: &Path, line: u32, character: u32) -> Vec<Com
             let module = parsed_module(source, path, offset);
             type_names(path, module.as_ref(), &vars, replace)
         }
+        Context::InstanceClass { seen } => {
+            let module = parsed_module(source, path, offset);
+            instance_classes(path, module.as_ref(), &seen, replace)
+        }
+        Context::InstanceHead { vars } => {
+            let module = parsed_module(source, path, offset);
+            type_names(path, module.as_ref(), &vars, replace)
+                .into_iter()
+                .filter(|item| item.kind != CompletionKind::Class)
+                .collect()
+        }
+        Context::InstanceMethod {
+            classes,
+            seen,
+            keywords: with_keywords,
+        } => {
+            let module = parsed_module(source, path, offset);
+            let mut items = if with_keywords {
+                keywords(path.to_string_lossy().ends_with(".d.ply"), replace)
+            } else {
+                Vec::new()
+            };
+            items.extend(instance_methods(
+                path,
+                module.as_ref(),
+                &classes,
+                &seen,
+                replace,
+            ));
+            items
+        }
         Context::Word => {
             let module = parsed_module(source, path, offset);
             let mut items = word_names(path, module.as_ref(), replace);
@@ -125,6 +157,17 @@ enum Context {
     Type {
         vars: Vec<String>,
     },
+    InstanceClass {
+        seen: Vec<String>,
+    },
+    InstanceHead {
+        vars: Vec<String>,
+    },
+    InstanceMethod {
+        classes: Vec<String>,
+        seen: Vec<String>,
+        keywords: bool,
+    },
     Word,
 }
 
@@ -150,6 +193,18 @@ fn context_of(walked: &Walk, partial: Option<&Token>, at_column_0: bool) -> Cont
         Place::DataFields => Context::Type {
             vars: walked.params.clone(),
         },
+        Place::InstanceClass => Context::InstanceClass {
+            seen: walked.classes.clone(),
+        },
+        Place::InstanceHead => Context::InstanceHead {
+            vars: walked.vars.clone(),
+        },
+        Place::InstanceBody => Context::InstanceMethod {
+            classes: walked.classes.clone(),
+            seen: walked.bound.clone(),
+            keywords: at_column_0,
+        },
+        Place::InstanceWord => Context::Word,
         Place::Body if !at_column_0 => Context::Word,
         // A term at column 0 is still a term. The brackets are not a new declaration.
         Place::ProbePicture | Place::ProbeProgram => Context::Word,
@@ -215,9 +270,15 @@ fn import_names(
                 }
                 let mut load = |start: &Path, path: &str| load_surface(start, path);
                 let Some((_, found)) = surface::lookup(&module, &file, &name, &mut load) else {
+                    push(&mut items, unnamed_export(&name, replace));
                     continue;
                 };
-                for (kind, detail, doc) in found_exports(&found, &name) {
+                let exports = found_exports(&found, &name);
+                if exports.is_empty() {
+                    push(&mut items, unnamed_export(&name, replace));
+                    continue;
+                }
+                for (kind, detail, doc) in exports {
                     push(
                         &mut items,
                         entry(&name, &name, kind, &detail, &doc, "2", replace),
@@ -227,6 +288,103 @@ fn import_names(
         }
     }
     items
+}
+
+/// A published name whose definition could not be read. Uppercase is a type.
+fn unnamed_export(name: &str, replace: Span) -> Completion {
+    let kind = if is_upper(name) {
+        CompletionKind::Type
+    } else {
+        CompletionKind::Word
+    };
+    entry(name, name, kind, "", "", "2", replace)
+}
+
+fn instance_classes(
+    from: &Path,
+    module: Option<&Module>,
+    seen: &[String],
+    replace: Span,
+) -> Vec<Completion> {
+    let mut items = Vec::new();
+    let Some(module) = module else {
+        return items;
+    };
+    for (local, class) in classes_in(from, module) {
+        if seen.iter().any(|have| have == &local) {
+            continue;
+        }
+        push(
+            &mut items,
+            entry(
+                &local,
+                &local,
+                CompletionKind::Class,
+                &class_detail(&class),
+                &class.doc,
+                "1",
+                replace,
+            ),
+        );
+    }
+    items
+}
+
+fn instance_methods(
+    from: &Path,
+    module: Option<&Module>,
+    classes: &[String],
+    seen: &[String],
+    replace: Span,
+) -> Vec<Completion> {
+    let mut items = Vec::new();
+    let Some(module) = module else {
+        return items;
+    };
+    let known = classes_in(from, module);
+    for name in classes {
+        let Some((_, class)) = known.iter().find(|(local, _)| local == name) else {
+            continue;
+        };
+        for method in &class.methods {
+            if seen.iter().any(|have| have == &method.name) {
+                continue;
+            }
+            push(&mut items, method_entry(class, method, "1", replace));
+        }
+    }
+    items
+}
+
+/// `(local name, class)` for classes defined here and classes this file imports.
+fn classes_in(from: &Path, module: &Module) -> Vec<(String, Class)> {
+    let mut found = Vec::new();
+    for item in &module.items {
+        if let Item::Class(class) = item {
+            found.push((class.name.clone(), class.clone()));
+        }
+    }
+    for import in &module.imports {
+        let Some(file) = provider_file(from, &import.path) else {
+            continue;
+        };
+        let Some(provider) = read_module(&file) else {
+            continue;
+        };
+        // `selected_names` is `(remote, local)`. An alias binds `Box` as `M:Box`.
+        for (remote, local) in selected_names(from, import) {
+            let mut load = |start: &Path, path: &str| load_surface(start, path);
+            let Some((_, hit)) = surface::lookup(&provider, &file, &remote, &mut load) else {
+                continue;
+            };
+            if let Found::Class(class) = hit {
+                if class.name == remote {
+                    found.push((local, class));
+                }
+            }
+        }
+    }
+    found
 }
 
 fn type_names(
@@ -448,6 +606,7 @@ fn alias_import_path(tokens: &[Token], offset: usize, alias: &str) -> Option<Str
 fn kind_in(kind: CompletionKind, space: NameSpace) -> bool {
     match space {
         NameSpace::Either => true,
+        NameSpace::Class => matches!(kind, CompletionKind::Class),
         NameSpace::Type => matches!(
             kind,
             CompletionKind::Type | CompletionKind::Class | CompletionKind::TypeVar
@@ -475,7 +634,9 @@ fn alias_cursor(tokens: &[Token], offset: usize) -> Option<AliasCursor> {
             Some(AliasCursor {
                 alias: glued_alias(tokens, index)?,
                 replace: Span::new(offset, offset),
-                space: name_space_at(tokens, index),
+                // Include the colon. Otherwise `# M:` reads `M` as a finished class
+                // and offers types of the head.
+                space: name_space_at(tokens, index + 1),
             })
         }
         TokenKind::Ident(_) => {
@@ -849,6 +1010,14 @@ struct Walk {
     binders: bool,
     depth: i32,
     saw_foreign: bool,
+    /// Class names already written on this instance, including `Alias:Name`.
+    classes: Vec<String>,
+    /// Method names already bound on this instance.
+    bound: Vec<String>,
+    /// The method name before `=`.
+    method: Option<String>,
+    /// The alias of a glued `Alias:name` that has not taken its name yet.
+    qualifier: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -875,6 +1044,16 @@ enum Place {
     DataCtor,
     DataFields,
     DataGap,
+    /// After `#`, on a class name. A comma returns here for the next class.
+    InstanceClass,
+    /// Types of the instance head, on the same line as the last class.
+    InstanceHead,
+    /// An indented `method = word` line, on the method name.
+    InstanceBody,
+    /// After the method name, before `=`.
+    InstanceEq,
+    /// After `=`, on the implementation word.
+    InstanceWord,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -882,21 +1061,29 @@ pub(crate) enum NameSpace {
     Type,
     Value,
     Either,
+    /// A class name. An alias member here is a class, not a type or a word.
+    Class,
 }
 
 /// The place of the tokens before `index`. A type name and a constructor can share a name.
 pub(crate) fn name_space_at(tokens: &[Token], index: usize) -> NameSpace {
     match walk(&prefix(tokens, index)).state {
-        Place::Signature | Place::DataFields | Place::DataName | Place::DataParams => {
-            NameSpace::Type
-        }
+        Place::Signature
+        | Place::DataFields
+        | Place::DataName
+        | Place::DataParams
+        | Place::InstanceHead => NameSpace::Type,
+        Place::InstanceClass => NameSpace::Class,
         Place::Body
         | Place::DefName
         | Place::DataCtor
         | Place::Vis
         | Place::DefParen
         | Place::ProbePicture
-        | Place::ProbeProgram => NameSpace::Value,
+        | Place::ProbeProgram
+        | Place::InstanceBody
+        | Place::InstanceEq
+        | Place::InstanceWord => NameSpace::Value,
         Place::Top
         | Place::Import
         | Place::ImportString
@@ -931,6 +1118,10 @@ fn walk(tokens: &[&Token]) -> Walk {
         binders: true,
         depth: 0,
         saw_foreign: false,
+        classes: Vec::new(),
+        bound: Vec::new(),
+        method: None,
+        qualifier: None,
     };
     let mut index = 0;
     while index < tokens.len() {
@@ -951,6 +1142,10 @@ fn walk(tokens: &[&Token]) -> Walk {
             walked.depth = 0;
             walked.saw_foreign = false;
             walked.rename = false;
+            walked.classes.clear();
+            walked.bound.clear();
+            walked.method = None;
+            walked.qualifier = None;
         }
         step(&mut walked, token, next);
         index += 1;
@@ -982,6 +1177,11 @@ fn resets(state: Place, token: &Token) -> bool {
             | Place::ProbePicture
             | Place::ProbeBetween
             | Place::ProbeProgram
+            | Place::InstanceClass
+            | Place::InstanceHead
+            | Place::InstanceBody
+            | Place::InstanceEq
+            | Place::InstanceWord
     )
 }
 
@@ -992,7 +1192,22 @@ fn is_probe_start(token: &Token) -> bool {
 fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
     match walked.state {
         Place::Top => match &token.kind {
-            TokenKind::Import => walked.state = Place::Import,
+            TokenKind::Import => {
+                walked.path.clear();
+                walked.seen.clear();
+                walked.closed = false;
+                walked.rename = false;
+                walked.state = Place::Import;
+            }
+            TokenKind::Instance => {
+                walked.classes.clear();
+                walked.bound.clear();
+                walked.method = None;
+                walked.qualifier = None;
+                walked.vars.clear();
+                walked.depth = 0;
+                walked.state = Place::InstanceClass;
+            }
             TokenKind::Colon => {
                 walked.saw_foreign = false;
                 walked.state = Place::DefName;
@@ -1168,7 +1383,98 @@ fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
             TokenKind::Pipe => walked.state = Place::DataCtor,
             _ => {}
         },
+        Place::InstanceClass => match &token.kind {
+            TokenKind::Ident(name) if glued_colon(token, next) => {
+                walked.qualifier = Some(name.clone());
+            }
+            TokenKind::Colon => {}
+            TokenKind::Ident(name) => {
+                let full = match walked.qualifier.take() {
+                    Some(alias) => format!("{alias}:{name}"),
+                    None => name.clone(),
+                };
+                walked.classes.push(full);
+                walked.vars.clear();
+                walked.depth = 0;
+                walked.state = Place::InstanceHead;
+            }
+            TokenKind::Newline => {}
+            _ => {}
+        },
+        Place::InstanceHead => match &token.kind {
+            TokenKind::LParen => walked.depth += 1,
+            TokenKind::RParen => {
+                walked.depth = walked.depth.saturating_sub(1);
+            }
+            TokenKind::Comma if walked.depth == 0 => {
+                walked.vars.clear();
+                walked.state = Place::InstanceClass;
+            }
+            TokenKind::Newline if walked.depth == 0 => {
+                walked.method = None;
+                walked.qualifier = None;
+                walked.state = Place::InstanceBody;
+            }
+            TokenKind::Ident(name) if is_lower(name) && !followed_by_colon(next) => {
+                if !walked.vars.iter().any(|var| var == name) {
+                    walked.vars.push(name.clone());
+                }
+            }
+            _ => {}
+        },
+        Place::InstanceBody => match &token.kind {
+            TokenKind::Ident(name) => {
+                walked.method = Some(name.clone());
+                walked.qualifier = None;
+                walked.state = Place::InstanceEq;
+            }
+            TokenKind::Eq if token.col == 0 && token.line_start => {
+                walked.classes.clear();
+                walked.bound.clear();
+                walked.method = None;
+                walked.qualifier = None;
+                walked.state = Place::Top;
+            }
+            TokenKind::Newline => {}
+            _ => {}
+        },
+        Place::InstanceEq => match &token.kind {
+            TokenKind::Eq => walked.state = Place::InstanceWord,
+            TokenKind::Newline => {
+                walked.method = None;
+                walked.state = Place::InstanceBody;
+            }
+            _ => {}
+        },
+        Place::InstanceWord => match &token.kind {
+            TokenKind::Ident(name) if glued_colon(token, next) => {
+                walked.qualifier = Some(name.clone());
+            }
+            TokenKind::Colon => {}
+            TokenKind::Ident(_) => {
+                walked.qualifier = None;
+                if let Some(name) = walked.method.take() {
+                    walked.bound.push(name);
+                }
+                walked.state = Place::InstanceBody;
+            }
+            TokenKind::Newline => {
+                walked.qualifier = None;
+                walked.method = None;
+                walked.state = Place::InstanceBody;
+            }
+            _ => {}
+        },
     }
+}
+
+/// `Alias:` with no space, and not a colon that starts a word.
+fn glued_colon(token: &Token, next: Option<&&Token>) -> bool {
+    next.is_some_and(|next| {
+        matches!(next.kind, TokenKind::Colon)
+            && token.span.end == next.span.start
+            && !(next.line_start && next.col == 0)
+    })
 }
 
 fn is_item(token: &Token) -> bool {
@@ -2368,6 +2674,35 @@ mod tests {
         let (line, character) = at(source, "( M");
         let types = complete(source, &path, line, character);
         assert!(types.iter().any(|item| item.label == "Maybe"), "{types:?}");
+
+        let source = "~ \"Data/Maybe\" Just, ";
+        let (line, character) = at(source, "Just, ");
+        let names = complete(source, &path, line, character);
+        assert!(
+            names.iter().any(|item| item.label == "Nothing"),
+            "{names:?}"
+        );
+        assert!(!names.iter().any(|item| item.label == "Just"), "{names:?}");
+
+        let source = "~ \"Data/Maybe\"\n  J";
+        let (line, character) = at(source, "\n  J");
+        let names = complete(source, &path, line, character);
+        assert!(names.iter().any(|item| item.label == "Just"), "{names:?}");
+
+        fs::write(
+            root.join("src/Data/Num.ply"),
+            "@ add\n\n: add ( Int Int -- Int )\n  drop\n",
+        )
+        .unwrap();
+        let source = "~ \"Data/Maybe\" Just\n\n~ \"Data/Maybe\" J";
+        let (line, character) = at(source, "Maybe\" J");
+        let names = complete(source, &path, line, character);
+        assert!(names.iter().any(|item| item.label == "Just"), "{names:?}");
+        let source = "~ \"Data/Maybe\" : M\n\n~ \"Data/Num\" a";
+        let (line, character) = at(source, "Num\" a");
+        let names = complete(source, &path, line, character);
+        assert!(names.iter().any(|item| item.label == "add"), "{names:?}");
+        assert!(!names.iter().any(|item| item.label == "Just"), "{names:?}");
     }
 
     #[test]
@@ -2475,6 +2810,150 @@ mod tests {
             &partial[from.replace.start as usize..from.replace.end as usize],
             "fr"
         );
+
+        let header = "~ \"Data/Maybe\" : M\n\n# ";
+        let (line, character) = at(header, "# ");
+        let classes = complete(header, &path, line, character);
+        assert!(
+            classes.iter().any(|item| item.label == "M:Box"),
+            "{classes:?}"
+        );
+        assert!(
+            !classes.iter().any(|item| item.label == "Maybe"),
+            "{classes:?}"
+        );
+        let qualified = "~ \"Data/Maybe\" : M\n\n# M:";
+        let (line, character) = at(qualified, "# M:");
+        let classes = complete(qualified, &path, line, character);
+        let box_class = classes
+            .iter()
+            .find(|item| item.label == "Box")
+            .expect("class Box");
+        assert_eq!(box_class.kind, CompletionKind::Class);
+        assert!(
+            !classes.iter().any(|item| item.label == "Maybe"),
+            "{classes:?}"
+        );
+        assert!(
+            !classes.iter().any(|item| item.label == "Just"),
+            "{classes:?}"
+        );
+
+        let method = "~ \"Data/Maybe\" : M\n\n# M:Box a\n  w";
+        let (line, character) = at(method, "\n  w");
+        let methods = complete(method, &path, line, character);
+        let wrap = methods
+            .iter()
+            .find(|item| item.label == "wrap")
+            .expect("wrap");
+        assert_eq!(wrap.kind, CompletionKind::Word);
+        assert!(
+            !methods.iter().any(|item| item.label == "dup"),
+            "{methods:?}"
+        );
+    }
+
+    #[test]
+    fn completes_an_instance() {
+        let prelude = "\
+& Eq a
+  .. Equal.
+  eq ( a a -- Bool )
+  differ ( a a -- Bool )
+
+& Show a
+  show ( a -- Str )
+
+; Maybe a = Nothing | Just a
+
+: eqInt ( Int Int -- Bool )
+  drop drop true
+
+: differInt ( Int Int -- Bool )
+  drop drop false
+";
+        let classes = labels(&format!("{prelude}\n# "), "\n# ");
+        assert!(classes.iter().any(|label| label == "Eq"), "{classes:?}");
+        assert!(classes.iter().any(|label| label == "Show"), "{classes:?}");
+        assert!(!classes.iter().any(|label| label == "Maybe"), "{classes:?}");
+        assert!(!classes.iter().any(|label| label == "dup"), "{classes:?}");
+
+        let source = format!("{prelude}\n# Eq ");
+        let (line, character) = at(&source, "# Eq ");
+        let types = complete(&source, Path::new("M.ply"), line, character);
+        assert!(types.iter().any(|item| item.label == "Maybe"), "{types:?}");
+        assert!(types.iter().any(|item| item.label == "Int"), "{types:?}");
+        assert!(!types.iter().any(|item| item.label == "Eq"), "{types:?}");
+        assert!(!types.iter().any(|item| item.label == "eq"), "{types:?}");
+
+        let source = format!("{prelude}\n# Eq a ");
+        let (line, character) = at(&source, "# Eq a ");
+        let types = complete(&source, Path::new("M.ply"), line, character);
+        assert!(types.iter().any(|item| item.label == "a"), "{types:?}");
+
+        let source = format!("{prelude}\n# Eq, ");
+        let (line, character) = at(&source, "# Eq, ");
+        let classes = complete(&source, Path::new("M.ply"), line, character);
+        assert!(
+            classes.iter().any(|item| item.label == "Show"),
+            "{classes:?}"
+        );
+        assert!(
+            !classes.iter().any(|item| item.label == "Eq"),
+            "{classes:?}"
+        );
+
+        let source = format!("{prelude}\n# Eq Int\n  ");
+        let (line, character) = at(&source, "\n  ");
+        let methods = complete(&source, Path::new("M.ply"), line, character);
+        let eq = methods.iter().find(|item| item.label == "eq").expect("eq");
+        assert!(eq.detail.contains("a a -- Bool"), "{eq:?}");
+        assert_eq!(eq.documentation, "Equal.");
+        assert!(
+            methods.iter().any(|item| item.label == "differ"),
+            "{methods:?}"
+        );
+        assert!(
+            !methods.iter().any(|item| item.label == "dup"),
+            "{methods:?}"
+        );
+        assert!(
+            !methods.iter().any(|item| item.label == "show"),
+            "{methods:?}"
+        );
+
+        let source = format!("{prelude}\n# Eq Int\n  eq = ");
+        let (line, character) = at(&source, "eq = ");
+        let words = complete(&source, Path::new("M.ply"), line, character);
+        assert!(words.iter().any(|item| item.label == "eqInt"), "{words:?}");
+        assert!(words.iter().any(|item| item.label == "dup"), "{words:?}");
+
+        let source = format!("{prelude}\n# Eq Int\n  eq = eqInt\n  ");
+        let (line, character) = at(&source, "eqInt\n  ");
+        let methods = complete(&source, Path::new("M.ply"), line, character);
+        assert!(
+            methods.iter().any(|item| item.label == "differ"),
+            "{methods:?}"
+        );
+        assert!(
+            !methods.iter().any(|item| item.label == "eq"),
+            "{methods:?}"
+        );
+
+        let source = format!("{prelude}\n# Eq, Show Int\n  ");
+        let (line, character) = at(&source, "\n  ");
+        let methods = complete(&source, Path::new("M.ply"), line, character);
+        assert!(methods.iter().any(|item| item.label == "eq"), "{methods:?}");
+        assert!(
+            methods.iter().any(|item| item.label == "show"),
+            "{methods:?}"
+        );
+
+        let source = format!("{prelude}\n# Eq Int\n  eq = eqInt\n\n: use ( Int -- Int )\n  du");
+        let (line, character) = at(&source, "\n  du");
+        let words = complete(&source, Path::new("M.ply"), line, character);
+        assert!(words.iter().any(|item| item.label == "dup"), "{words:?}");
+        assert!(words.iter().any(|item| item.label == "use"), "{words:?}");
     }
 
     #[test]

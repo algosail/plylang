@@ -127,10 +127,20 @@ pub enum Error {
         owners: String,
     },
     OrphanInstance,
-    MissingMethod(String),
+    /// Methods the instance head does not bind. `head` is the class and the
+    /// types written on the instance.
+    MissingMethod {
+        head: String,
+        names: Vec<String>,
+    },
     InstanceWordPrivate(String),
     IncoherentInstance,
-    NoInstance(String),
+    /// `needed_by` is empty at a use. On an instance it is the head whose
+    /// superclass has no instance.
+    NoInstance {
+        constraint: String,
+        needed_by: String,
+    },
     AmbiguousConstraint(String),
     CyclicInstance(String),
     ImportNotExported {
@@ -380,10 +390,29 @@ impl Error {
                 ("PL0083", format!("method {name} is a method of {owners}"))
             }
             OrphanInstance => static_text("PL0084", "orphan instance"),
-            MissingMethod(name) => ("PL0085", format!("missing method {name}")),
+            MissingMethod { head, names } => (
+                "PL0085",
+                format!(
+                    "{head} is missing {} {}",
+                    noun(names.len(), "method", "methods"),
+                    names.join(", ")
+                ),
+            ),
             InstanceWordPrivate(name) => ("PL0086", format!("instance word {name} is private")),
             IncoherentInstance => static_text("PL0087", "incoherent instance"),
-            NoInstance(constraint) => ("PL0088", format!("no instance for {constraint}")),
+            NoInstance {
+                constraint,
+                needed_by,
+            } => {
+                if needed_by.is_empty() {
+                    ("PL0088", format!("no instance for {constraint}"))
+                } else {
+                    (
+                        "PL0088",
+                        format!("{needed_by} has no instance for {constraint}"),
+                    )
+                }
+            }
             AmbiguousConstraint(constraint) => {
                 ("PL0089", format!("ambiguous constraint {constraint}"))
             }
@@ -823,8 +852,11 @@ mod tests {
             ),
             (Error::OrphanInstance, "orphan instance", "PL0084"),
             (
-                Error::MissingMethod("eq".into()),
-                "missing method eq",
+                Error::MissingMethod {
+                    head: "Eq Int".into(),
+                    names: vec!["eq".into()],
+                },
+                "Eq Int is missing method eq",
                 "PL0085",
             ),
             (
@@ -834,8 +866,19 @@ mod tests {
             ),
             (Error::IncoherentInstance, "incoherent instance", "PL0087"),
             (
-                Error::NoInstance("Eq Int".into()),
+                Error::NoInstance {
+                    constraint: "Eq Int".into(),
+                    needed_by: String::new(),
+                },
                 "no instance for Eq Int",
+                "PL0088",
+            ),
+            (
+                Error::NoInstance {
+                    constraint: "Eq Int".into(),
+                    needed_by: "Ord Int".into(),
+                },
+                "Ord Int has no instance for Eq Int",
                 "PL0088",
             ),
             (
@@ -1090,7 +1133,7 @@ mod tests {
                 "PL0141",
             ),
         ];
-        assert_eq!(samples.len(), 141);
+        assert_eq!(samples.len(), 142);
         for (error, message, code) in samples {
             assert_eq!(error.code(), code, "{message}");
             assert_eq!(error.message(), message);

@@ -697,19 +697,23 @@ Fix: split the instance into one head per class, or give the methods different n
 
 ## PL0084
 
-`orphan instance`
+`orphan instance HEAD`
 
-This module defines neither the class nor a type constructor in the instance head. A builtin type in the head (`Num`, `Maybe` from the compiler, and the other builtins) counts as defined here.
+This module defines neither the class nor a type constructor in the instance head. `HEAD` is that class and the types written after it, such as `Eq (Maybe a)`. A builtin type in the head (`Num`, `Maybe` from the compiler, and the other builtins) counts as defined here.
 
 Fix: move the instance into the module that defines the class, or into the module that defines one of the head types.
 
 ## PL0085
 
-`missing method NAME`
+`HEAD is missing method NAME`
 
-The instance does not bind every method of the class.
+`HEAD is missing methods NAME, NAME`
 
-Fix: add `name = word` for the missing method.
+The instance does not bind every method of that class. `HEAD` is the class and the types written on the instance, such as `Eq Int`.
+
+A word bound for a method reports that method's own error with the head in front: `Eq Int method eq: type mismatch: expected Bool, found Int`.
+
+Fix: add `name = word` for each missing method.
 
 ## PL0086
 
@@ -721,7 +725,9 @@ This code is not produced. A word bound in `#` stays in its file when it is abse
 
 `incoherent instance`
 
-Two instances match the same head, a new instance overlaps one already in scope, or two constraints in one signature each supply the wanted class. Several superclass paths from one constraint are one dictionary, and the checker uses the shortest path. A synonym is expanded before this check, so two spellings of one type still overlap.
+`incoherent instance HEAD`
+
+Two instances match the same head, a new instance overlaps one already in scope, or two constraints in one signature each supply the wanted class. A declaration names the head, such as `Eq Int`. Two constraints in one signature stay `incoherent instance`. Several superclass paths from one constraint are one dictionary, and the checker uses the shortest path. A synonym is expanded before this check, so two spellings of one type still overlap.
 
 Fix: delete one of the instances, or write the wanted class once in the signature.
 
@@ -729,7 +735,9 @@ Fix: delete one of the instances, or write the wanted class once in the signatur
 
 `no instance for CONSTRAINT`
 
-No visible instance matches this constraint.
+`HEAD has no instance for CONSTRAINT`
+
+No visible instance matches this constraint. The second form is an instance whose superclass is not implemented for that head. `HEAD` is the class being declared, such as `Ord Int`, and `CONSTRAINT` is the superclass it needs, such as `Eq Int`.
 
 Fix: declare the instance, import the module that declares it, or change the type so an existing instance applies.
 

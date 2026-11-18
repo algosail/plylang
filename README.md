@@ -34,13 +34,13 @@ An omitted stack bottom is the same tail on the left and on the right. An explic
 
 Five built-in types and two constructors of arity 1 are visible in every module. They cannot be redefined.
 
-| Type | Literal | In JavaScript |
-| --- | --- | --- |
-| `Num` | `1`, `42`, `1.5`, `1e-3` | number |
-| `Int` | `0n`, `42n`, `-42n` | `bigint` |
-| `Str` | `"hi"`, `"a\nb"` | string |
-| `Bool` | `true`, `false` | boolean |
-| `Unit` | the word `Unit` | `undefined` |
+| Type   | Literal                  | In JavaScript |
+| ------ | ------------------------ | ------------- |
+| `Num`  | `1`, `42`, `1.5`, `1e-3` | number        |
+| `Int`  | `0n`, `42n`, `-42n`      | `bigint`      |
+| `Str`  | `"hi"`, `"a\nb"`         | string        |
+| `Bool` | `true`, `false`          | boolean       |
+| `Unit` | the word `Unit`          | `undefined`   |
 
 `(Array a)` is an array. `(StrMap a)` is a dictionary with a string key. Bare digits are `Num`, an ordinary number in JavaScript. `Int` is written with the suffix `n` and becomes a `bigint`. In the examples below a number is `Num`. `1.0` is a number. `1.` is the number `1` and a separate dot. A string accepts `\\`, `\"`, `\n`, `\t`, and `\r`.
 
@@ -96,13 +96,13 @@ The same permutations as in Factor follow, with names made of letters: `dupd`, `
 `cons` pushes a value and then runs a quotation. The value sits under the quotation, so `5 [ 1 add ] cons` is a quotation of type `(-- Num)` that pushes five and then adds one. The call site does not name that value.
 
 ```ply
-~ "@plylang/prelude/Classes/Eq" equal
-~ "@plylang/prelude/Classes/Subtractable" subtract
+~ "@plylang/prelude/Classes/Setoid" equal
+~ "@plylang/prelude/Classes/Subtractable" sub
 ~ "@plylang/prelude/Classes/Arithmetic" multiply
 ~ "@plylang/prelude/Data/Num"
 
 : fact ( Num -- Num )
-  dup 0 equal [ drop 1 ] [ dup 1 subtract fact multiply ] if
+  dup 0 equal [ drop 1 ] [ dup 1 sub fact multiply ] if
 ```
 
 Zero is replaced by one. Otherwise `n` and `n - 1` remain on the stack, the recursive `fact` computes the second, and `multiply` multiplies.
@@ -259,10 +259,10 @@ The order in the example is the dictionary, the key, and the value on top.
 ```
 
 ```ply
-~ "@plylang/prelude/Classes/Eq" Eq, equal
+~ "@plylang/prelude/Classes/Setoid" Setoid, equal
 ~ "@plylang/prelude/Data/Num"
 
-: same ( Eq a => a a -- Bool )
+: same ( Setoid a => a a -- Bool )
   equal
 ```
 

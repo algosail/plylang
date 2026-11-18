@@ -76,4 +76,4 @@ A parameter indexes the value. `(Hub Num)` and `(Hub Str)` are different types. 
 
 A name binds the value. There is no constructor to match. Writing `=`, `==`, or a constructor is [PL0116](Errors.md#pl0116).
 
-A data type derives Eq, Show, Ord, and Hash when that class is in scope, the module does not already give the type an instance, no field is a function, a Ref, or a Cell, and Ord can see LT, EQ, and GT.
+A data type derives Setoid, Show, Ord, and Hash when that class is in scope, the module does not already give the type an instance, and no field is a function, a Ref, or a Cell. Ord's derived method is `lte` and returns `Bool`.

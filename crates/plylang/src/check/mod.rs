@@ -6157,11 +6157,23 @@ mod tests {
         );
         err(
             "& Eq a\n  eq ( a a -- Bool )\n  differ ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  drop drop true\n\n# Eq Int\n  eq = eqInt\n",
-            "missing method differ",
+            "Eq Int is missing method differ",
+        );
+        err(
+            "& Eq a\n  eq ( a a -- Bool )\n  differ ( a a -- Bool )\n\n# Eq Int\n",
+            "Eq Int is missing methods eq, differ",
+        );
+        err(
+            "& Eq a\n  eq ( a a -- Bool )\n\n& Show a\n  show ( a -- Str )\n\n# Eq, Show Int\n",
+            "Eq Int is missing method eq",
         );
         err(
             "& Eq a\n  eq ( a a -- Bool )\n\n: bad ( Int -- Int )\n  dup drop\n\n# Eq Int\n  eq = bad\n",
-            "type mismatch: expected Bool, found Int",
+            "Eq Int method eq: type mismatch: expected Bool, found Int",
+        );
+        err(
+            "& Eq a\n  eq ( a a -- Bool )\n\n# Eq Int\n  eq = missing\n",
+            "Eq Int method eq: undefined word missing",
         );
         ok("& Eq a\n  eq ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  drop drop true\n\n# Eq Int\n  eq = eqInt\n");
         ok("& Eq a\n  eq ( a a -- Bool )\n\n: foreign eqInt ( Int Int -- Bool )\n\n# Eq Int\n  eq = eqInt\n");
@@ -6171,11 +6183,11 @@ mod tests {
         );
         err(
             "& Eq a\n  eq ( a a -- Bool )\n\n: eqInt ( Int Int -- Bool )\n  drop drop true\n\n# Eq Int\n  eq = eqInt\n\n# Eq Int\n  eq = eqInt\n",
-            "incoherent instance",
+            "incoherent instance Eq Int",
         );
         err(
             "& Eq a\n  eq ( a a -- Bool )\n\n; Maybe a = Nothing | Just a\n\n: eqMaybe ( a. (Maybe a) (Maybe a) -- Bool )\n  drop drop true\n\n# Eq (Maybe a)\n  eq = eqMaybe\n\n# Eq (Maybe Int)\n  eq = eqMaybe\n",
-            "incoherent instance",
+            "incoherent instance Eq (Maybe Int)",
         );
         err(
             "& Eq a\n  eq ( a a -- Bool )\n\n; Maybe a = Nothing | Just a\n\n: eqMaybe ( a. Eq (Maybe a) => (Maybe a) (Maybe a) -- Bool )\n  drop drop true\n\n# Eq (Maybe a)\n  eq = eqMaybe\n\n: use ( (Maybe Int) (Maybe Int) -- Bool )\n  eq\n",
@@ -6183,7 +6195,7 @@ mod tests {
         );
         err(
             "& Eq a\n  eq ( a a -- Bool )\n\n: eqWeird ( b. Eq b => Int Int -- Bool )\n  drop drop true\n\n# Eq Int\n  eq = eqWeird\n",
-            "ambiguous constraint Eq _",
+            "Eq Int method eq: ambiguous constraint Eq _",
         );
         err(
             "& Neutral a\n  empty ( -- a )\n\n: emptyString ( -- Str )\n  \"\"\n\n# Neutral Str\n  empty = emptyString\n\n: bad ( -- Int )\n  empty drop 1n\n",
@@ -6763,13 +6775,13 @@ mod tests {
     #[test]
     fn comparable_is_derived_for_a_product_of_ints() {
         ok("\
-& Eq a
+& Setoid a
   eq ( a a -- Bool )
 
 : eqInt ( Int Int -- Bool )
   drop drop true
 
-# Eq Int
+# Setoid Int
   eq = eqInt
 
 ; Person = Person name : Int, age : Int
@@ -6778,13 +6790,13 @@ mod tests {
   eq
 ");
         ok("\
-& Eq a
+& Setoid a
   eq ( a a -- Bool )
 
 : eqInt ( Int Int -- Bool )
   drop drop true
 
-# Eq Int
+# Setoid Int
   eq = eqInt
 
 ; Answer = No | Yes Int
@@ -6794,7 +6806,7 @@ mod tests {
 ");
         err(
             "\
-& Eq a
+& Setoid a
   eq ( a a -- Bool )
 
 ; Task = Task ( Int -- Int )
@@ -6802,11 +6814,11 @@ mod tests {
 : same ( Task Task -- Bool )
   eq
 ",
-            "no instance for Eq Task",
+            "no instance for Setoid Task",
         );
         err(
             "\
-& Eq a
+& Setoid a
   eq ( a a -- Bool )
 
 ; foreign Ref a
@@ -6816,11 +6828,11 @@ mod tests {
 : same ( Cell Cell -- Bool )
   eq
 ",
-            "no instance for Eq Cell",
+            "no instance for Setoid Cell",
         );
         err(
             "\
-& Eq a
+& Setoid a
   eq ( a a -- Bool )
 
 ; foreign Cell a
@@ -6830,7 +6842,7 @@ mod tests {
 : same ( Box Box -- Bool )
   eq
 ",
-            "no instance for Eq Box",
+            "no instance for Setoid Box",
         );
     }
 
@@ -6942,57 +6954,61 @@ mod tests {
             "no instance for Show Cell",
         );
         ok("\
-; Ordering = LT | EQ | GT
-
-& Eq a
+& Setoid a
   eq ( a a -- Bool )
 
-& Eq a => Ord a
-  compare ( a a -- Ordering )
+& Setoid a => Ord a
+  lte ( a a -- Bool )
 
 : eqInt ( Int Int -- Bool )
   drop drop true
 
-: compareInt ( Int Int -- Ordering )
-  drop drop EQ
+: lteInt ( Int Int -- Bool )
+  drop drop true
 
-# Eq Int
+# Setoid Int
   eq = eqInt
 
 # Ord Int
-  compare = compareInt
+  lte = lteInt
 
 ; Answer = No | Yes Int
 
-: ordered ( Answer Answer -- Ordering )
-  compare
+: ordered ( Answer Answer -- Bool )
+  lte
 ");
         err(
             "\
-& Eq a
+& Setoid a
   eq ( a a -- Bool )
 
-& Eq a => Ord a
-  compare ( a a -- Int )
+& Setoid a => Ord a
+  lte ( a a -- Bool )
 
 : eqInt ( Int Int -- Bool )
   drop drop true
 
-# Eq Int
+: lteInt ( Int Int -- Bool )
+  drop drop true
+
+# Setoid Int
   eq = eqInt
 
-; Person = Person name : Int, age : Int
+# Ord Int
+  lte = lteInt
 
-: bad ( Person Person -- Int )
-  compare
+; Task = Task ( Int -- Int )
+
+: bad ( Task Task -- Bool )
+  lte
 ",
-            "no instance for Ord Person",
+            "no instance for Ord Task",
         );
         ok("\
-& Eq a
+& Setoid a
   eq ( a a -- Bool )
 
-& Eq a => Hash a
+& Setoid a => Hash a
   hash ( a -- Int )
 
 : eqInt ( Int Int -- Bool )
@@ -7001,7 +7017,7 @@ mod tests {
 : hashInt ( Int -- Int )
   dup drop
 
-# Eq Int
+# Setoid Int
   eq = eqInt
 
 # Hash Int
@@ -7111,7 +7127,7 @@ mod tests {
         );
         err(
             "& Eq a\n  eq ( a a -- Bool )\n\n; Person = Person name : Str, age : Num\n- Human Person\n\n: eqHuman ( Human Human -- Bool )\n  drop drop true\n\n: eqPerson ( Person Person -- Bool )\n  drop drop true\n\n# Eq Human\n  eq = eqHuman\n\n# Eq Person\n  eq = eqPerson\n",
-            "incoherent instance",
+            "incoherent instance Eq Person",
         );
     }
 
@@ -7394,14 +7410,14 @@ mod tests {
     fn an_instance_word_must_cover_the_method() {
         err(
             "; Pair a b = Pair frs : a, snd : b\n\n& Mappable f\n  map ( (f a) (a -- b) -- (f b) )\n\n: mapLeft ( (Pair a b) (a -- c) -- (Pair c b) )\n  (Pair x y) f ->\n    x f call y Pair\n\n# Mappable (Pair a)\n  map = mapLeft\n",
-            "type mismatch: expected _, found a",
+            "Mappable (Pair a) method map: type mismatch: expected _, found a",
         );
         ok(
             "; Pair a b = Pair frs : a, snd : b\n\n& Mappable f\n  map ( (f a) (a -- b) -- (f b) )\n\n: mapRight ( (Pair a b) (b -- c) -- (Pair a c) )\n  (Pair x y) f ->\n    x y f call Pair\n\n# Mappable (Pair a)\n  map = mapRight\n\n: use ( (Pair Int Str) (Str -- Bool) -- (Pair Int Bool) )\n  map\n",
         );
         err(
             "; Maybe a = Nothing | Just a\n\n& Comparable a\n  eq ( a a -- Bool )\n\n& Mappable f\n  map ( (f a) (a -- b) -- (f b) )\n\n: mapCmp ( Comparable b => (Maybe a) (a -- b) -- (Maybe b) )\n  drop drop Nothing\n\n# Mappable Maybe\n  map = mapCmp\n",
-            "ambiguous constraint Comparable b",
+            "Mappable Maybe method map: ambiguous constraint Comparable b",
         );
     }
 
@@ -7421,7 +7437,11 @@ mod tests {
         );
         err(
             "& Eq a\n  eq ( a a -- Bool )\n\n& Eq a => Ord a\n  compare ( a a -- Bool )\n\n: cmpInt ( Int Int -- Bool )\n  drop drop true\n\n# Ord Int\n  compare = cmpInt\n",
-            "no instance for Eq Int",
+            "Ord Int has no instance for Eq Int",
+        );
+        err(
+            "& Eq a\n  eq ( a a -- Bool )\n\n& Eq a => Ord a\n  compare ( a a -- Bool )\n\n: cmp ( a a -- Bool )\n  drop drop true\n\n# Ord a\n  compare = cmp\n",
+            "Ord a has no instance for Eq a",
         );
         ok("\
 & Mappable f
@@ -7482,7 +7502,7 @@ mod tests {
 # Walk Box
   step = stepBox
 ",
-            "type mismatch: expected Wrappable f, found no constraint",
+            "Walk Box method step: type mismatch: expected Wrappable f, found no constraint",
         );
         err(
             "\
