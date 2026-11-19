@@ -38,9 +38,9 @@ JavaScript emits a boolean.
 
 ## Unit
 
-No parameters. The only value is the word [`Unit`](Words.md#unit). JavaScript emits `undefined`.
+No parameters. The only value is the literal `unit`. JavaScript emits `undefined`. `null` is not `Unit`.
 
-That word is also the constructor. `Unit ->` checks the value and leaves it. The check is `value === undefined`. `null` is not `Unit`. `(Unit ..)` checks it and leaves nothing.
+`unit ->` checks the value and consumes it. One such arm covers `Unit`. `Unit ->` leaves the value and calls the `Nullary` word. On a wider type it does not cover the slot.
 
 ## Array
 
@@ -58,38 +58,34 @@ One parameter, written `(Array a)`. A literal is a program between `<` and `>`. 
 
 JavaScript emits an array. `dup` shares that reference. A word that writes returns a new array, and the array it received stays as it was. A shared cell that a program passes is `Cell`, from the prelude.
 
-A pattern has one fixed length. `<>` matches only the empty array. One length does not cover every `Array`. A later `_` covers the other lengths. `Array ->` covers every array. It checks `Array.isArray` and leaves the array.
+A pattern has one fixed length. `<>` matches only the empty array. One length does not cover every `Array`. A later `_` covers the other lengths. `Array ->` covers every array when `Unary` for `Array` is visible. It calls that instance's word and leaves the array.
 
 ## Matching a shape
 
-`Num`, `Int`, `Str`, `Bool`, `Array`, and `Unit` are patterns. JavaScript tests `typeof`, `Array.isArray`, or `=== undefined`. A bare name leaves the value. `(Array Num)` also tests every element. `(Array x)` does not bind `x`. `StrMap`, a record, and a `foreign` type have no shape test.
+A bare name that is not a constructor of the slot matches a visible `Nullary`, `Unary`, or `Binary` instance and leaves the value. The class is the arity of the head. The prelude gives `Nullary` to `Num`, `Int`, `Str`, `Bool`, and `Unit`, and `Unary` to `Array`. A `; foreign` type is matched the same way when its module writes the instance. Until that module is imported, the pattern is `no instance for Nullary Buffer`, or `no instance for Unary Hub`. `Cell` has no instance.
 
-The arm is checked against the word's signature with those variables filled in. The other arms and the caller keep the original signature.
+`(Array Num)` tests the array and then every element, through that instance's parameter word. Nested `(Array (Array Num))` follows. `(Array x)` and `(Array _)` do not name the element. `(Map Str Num)` needs `Binary`, and `(Map _ Num)` tests only the second parameter. `(Hub Num)` is `no instance for Unary Hub` until that module defines `Unary`. Write the head until then.
+
+The arm is checked against the word's signature with those variables filled in. The other arms and the caller keep the original signature. The compiler does not prove two checks are disjoint, so on a variable slot both `Num ->` and `Str ->` stay, and a later `_` is still required.
 
 ```ply
-: keep ( a. a -- a )
+: held ( a. a -- a )
   Num ->
   _ ->
 ```
 
-`Num ->` is `( Num -- Num )`. `_ ->` is `( a -- a )`. Both leave the value. `1 keep` is `Num`. `"hi" keep` is `Str`.
+`Num ->` is `( Num -- Num )`. `_ ->` is `( a -- a )`. Both leave the value. `1 held` is `Num`. `"hi" held` is `Str`.
 
 `Array ->` in `( Foldable f => (f a) -- Num )` is `( (Array a) -- Num )`. `f` is `Array`. The element stays `a`. A shape does not cover a wider slot, so a later `_` is still required. `_` leaves the value.
 
-## StrMap
-
-One parameter, written `(StrMap a)`. The key is `Str`. The program chooses the key when it runs, and the type does not name that key. A value of this type comes from an imported word. `dup` shares the reference. A word that writes returns a new map, and the map it received stays as it was.
-
 ## Foreign data
 
-`; foreign` declares a type with no constructors. JavaScript emits nothing for it. The values come from `: foreign` words.
+`; foreign` declares a type with no constructors. JavaScript emits nothing for it. The values come from `: foreign` words. Match the type when its module gives it `Nullary`, `Unary`, or `Binary`. The pattern calls that module's word.
 
-A parameter indexes the value. `(Hub Num)` and `(Hub Str)` are different types. The parameter is not a field.
+A parameter indexes the value. `(Hub Num)` and `(Hub Str)` are different types. The parameter is not a field, and it is not an element test.
 
 ```ply
 ; foreign Hub a
 ```
 
 A name binds the value. There is no constructor to match. Writing `=`, `==`, or a constructor is [PL0116](Errors.md#pl0116).
-
-A data type derives Setoid, Show, Ord, and Hash when that class is in scope, the module does not already give the type an instance, and no field is a function, a Ref, or a Cell. Ord's derived method is `lte` and returns `Bool`.

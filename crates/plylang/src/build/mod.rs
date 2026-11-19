@@ -101,8 +101,7 @@ struct Unit {
     path: PathBuf,
     display: String,
     source: String,
-    /// The module as parsed. `module` gains derived items during check,
-    /// so a later check of the same file starts from `parsed`.
+    /// The module as parsed. A later check of the same file starts from `parsed`.
     parsed: Module,
     module: Module,
     package_root: PathBuf,
@@ -1577,8 +1576,7 @@ impl Session {
         let deps = edges[id].clone();
         for dep in deps {
             if color[dep] == Color::Gray {
-                let span = self
-                    .units[id]
+                let span = self.units[id]
                     .module
                     .imports
                     .iter()
@@ -1608,14 +1606,9 @@ impl Session {
         for import in &module.imports {
             let target = self.resolve(id, &import.path, import.span)?;
             if target == id {
-                return Err(self.fail(
-                    id,
-                    import.span,
-                    cycle_message(&self.units, &[id], id),
-                ));
+                return Err(self.fail(id, import.span, cycle_message(&self.units, &[id], id)));
             }
-            let value =
-                import_carries_value(&used, &exported, import, &self.units[target].module);
+            let value = import_carries_value(&used, &exported, import, &self.units[target].module);
             self.units[id].deps.push(target);
             self.units[id].value_edge.push(value);
             self.link_unit(target)?;
@@ -1809,10 +1802,6 @@ impl Session {
         if self.units[id].kind == Kind::External {
             return Ok(());
         }
-        self.units[id]
-            .module
-            .items
-            .extend(checked.derived.iter().cloned());
         let module = self.units[id].module.clone();
         self.check_foreign(id, &checked.foreign_arity)?;
         let module_path = self.units[id].module_path.clone().expect("local module");
@@ -1894,8 +1883,7 @@ impl Session {
         stack.push(id);
         for dep in self.units[id].js_deps.clone() {
             if color[dep] == Color::Gray {
-                let span = self
-                    .units[id]
+                let span = self.units[id]
                     .module
                     .imports
                     .iter()
@@ -3036,8 +3024,7 @@ fn bound_kind(module: &Module, name: &str) -> BoundKind {
             Item::Data(data) if data.name == name => return BoundKind::TypeOnly,
             Item::Synonym(synonym) if synonym.name == name => return BoundKind::TypeOnly,
             Item::Class(class)
-                if class.name == name
-                    || class.methods.iter().any(|method| method.name == name) =>
+                if class.name == name || class.methods.iter().any(|method| method.name == name) =>
             {
                 return BoundKind::TypeOnly;
             }
@@ -3088,16 +3075,7 @@ fn collect_runtime(terms: &[Term], names: &mut HashSet<String>) {
                 names.insert(name.clone());
             }
             TermNode::Quote(body) | TermNode::Array(body) => collect_runtime(body, names),
-            TermNode::Record(fields) => {
-                for (_, term) in fields {
-                    collect_runtime(std::slice::from_ref(term), names);
-                }
-            }
-            TermNode::Lit(_)
-            | TermNode::Field(_)
-            | TermNode::FieldSet(_)
-            | TermNode::FieldInsert(_)
-            | TermNode::Bind(_) => {}
+            TermNode::Lit(_) | TermNode::Field(_) | TermNode::FieldSet(_) | TermNode::Bind(_) => {}
         }
     }
 }
@@ -3390,7 +3368,7 @@ mod tests {
             "src/Checks.ply",
             "@\n\n~ \"Host\" answer\n\n: helper ( -- Num )\n  answer\n\n; Note = Note\n\n? \"kept\" < 1 > [\n  helper\n]\n",
         );
-        temp.write("src/Program.ply", "@\n\n: main ( -- Unit )\n  Unit\n");
+        temp.write("src/Program.ply", "@\n\n: main ( -- Unit )\n  unit\n");
         temp.write("src/Place.ply", "@\n\n= cell Num\n  1\n");
         temp.write("src/Boot.ply", "@\n\n: boot ( -- Num )\n  1\n");
         temp.write("dist/Time.js", "stale\n");
@@ -4545,7 +4523,7 @@ mod tests {
             "src/Tool.ply",
             "@ main\n\n: foreign touch ( -- Unit )\n\n: main ( -- Unit )\n  touch\n",
         );
-        temp.write("src/Other.ply", "@\n\n: idle ( -- Unit )\n  Unit\n");
+        temp.write("src/Other.ply", "@\n\n: idle ( -- Unit )\n  unit\n");
         let app_mark = temp.0.join("app.txt");
         let tool_mark = temp.0.join("tool.txt");
         temp.write("foreign/App.js", &touch_js(&app_mark));
@@ -4630,11 +4608,11 @@ mod tests {
     fn main_accepts_only_the_unit_scheme() {
         let temp = Temp::new("entry-scheme");
         temp.write("package.json", &package_json(""));
-        temp.write("src/App.ply", "@\n\n: main ( . -- . Unit )\n  Unit\n");
+        temp.write("src/App.ply", "@\n\n: main ( . -- . Unit )\n  unit\n");
         check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
-        temp.write("src/App.ply", "@\n\n: main ( ..s -- ..s Unit )\n  Unit\n");
+        temp.write("src/App.ply", "@\n\n: main ( ..s -- ..s Unit )\n  unit\n");
         check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
-        temp.write("src/App.ply", "@\n\n: start ( -- Unit )\n  Unit\n");
+        temp.write("src/App.ply", "@\n\n: start ( -- Unit )\n  unit\n");
         check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         build(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         assert!(!temp.0.join("dist/App.js").is_file());
@@ -4645,12 +4623,12 @@ mod tests {
         assert_eq!(error.code, "PL0115");
         assert_eq!(error.message, "word main must have scheme ( -- Unit )");
         assert!(error.render().contains("App.ply"), "{}", error.render());
-        temp.write("src/App.ply", "@\n\n: main ( a. a -- a Unit )\n  Unit\n");
+        temp.write("src/App.ply", "@\n\n: main ( a. a -- a Unit )\n  unit\n");
         let error = check_package(&temp.0).unwrap_err();
         assert_eq!(error.code, "PL0115");
 
         let lone = Temp::new("entry-snippet");
-        lone.write("App.ply", ": main ( -- Unit )\n  Unit\n");
+        lone.write("App.ply", ": main ( -- Unit )\n  unit\n");
         let js = super::javascript_file(&lone.0.join("App.ply"))
             .unwrap_or_else(|error| panic!("{}", error.render()));
         assert!(js.contains("if (plyIsEntry) main();"), "{js}");
@@ -5251,11 +5229,11 @@ mod tests {
         let ping_lit = serde_json::to_string(&ping.to_string_lossy().into_owned()).unwrap();
         temp.write(
             "src/App.ply",
-            "@\n\n: foreign boom ( -- Unit )\n\n: spare ( -- Unit )\n  Unit\n\n: main ( -- Unit )\n  boom\n",
+            "@\n\n: foreign boom ( -- Unit )\n\n: spare ( -- Unit )\n  unit\n\n: main ( -- Unit )\n  boom\n",
         );
         temp.write(
             "src/Data/Ping.ply",
-            "@\n\n: foreign ping ( -- Unit )\n\n: spare ( -- Unit )\n  Unit\n\n: main ( -- Unit )\n  ping\n",
+            "@\n\n: foreign ping ( -- Unit )\n\n: spare ( -- Unit )\n  unit\n\n: main ( -- Unit )\n  ping\n",
         );
         temp.write(
             "foreign/App.js",
@@ -5369,7 +5347,7 @@ mod tests {
         );
         temp.write(
             "src/Face.ply",
-            "@ ping\n\n: foreign ping ( -- Unit )\n\n: hidden ( -- Unit )\n  Unit\n",
+            "@ ping\n\n: foreign ping ( -- Unit )\n\n: hidden ( -- Unit )\n  unit\n",
         );
         temp.write(
             "src/Isle.ply",
@@ -5411,7 +5389,7 @@ mod tests {
 
         temp.write(
             "src/Isle.ply",
-            "@\n~ \"Face\" ping\n\n: main ( -- Unit )\n  Unit\n\n= offered Unit\n  ping\n",
+            "@\n~ \"Face\" ping\n\n: main ( -- Unit )\n  unit\n\n= offered Unit\n  ping\n",
         );
         fs::remove_file(&mark).unwrap();
         compile(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
@@ -5751,7 +5729,7 @@ mod tests {
         assert_eq!(error.code, "PL0127");
 
         temp.write("package.json", r#"{ "ply": { "language": 1 } }"#);
-        temp.write("src/App.ply", "@\n\n: main ( -- Unit )\n  Unit\n");
+        temp.write("src/App.ply", "@\n\n: main ( -- Unit )\n  unit\n");
         check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         let error = compile(&temp.0).unwrap_err();
         assert_eq!(error.code, "PL0129", "{}", error.render());
@@ -5761,7 +5739,7 @@ mod tests {
             "package.json",
             r#"{ "ply": { "language": 1, "entry": "App" } }"#,
         );
-        temp.write("src/App.ply", "@\n\n: idle ( -- Unit )\n  Unit\n");
+        temp.write("src/App.ply", "@\n\n: idle ( -- Unit )\n  unit\n");
         check_package(&temp.0).unwrap_or_else(|error| panic!("{}", error.render()));
         let error = compile(&temp.0).unwrap_err();
         assert_eq!(error.code, "PL0129", "{}", error.render());

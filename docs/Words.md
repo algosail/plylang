@@ -244,10 +244,4 @@ Pops a `Bool` and two quotations. The `true` branch is pushed first, so the `fal
 
 ## Value
 
-### Unit
-
-```ply
-..s -- ..s Unit
-```
-
-Pushes the only value of type [`Unit`](Types.md#unit).
+`unit` is the literal of type [`Unit`](Types.md#unit). It is not a word.

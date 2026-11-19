@@ -136,10 +136,6 @@ fn type_is_hidden(module: &Module, ty: &Type) -> bool {
             .iter()
             .chain(&effect.output.items)
             .any(|ty| type_is_hidden(module, ty)),
-        Type::Record(row) => {
-            row.fields.iter().any(|(_, ty)| type_is_hidden(module, ty))
-                || row.tail_ty().is_some_and(|ty| type_is_hidden(module, ty))
-        }
     }
 }
 

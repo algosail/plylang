@@ -17,7 +17,6 @@ pub struct AnfModule {
     pub places: Vec<AnfPlace>,
     /// Checks. `javascript` leaves them out. The test runner appends them.
     pub checks: Vec<AnfCheck>,
-    pub needs_unit: bool,
     /// Instance words this module calls, and the module that wrote the `#`.
     pub method_homes: Vec<MethodHome>,
 }
@@ -101,7 +100,7 @@ pub enum Access {
     Field { index: usize, width: usize },
     /// Array element. Index 0 is the left.
     Index(usize),
-    /// Record field. The string is the label, read as `obj.name`.
+    /// Named product field. The string is the label, read as `obj.name`.
     Prop(String),
 }
 
@@ -116,18 +115,35 @@ pub enum PatTest {
     Length(usize),
     /// The value has this runtime shape. A ground type emits no test.
     Shape(ShapeTest),
+    /// The literal `unit`. The value is `undefined`. Reading `.tag` throws.
+    Undefined,
 }
 
-/// A shape JavaScript can see. `Array(None)` is any array.
+/// One parameter the instance walks. Index 0 is `checkUnary_1` or `checkBinary_1`.
 #[derive(Clone, Debug, PartialEq)]
-pub enum ShapeTest {
-    Num,
-    Int,
-    Str,
-    Bool,
-    /// `undefined`. `null` is not Unit.
-    Unit,
-    Array(Option<Box<ShapeTest>>),
+pub struct ParamTest {
+    pub index: usize,
+    /// The instance word, such as `everyArray`.
+    pub word: String,
+    /// Module that wrote the `#`.
+    pub origin: String,
+    pub inner: Box<ShapeTest>,
+}
+
+/// A `Nullary`, `Unary`, or `Binary` instance JavaScript can call.
+/// `params` holds only the parameters the pattern named.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShapeTest {
+    /// The instance word, such as `isNum` or `isArray`.
+    pub word: String,
+    /// Head constructor. `Num`, `Array`, `Buffer`.
+    pub ctor: String,
+    /// Parameter count of the head. `Num` is 0. `(Array a)` is 1.
+    pub arity: usize,
+    /// Parameter tests. An open parameter is absent.
+    pub params: Vec<ParamTest>,
+    /// Module that wrote the `#`.
+    pub origin: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -166,12 +182,12 @@ pub enum Value {
         base: LocalId,
         index: usize,
     },
-    /// Property of a record object. The name is the Ply field label.
+    /// Named product field. The name is the label.
     Prop {
         base: LocalId,
         name: String,
     },
-    /// A new record. The old object is not mutated. `name` is a static label.
+    /// Update one named product field. The old object is not mutated.
     SetProp {
         base: LocalId,
         name: String,
@@ -179,10 +195,6 @@ pub enum Value {
     },
     /// JavaScript array, index 0 at the left.
     Array(Vec<LocalId>),
-    /// JavaScript object. Fields are in source order.
-    Record {
-        fields: Vec<(String, LocalId)>,
-    },
     /// Class dictionary. A method is the implementing word, or a closure that
     /// closes over dictionaries fixed by the instance head. The closure's
     /// parameters are the method's own dictionaries and then the stack values.
@@ -234,9 +246,6 @@ pub struct MethodHome {
 impl AnfModule {
     pub fn javascript(&self) -> String {
         let mut out = String::new();
-        if self.needs_unit {
-            out.push_str("const Unit = undefined;\n");
-        }
         for data in &self.datas {
             for ctor in &data.ctors {
                 if !out.is_empty() {
@@ -570,24 +579,34 @@ fn render_cond(cond: &Cond) -> String {
         PatTest::Tag(tag) => format!("{path}.tag === \"{tag}\""),
         PatTest::Length(len) => format!("{path}.length === {len}"),
         PatTest::Shape(shape) => render_shape(&path, shape, 0),
+        PatTest::Undefined => format!("{path} === undefined"),
     }
 }
 
-/// `e0`, `e1`, … are the element names. Each array gets the next one.
+/// `e0`, `e1`, … name a parameter whose own test still has parameters.
 fn render_shape(path: &str, shape: &ShapeTest, depth: usize) -> String {
-    match shape {
-        ShapeTest::Num => format!("typeof {path} === \"number\""),
-        ShapeTest::Int => format!("typeof {path} === \"bigint\""),
-        ShapeTest::Str => format!("typeof {path} === \"string\""),
-        ShapeTest::Bool => format!("typeof {path} === \"boolean\""),
-        ShapeTest::Unit => format!("{path} === undefined"),
-        ShapeTest::Array(None) => format!("Array.isArray({path})"),
-        ShapeTest::Array(Some(elem)) => {
-            let name = format!("e{depth}");
-            let inner = render_shape(&name, elem, depth + 1);
-            format!("(Array.isArray({path}) && {path}.every(({name}) => {inner}))")
-        }
+    let call = format!("{}({path})", js_ident(&shape.word));
+    if shape.params.is_empty() {
+        return call;
     }
+    let mut parts = vec![call];
+    for param in &shape.params {
+        parts.push(format!(
+            "{}({path}, {})",
+            js_ident(&param.word),
+            render_pred(&param.inner, depth)
+        ));
+    }
+    format!("({})", parts.join(" && "))
+}
+
+/// A parameter word takes a predicate. A shape with no further parameters is that word.
+fn render_pred(shape: &ShapeTest, depth: usize) -> String {
+    if shape.params.is_empty() {
+        return js_ident(&shape.word);
+    }
+    let name = format!("e{depth}");
+    format!("({name}) => {}", render_shape(&name, shape, depth + 1))
 }
 
 fn quote_expr(quote: &QuoteForm, indent: usize) -> String {
@@ -629,12 +648,6 @@ fn render_value(value: &Value) -> String {
                 .join(", ");
             format!("{}({args})", js_ident(name))
         }
-        Value::Call { word, args } if word == "#show_cat" => {
-            format!("({} + {})", local_name(args[0]), local_name(args[1]))
-        }
-        Value::Call { word, args } if word == "#hash_mix" => {
-            format!("({} * 31n + {})", local_name(args[0]), local_name(args[1]))
-        }
         Value::Call { word, args } => {
             let list = args
                 .iter()
@@ -675,14 +688,6 @@ fn render_value(value: &Value) -> String {
                 .join(", ");
             format!("[{list}]")
         }
-        Value::Record { fields } => {
-            let list = fields
-                .iter()
-                .map(|(name, id)| format!("{name}: {}", local_name(*id)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("({{ {list} }})")
-        }
         Value::Dict { fields } => render_dict(fields),
         Value::Quote(_) | Value::If { .. } | Value::Choose { .. } => {
             unreachable!("compound value")
@@ -701,6 +706,18 @@ pub(crate) fn referenced_words(module: &AnfModule) -> Vec<String> {
         collect_words(&place.init.body, &mut names);
     }
     names
+}
+
+fn collect_shape(shape: &ShapeTest, names: &mut Vec<String>) {
+    if !shape.word.is_empty() {
+        names.push(shape.word.clone());
+    }
+    for param in &shape.params {
+        if !param.word.is_empty() {
+            names.push(param.word.clone());
+        }
+        collect_shape(&param.inner, names);
+    }
 }
 
 fn collect_words(expr: &Expr, names: &mut Vec<String>) {
@@ -733,6 +750,11 @@ fn collect_value(value: &Value, names: &mut Vec<String>) {
         }
         Value::Choose { arms } => {
             for arm in arms {
+                for cond in &arm.conds {
+                    if let PatTest::Shape(shape) = &cond.test {
+                        collect_shape(shape, names);
+                    }
+                }
                 collect_words(&arm.body, names);
             }
         }
@@ -742,8 +764,7 @@ fn collect_value(value: &Value, names: &mut Vec<String>) {
         | Value::Index { .. }
         | Value::Prop { .. }
         | Value::SetProp { .. }
-        | Value::Array(_)
-        | Value::Record { .. } => {}
+        | Value::Array(_) => {}
     }
 }
 
@@ -782,6 +803,7 @@ fn js_lit(lit: &Lit) -> String {
         Lit::String(value) => js_string(value),
         Lit::Bool(true) => "true".to_string(),
         Lit::Bool(false) => "false".to_string(),
+        Lit::Unit => "undefined".to_string(),
     }
 }
 
@@ -940,6 +962,7 @@ fn write_anf_value(
             Lit::Number(lexeme) => write!(formatter, "{lexeme}"),
             Lit::String(text) => write!(formatter, "{:?}", text),
             Lit::Bool(flag) => write!(formatter, "{flag}"),
+            Lit::Unit => write!(formatter, "unit"),
         },
         Value::Quote(quote) => {
             let params = quote
@@ -1002,16 +1025,6 @@ fn write_anf_value(
                 write!(formatter, "{}", local_name(*id))?;
             }
             write!(formatter, "]")
-        }
-        Value::Record { fields } => {
-            write!(formatter, "({{ ")?;
-            for (index, (name, id)) in fields.iter().enumerate() {
-                if index > 0 {
-                    write!(formatter, ", ")?;
-                }
-                write!(formatter, "{name}: {}", local_name(*id))?;
-            }
-            write!(formatter, " }})")
         }
         Value::Dict { fields } => {
             write!(formatter, "{{")?;

@@ -50,7 +50,6 @@ pub fn hover_with_sites(
             }
             TokenKind::Field(_)
             | TokenKind::FieldSet(_)
-            | TokenKind::FieldInsert(_)
             | TokenKind::PlaceSet(_)
             | TokenKind::PlaceBind(_) => sites
                 .iter()
@@ -525,10 +524,7 @@ fn token_at(tokens: &[Token], offset: u32) -> Option<&Token> {
     tokens.iter().find(|token| {
         matches!(
             token.kind,
-            TokenKind::Ident(_)
-                | TokenKind::Field(_)
-                | TokenKind::FieldSet(_)
-                | TokenKind::FieldInsert(_)
+            TokenKind::Ident(_) | TokenKind::Field(_) | TokenKind::FieldSet(_)
         ) && token.span.start <= offset
             && offset < token.span.end
     })

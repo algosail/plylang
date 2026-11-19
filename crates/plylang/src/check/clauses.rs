@@ -6,13 +6,13 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::anf::ShapeTest;
+use crate::anf::{ParamTest, ShapeTest};
 use crate::ast::{Clause, Def, Lit, Pattern};
 use crate::codes::Error;
 use crate::diagnostic::Diagnostic;
 use crate::span::Span;
 
-use super::{Checker, RowId, StackId, StackNode, TyId, TyNode};
+use super::{Checker, StackId, StackNode, TyId, TyNode};
 
 pub(super) struct ClauseInfo {
     pub binds: Vec<(String, TyId)>,
@@ -63,10 +63,104 @@ pub(super) struct TypeWitness {
     pub test: Option<ShapeTest>,
 }
 
+/// A pattern is a service-class test, or it is some other pattern.
+pub(super) enum CheckDecision {
+    Use(ShapeTest),
+    NotCheck,
+}
+
+/// The part of a pattern `Nullary`, `Unary`, or `Binary` can read.
+/// A spill or a literal is absent.
+enum CheckView<'a> {
+    /// `Num` or `Array`.
+    Unpack(&'a str),
+    /// `(Num)`. `(Array)` is an arity error, not this check.
+    Nullary(&'a str),
+    /// `(Array Num)`, `(Array _)`, `(Map Str Num)`.
+    Applied { name: &'a str, args: &'a [Pattern] },
+}
+
+/// One service instance whose head is the unsaturated constructor.
+struct OpenCheck {
+    ctor: String,
+    arity: usize,
+    word: String,
+    origin: String,
+    /// Parameter words, in index order. `checkUnary_1` is index 0.
+    params: Vec<(String, String)>,
+}
+
+/// Constructor of a visible service head.
+struct OpenHead {
+    ctor: String,
+    arity: usize,
+}
+
+/// One named parameter of a service pattern.
+#[derive(Clone, Debug)]
+struct SeenParam {
+    index: usize,
+    inner: Box<SeenCheck>,
+}
+
+/// A service pattern already accepted on a variable slot.
+#[derive(Clone, Debug)]
+struct SeenCheck {
+    ctor: String,
+    params: Vec<SeenParam>,
+}
+
+/// The class a head of this arity implements. Arity above two has none.
+#[derive(Clone, Copy)]
+struct Service {
+    class: &'static str,
+    method: &'static str,
+    params: &'static [&'static str],
+}
+
+fn service_for(arity: usize) -> Option<Service> {
+    match arity {
+        0 => Some(Service {
+            class: "Nullary",
+            method: "checkNullary",
+            params: &[],
+        }),
+        1 => Some(Service {
+            class: "Unary",
+            method: "checkUnary",
+            params: &["checkUnary_1"],
+        }),
+        2 => Some(Service {
+            class: "Binary",
+            method: "checkBinary",
+            params: &["checkBinary_1", "checkBinary_2"],
+        }),
+        _ => None,
+    }
+}
+
+impl<'a> CheckView<'a> {
+    fn name(&self) -> &'a str {
+        match self {
+            CheckView::Unpack(name) | CheckView::Nullary(name) => name,
+            CheckView::Applied { name, .. } => name,
+        }
+    }
+
+    /// The pattern names a parameter, such as `(Hub Num)`. `_` and a binder do not.
+    fn names_parameter(&self) -> bool {
+        match self {
+            CheckView::Applied { args, .. } => args
+                .iter()
+                .any(|arg| !matches!(arg, Pattern::Wild | Pattern::Bind(..))),
+            _ => false,
+        }
+    }
+}
+
 /// What a slot can still be. `Open` is an infinite scalar with some literals removed.
 /// `Array` is every length when `open`, except lengths listed in `apart`.
 /// An apart length with no rows is covered. `open: false` means only those lengths remain.
-/// `Record` lists the fields the type has. A pattern may read fewer of them.
 /// `Deep` is a data type the walk did not enter. `Any` is a type the walk did see
 /// and does not know, such as a variable; a constructor does not cover `Any`.
 /// A child is an [`Rc`], so cloning a node copies one layer. The same type at the
@@ -77,12 +171,20 @@ pub(super) struct TypeWitness {
 #[derive(Clone, Debug)]
 enum Need {
     Any,
+    /// A variable slot after one or more service patterns. The same head again
+    /// is redundant. A different head still overlaps, because the tests are not
+    /// proved disjoint.
+    Screened {
+        seen: Vec<SeenCheck>,
+    },
     /// The walk stopped. A wildcard or a binding covers the slot.
     Deep,
     Bool {
         yes: bool,
         no: bool,
     },
+    /// The one value `unit`.
+    Unit,
     Open {
         name: String,
         excluded: Vec<Lit>,
@@ -96,16 +198,6 @@ enum Need {
         open: bool,
         apart: Vec<Apart>,
     },
-    Record {
-        fields: Vec<FieldNeed>,
-    },
-}
-
-/// One label of a record that is still in play. Order is alphabetical.
-#[derive(Clone, Debug)]
-struct FieldNeed {
-    name: String,
-    need: Rc<Need>,
 }
 
 /// One fixed length that is no longer the plain open element.
@@ -133,7 +225,6 @@ const EXAMPLE_CAP: usize = 8;
 enum TypeKey {
     Other,
     Ctor(String, Vec<TypeKey>),
-    Record(Vec<(String, TypeKey)>),
 }
 
 struct NeedMemo {
@@ -314,20 +405,16 @@ impl Checker {
                     .map_err(|message| self.error(span, message))?;
                 Ok(())
             }
-            Pattern::Unpack(name) => {
-                match self.ctor_shape(name, ty, span) {
-                    Ok(shape) => {
-                        pushes.push((ty, Some(shape.tag)));
-                        Ok(())
-                    }
-                    Err(error) => {
-                        if host_spec(pattern).is_none() {
-                            return Err(error);
-                        }
-                        self.effect_host(pattern, ty, span, pushes, subst)
-                    }
+            Pattern::Unpack(name) => match self.ctor_shape(name, ty, span) {
+                Ok(shape) => {
+                    pushes.push((ty, Some(shape.tag)));
+                    Ok(())
                 }
-            }
+                Err(error) => match self.decide_check(pattern, span)? {
+                    CheckDecision::Use(_) => self.effect_host(pattern, ty, span, pushes, subst),
+                    CheckDecision::NotCheck => Err(error),
+                },
+            },
             Pattern::Open(name) => {
                 let shape = self.ctor_shape(name, ty, span)?;
                 for field in shape.fields {
@@ -338,12 +425,12 @@ impl Checker {
             Pattern::Ctor(name, patterns) => {
                 let shape = match self.ctor_shape(name, ty, span) {
                     Ok(shape) => shape,
-                    Err(error) => {
-                        if host_spec(pattern).is_none() {
-                            return Err(error);
+                    Err(error) => match self.decide_check(pattern, span)? {
+                        CheckDecision::Use(_) => {
+                            return self.effect_host(pattern, ty, span, pushes, subst);
                         }
-                        return self.effect_host(pattern, ty, span, pushes, subst);
-                    }
+                        CheckDecision::NotCheck => return Err(error),
+                    },
                 };
                 if let Some(groups) = group_type_tests(patterns, shape.fields.len()) {
                     if self.type_test_heads(&groups) {
@@ -378,13 +465,6 @@ impl Checker {
                 }
                 Ok(())
             }
-            Pattern::Record(fields) => {
-                let types = self.open_record_pattern(fields, ty, span)?;
-                for (pattern, field_ty) in fields.iter().zip(types) {
-                    self.pattern_effect(&pattern.1, field_ty, span, binds, pushes, subst)?;
-                }
-                Ok(())
-            }
         }
     }
 
@@ -397,36 +477,12 @@ impl Checker {
         pushes: &mut Vec<(TyId, Option<String>)>,
         subst: &mut HashMap<TyId, TyId>,
     ) -> Result<(), Diagnostic> {
-        let Some(shape) = host_spec(pattern) else {
+        let CheckDecision::Use(shape) = self.decide_check(pattern, span)? else {
             return Err(self.error(span, Error::ExpectedPattern));
         };
         self.match_host(ty, &shape, span, subst)?;
         pushes.push((ty, None));
         Ok(())
-    }
-
-    /// Field types of a record pattern. The pattern row is open, so a closed
-    /// slot may keep labels the pattern does not name. A missing label is
-    /// `record has no field NAME`.
-    pub(super) fn open_record_pattern(
-        &mut self,
-        fields: &[(String, Pattern)],
-        ty: TyId,
-        span: Span,
-    ) -> Result<Vec<TyId>, Diagnostic> {
-        let mut pairs = Vec::with_capacity(fields.len());
-        let mut ids = Vec::with_capacity(fields.len());
-        for (name, _) in fields {
-            let field_ty = self.ty_var();
-            pairs.push((name.clone(), field_ty));
-            ids.push(field_ty);
-        }
-        let tail = self.row_var();
-        let row = self.row_fields(pairs, Some(tail));
-        let record = self.ty_record(row);
-        self.unify_ty(ty, record)
-            .map_err(|message| self.error(span, message))?;
-        Ok(ids.into_iter().map(|id| self.find_ty(id)).collect())
     }
 
     /// Element type of an array pattern. A flexible slot becomes `(Array _)`.
@@ -488,7 +544,7 @@ impl Checker {
     }
 
     /// `(Name)` with fields is an error. A full list of patterns is positional,
-    /// including derive's `(Person l0 l1)` and `(Sent _ headers _ _ _)`.
+    /// such as `(Person l0 l1)` and `(Sent _ headers _ _ _)`.
     /// A full list of distinct field names, and any shorter list of names, binds
     /// those fields. Order does not matter. An unknown name is `no field`.
     pub(super) fn ctor_match(
@@ -571,14 +627,7 @@ impl Checker {
         for (index, group) in groups.iter().enumerate() {
             match group {
                 SlotPat::Plain(pattern) => {
-                    self.pattern_effect(
-                        pattern,
-                        shape.fields[index],
-                        span,
-                        binds,
-                        pushes,
-                        subst,
-                    )?;
+                    self.pattern_effect(pattern, shape.fields[index], span, binds, pushes, subst)?;
                 }
                 SlotPat::Test { ty, bind } => {
                     let witness = self.check_type_test(ty, shape.fields[index], span, subst)?;
@@ -599,7 +648,7 @@ impl Checker {
         span: Span,
         subst: &mut HashMap<TyId, TyId>,
     ) -> Result<TypeWitness, Diagnostic> {
-        if let Some(shape) = host_spec(pattern) {
+        if let CheckDecision::Use(shape) = self.decide_check(pattern, span)? {
             let exposed = self.expose(field);
             if matches!(self.tys[exposed.0 as usize], TyNode::Ctor(..)) {
                 let pattern_ty = self.pattern_type(pattern, span)?;
@@ -669,6 +718,13 @@ impl Checker {
             || self.extra_arity.contains_key(name)
             || (self.hidden_type_visible()
                 && (self.datas.contains_key(name) || self.synonyms.contains_key(name)))
+    }
+
+    fn known_arity(&self, name: &str) -> Option<usize> {
+        self.type_arity
+            .get(name)
+            .or_else(|| self.extra_arity.get(name))
+            .copied()
     }
 
     fn pattern_type(&mut self, pattern: &Pattern, span: Span) -> Result<TyId, Diagnostic> {
@@ -761,7 +817,6 @@ impl Checker {
             TyNode::Fun(input, output, _) => {
                 self.ground_stack(*input, seen) && self.ground_stack(*output, seen)
             }
-            TyNode::Record(row) => self.ground_row(*row, seen),
             TyNode::Link(_) | TyNode::Alias { .. } => true,
         }
     }
@@ -778,26 +833,264 @@ impl Checker {
         }
     }
 
-    fn ground_row(&self, row: RowId, seen: &mut HashSet<u32>) -> bool {
-        match self.peel_row(row) {
-            Ok((fields, None)) => fields.iter().all(|(_, field)| self.ground_ty(*field, seen)),
-            _ => false,
+    /// A visible `# Nullary`, `# Unary`, or `# Binary` whose head is unsaturated.
+    fn open_service(&self, name: &str, service: Service) -> Option<OpenCheck> {
+        let name = self.canonical(name);
+        for inst in &self.instances {
+            if inst.class_name != service.class || inst.args.len() != 1 {
+                continue;
+            }
+            let arg = self.expose(inst.args[0]);
+            let TyNode::Ctor(ctor, params) = &self.tys[arg.0 as usize] else {
+                continue;
+            };
+            if ctor != name || !params.is_empty() {
+                continue;
+            }
+            let Some(method) = inst
+                .methods
+                .iter()
+                .find(|method| method.name == service.method)
+            else {
+                continue;
+            };
+            let mut words = Vec::with_capacity(service.params.len());
+            let mut complete = true;
+            for param_name in service.params {
+                let Some(found) = inst
+                    .methods
+                    .iter()
+                    .find(|method| method.name == *param_name)
+                else {
+                    complete = false;
+                    break;
+                };
+                words.push((found.word.clone(), inst.origin.clone()));
+            }
+            if !complete {
+                continue;
+            }
+            let Some(arity) = self.known_arity(ctor) else {
+                continue;
+            };
+            return Some(OpenCheck {
+                ctor: ctor.clone(),
+                arity,
+                word: method.word.clone(),
+                origin: inst.origin.clone(),
+                params: words,
+            });
         }
+        None
     }
 
-    /// `Num`, `Int`, `Str`, `Bool`, and arrays of those. A variable element is any array.
-    fn shape_of_ty(&self, ty: TyId) -> Option<ShapeTest> {
-        let ty = self.expose(ty);
-        match &self.tys[ty.0 as usize] {
-            TyNode::Ctor(name, args) if args.is_empty() => scalar_shape(name),
-            TyNode::Ctor(name, args) if name == "Array" && args.len() == 1 => {
-                let elem = self.expose(args[0]);
-                match &self.tys[elem.0 as usize] {
-                    TyNode::Var | TyNode::Rigid(_) => Some(ShapeTest::Array(None)),
-                    _ => Some(ShapeTest::Array(Some(Box::new(self.shape_of_ty(elem)?)))),
-                }
+    fn param_open(&self, id: TyId) -> bool {
+        let id = self.expose(id);
+        matches!(
+            self.tys[id.0 as usize],
+            TyNode::Var | TyNode::Template | TyNode::Rigid(_)
+        )
+    }
+
+    fn open_heads(&self) -> Vec<OpenHead> {
+        let mut heads = Vec::new();
+        let mut seen = HashSet::new();
+        for inst in &self.instances {
+            let class_arity = match inst.class_name.as_str() {
+                "Nullary" => 0,
+                "Unary" => 1,
+                "Binary" => 2,
+                _ => continue,
+            };
+            if inst.args.len() != 1 {
+                continue;
             }
-            _ => None,
+            let arg = self.expose(inst.args[0]);
+            let TyNode::Ctor(ctor, params) = &self.tys[arg.0 as usize] else {
+                continue;
+            };
+            if !params.is_empty() {
+                continue;
+            }
+            let Some(arity) = self.known_arity(ctor) else {
+                continue;
+            };
+            if arity != class_arity || !seen.insert(ctor.clone()) {
+                continue;
+            }
+            heads.push(OpenHead {
+                ctor: ctor.clone(),
+                arity,
+            });
+        }
+        heads
+    }
+
+    fn data_with_constructors(&self, name: &str) -> bool {
+        self.datas
+            .get(name)
+            .is_some_and(|data| !data.ctors.is_empty())
+    }
+
+    /// `Name ->` and `(Array Num)` select a visible service instance.
+    /// A data type with constructors and no instance stays a constructor pattern.
+    pub(super) fn decide_check(
+        &mut self,
+        pattern: &Pattern,
+        span: Span,
+    ) -> Result<CheckDecision, Diagnostic> {
+        let Some(view) = check_view(pattern) else {
+            return Ok(CheckDecision::NotCheck);
+        };
+        let name = view.name().to_string();
+        if !self.type_known(&name) {
+            return Ok(CheckDecision::NotCheck);
+        }
+        if self.syn_in_scope(&name) {
+            let ty = self.pattern_type(pattern, span)?;
+            return self.decide_ty(ty, span);
+        }
+        self.decide_view(&view, span)
+    }
+
+    /// A visible service instance for this unsaturated head.
+    /// `None` means the pattern is not a check. A named parameter of an arity
+    /// the service classes do not cover is `has no element test`. A head with
+    /// no constructors and no instance is `no instance`.
+    fn take_service(
+        &self,
+        name: &str,
+        arity: usize,
+        named: bool,
+        span: Span,
+    ) -> Result<Option<OpenCheck>, Diagnostic> {
+        let Some(service) = service_for(arity) else {
+            if named && !self.data_with_constructors(name) {
+                return Err(self.error(span, Error::NoElementTest(name.to_string())));
+            }
+            return Ok(None);
+        };
+        // A visible instance is the check, including when the type has constructors.
+        let Some(open) = self.open_service(name, service) else {
+            if self.data_with_constructors(name) {
+                return Ok(None);
+            }
+            return Err(self.error(
+                span,
+                Error::NoInstance {
+                    constraint: format!("{} {name}", service.class),
+                    needed_by: String::new(),
+                },
+            ));
+        };
+        Ok(Some(open))
+    }
+
+    fn decide_view(
+        &mut self,
+        view: &CheckView<'_>,
+        span: Span,
+    ) -> Result<CheckDecision, Diagnostic> {
+        let name = view.name();
+        // `(Num)` is the check. `(Array)` still asks for one argument.
+        if matches!(view, CheckView::Nullary(_)) && self.known_arity(name) != Some(0) {
+            return Ok(CheckDecision::NotCheck);
+        }
+        let Some(arity) = self.known_arity(name) else {
+            return Ok(CheckDecision::NotCheck);
+        };
+        if let CheckView::Applied { args, .. } = view {
+            if args.len() != arity {
+                return Ok(CheckDecision::NotCheck);
+            }
+        }
+        let Some(open) = self.take_service(name, arity, view.names_parameter(), span)? else {
+            return Ok(CheckDecision::NotCheck);
+        };
+        let Some(params) = self.param_tests(view, &open, span)? else {
+            return Ok(CheckDecision::NotCheck);
+        };
+        Ok(CheckDecision::Use(shape_from(&open, params)))
+    }
+
+    /// Named parameters become tests. `_` and a binder add none, and bind nothing.
+    /// `None` means an argument is not itself a check, so the pattern is not one.
+    fn param_tests(
+        &mut self,
+        view: &CheckView<'_>,
+        open: &OpenCheck,
+        span: Span,
+    ) -> Result<Option<Vec<ParamTest>>, Diagnostic> {
+        let CheckView::Applied { args, .. } = view else {
+            return Ok(Some(Vec::new()));
+        };
+        let mut params = Vec::new();
+        for (index, arg) in args.iter().enumerate() {
+            if matches!(arg, Pattern::Wild | Pattern::Bind(..)) {
+                continue;
+            }
+            let CheckDecision::Use(inner) = self.decide_check(arg, span)? else {
+                return Ok(None);
+            };
+            let Some((word, origin)) = open.params.get(index) else {
+                return Err(self.error(span, Error::NoElementTest(open.ctor.clone())));
+            };
+            params.push(ParamTest {
+                index,
+                word: word.clone(),
+                origin: origin.clone(),
+                inner: Box::new(inner),
+            });
+        }
+        Ok(Some(params))
+    }
+
+    fn decide_ty(&mut self, ty: TyId, span: Span) -> Result<CheckDecision, Diagnostic> {
+        let ty = self.expose(ty);
+        let TyNode::Ctor(name, args) = self.tys[ty.0 as usize].clone() else {
+            return Ok(CheckDecision::NotCheck);
+        };
+        if !self.type_known(&name) {
+            return Ok(CheckDecision::NotCheck);
+        }
+        let Some(arity) = self.known_arity(&name) else {
+            return Ok(CheckDecision::NotCheck);
+        };
+        if !args.is_empty() && args.len() != arity {
+            return Ok(CheckDecision::NotCheck);
+        }
+        let named = args.iter().copied().any(|arg| !self.param_open(arg));
+        let Some(open) = self.take_service(&name, arity, named, span)? else {
+            return Ok(CheckDecision::NotCheck);
+        };
+        let mut params = Vec::new();
+        for (index, arg) in args.iter().copied().enumerate() {
+            if self.param_open(arg) {
+                continue;
+            }
+            let CheckDecision::Use(inner) = self.decide_ty(arg, span)? else {
+                return Ok(CheckDecision::NotCheck);
+            };
+            let Some((word, origin)) = open.params.get(index) else {
+                return Err(self.error(span, Error::NoElementTest(name)));
+            };
+            params.push(ParamTest {
+                index,
+                word: word.clone(),
+                origin: origin.clone(),
+                inner: Box::new(inner),
+            });
+        }
+        Ok(CheckDecision::Use(shape_from(&open, params)))
+    }
+
+    /// The elaborated type of a field that is already a constructor, when the
+    /// pattern itself was not a `Check` form. A variable element is any array.
+    fn shape_of_ty(&mut self, ty: TyId) -> Option<ShapeTest> {
+        let decided = self.decide_ty(ty, Span::new(0, 0)).ok()?;
+        match decided {
+            CheckDecision::Use(shape) => Some(shape),
+            CheckDecision::NotCheck => None,
         }
     }
 
@@ -854,9 +1147,9 @@ impl Checker {
         Ok(Some(shape.clone()))
     }
 
-    /// `(f a)` matches `Array`. `f` becomes `Array` and the element stays `a`,
-    /// unless the pattern names the element. A scalar does not match an
-    /// application: that binding would have the wrong kind.
+    /// `(f a)` matches a head that is no shorter than the application.
+    /// The prefix of the head becomes `f`. A named prefix parameter is part of
+    /// that head. The remaining parameters line up with the application.
     fn match_app(
         &mut self,
         head: TyId,
@@ -865,24 +1158,23 @@ impl Checker {
         span: Span,
         subst: &mut HashMap<TyId, TyId>,
     ) -> Result<Option<ShapeTest>, Diagnostic> {
-        let ShapeTest::Array(elem) = shape else {
-            let slot = self.expose_app(head, args);
-            let message = self.host_mismatch(shape, slot);
-            return Err(self.error(span, message));
-        };
         let head = self.expose(head);
-        if !matches!(
+        let flexible = matches!(
             self.tys[head.0 as usize],
             TyNode::Rigid(_) | TyNode::Var | TyNode::Template
-        ) || args.len() != 1
-        {
+        );
+        if !flexible || shape.arity < args.len() {
             let slot = self.expose_app(head, args);
             let message = self.host_mismatch(shape, slot);
             return Err(self.error(span, message));
         }
-        self.bind_head(head, span, subst)?;
-        if let Some(elem) = elem {
-            self.match_host(args[0], elem, span, subst)?;
+        let prefix = shape.arity - args.len();
+        self.bind_unsaturated(head, shape, prefix, span, subst)?;
+        for (offset, arg) in args.iter().copied().enumerate() {
+            let index = prefix + offset;
+            if let Some(param) = shape.params.iter().find(|param| param.index == index) {
+                self.match_host(arg, &param.inner, span, subst)?;
+            }
         }
         Ok(Some(shape.clone()))
     }
@@ -895,32 +1187,80 @@ impl Checker {
         id
     }
 
-    /// `f` is the unsaturated `Array` constructor. A second pattern must agree.
-    fn bind_head(
+    /// `f` becomes the unsaturated head. A named prefix parameter is that
+    /// argument. A second pattern refines the stored image. It does not build
+    /// another one: two fresh variables would not match.
+    fn bind_unsaturated(
         &mut self,
         head: TyId,
+        shape: &ShapeTest,
+        prefix: usize,
         span: Span,
         subst: &mut HashMap<TyId, TyId>,
     ) -> Result<(), Diagnostic> {
         let head = self.find_ty(head);
-        let array = self.ty_ctor("Array", Vec::new());
         if matches!(self.tys[head.0 as usize], TyNode::Rigid(_)) {
             if let Some(prev) = subst.get(&head).copied() {
-                if !self.congruent_ty(prev, array) {
-                    return Err(self.error(span, self.ty_mismatch(array, prev)));
+                if self.refine_prefix(prev, shape, prefix, span, subst)? {
+                    return Ok(());
                 }
-                return Ok(());
+                let image = self.head_prefix(shape, prefix);
+                let message = self.ty_mismatch(image, prev);
+                return Err(self.error(span, message));
             }
-            subst.insert(head, array);
+            subst.insert(head, self.head_prefix(shape, prefix));
             return Ok(());
         }
-        self.bind_ty(head, array)
+        let image = self.head_prefix(shape, prefix);
+        self.bind_ty(head, image)
             .map_err(|message| self.error(span, message))?;
         Ok(())
     }
 
-    /// The slot is already a constructor. Fill in an element variable, or reject
-    /// a different type. No test when nothing was learned.
+    /// The unsaturated head. A named prefix parameter uses that test's image.
+    fn head_prefix(&mut self, shape: &ShapeTest, prefix: usize) -> TyId {
+        let mut params = Vec::with_capacity(prefix);
+        for index in 0..prefix {
+            if let Some(param) = shape.params.iter().find(|param| param.index == index) {
+                params.push(self.host_image(&param.inner));
+            } else {
+                params.push(self.ty_var());
+            }
+        }
+        self.ty_ctor(&shape.ctor, params)
+    }
+
+    /// Same constructor and the same prefix length. Named prefix arguments
+    /// refine the variables already stored.
+    fn refine_prefix(
+        &mut self,
+        prev: TyId,
+        shape: &ShapeTest,
+        prefix: usize,
+        span: Span,
+        subst: &mut HashMap<TyId, TyId>,
+    ) -> Result<bool, Diagnostic> {
+        let prev = self.expose(prev);
+        let TyNode::Ctor(name, args) = self.tys[prev.0 as usize].clone() else {
+            return Ok(false);
+        };
+        if name != shape.ctor || args.len() != prefix {
+            return Ok(false);
+        }
+        for index in 0..prefix {
+            if let Some(param) = shape.params.iter().find(|param| param.index == index) {
+                let Some(arg) = args.get(index).copied() else {
+                    return Ok(false);
+                };
+                self.match_host(arg, &param.inner, span, subst)?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// The slot is already a constructor. Fill a parameter variable, or reject
+    /// a different type. A parameter that was already known drops out of the
+    /// test. No test when every parameter was already known.
     fn match_known(
         &mut self,
         name: &str,
@@ -929,25 +1269,40 @@ impl Checker {
         span: Span,
         subst: &mut HashMap<TyId, TyId>,
     ) -> Result<Option<ShapeTest>, Diagnostic> {
-        let slot = self.ty_ctor(name, args.to_vec());
-        match shape {
-            ShapeTest::Array(elem) if name == "Array" && args.len() == 1 => match elem {
-                None => Ok(None),
-                Some(elem) => {
-                    let inner = self.match_host(args[0], elem, span, subst)?;
-                    Ok(inner.map(|inner| ShapeTest::Array(Some(Box::new(inner)))))
-                }
-            },
-            _ if args.is_empty() && shape_ctor(shape) == Some(name) => Ok(None),
-            _ => {
-                let message = self.host_mismatch(shape, slot);
-                Err(self.error(span, message))
+        if name == shape.ctor && args.len() == shape.arity {
+            if shape.params.is_empty() {
+                return Ok(None);
             }
+            let mut kept = Vec::new();
+            for param in &shape.params {
+                let Some(arg) = args.get(param.index).copied() else {
+                    let slot = self.ty_ctor(name, args.to_vec());
+                    let message = self.host_mismatch(shape, slot);
+                    return Err(self.error(span, message));
+                };
+                if let Some(inner) = self.match_host(arg, &param.inner, span, subst)? {
+                    kept.push(ParamTest {
+                        index: param.index,
+                        word: param.word.clone(),
+                        origin: param.origin.clone(),
+                        inner: Box::new(inner),
+                    });
+                }
+            }
+            if kept.is_empty() {
+                return Ok(None);
+            }
+            let mut next = shape.clone();
+            next.params = kept;
+            return Ok(Some(next));
         }
+        let slot = self.ty_ctor(name, args.to_vec());
+        let message = self.host_mismatch(shape, slot);
+        Err(self.error(span, message))
     }
 
-    /// `a` was already learned. A wider pattern must agree. A tighter element
-    /// fills the variable stored in that image.
+    /// `a` was already learned. The same head agrees. A tighter parameter fills
+    /// the variable stored in that image. A fresh image would fail congruence.
     fn refine_bound(
         &mut self,
         prev: TyId,
@@ -956,43 +1311,32 @@ impl Checker {
         subst: &mut HashMap<TyId, TyId>,
     ) -> Result<Option<ShapeTest>, Diagnostic> {
         let prev = self.expose(prev);
-        match (self.tys[prev.0 as usize].clone(), shape) {
-            (TyNode::Ctor(name, args), ShapeTest::Array(elem))
-                if name == "Array" && args.len() == 1 =>
-            {
-                if let Some(elem) = elem {
-                    self.match_host(args[0], elem, span, subst)?;
-                }
-                Ok(Some(shape.clone()))
-            }
-            (TyNode::Ctor(name, args), _)
-                if args.is_empty() && shape_ctor(shape) == Some(name.as_str()) =>
-            {
-                Ok(Some(shape.clone()))
-            }
-            _ => {
-                let message = self.host_mismatch(shape, prev);
-                Err(self.error(span, message))
+        let TyNode::Ctor(name, args) = self.tys[prev.0 as usize].clone() else {
+            let message = self.host_mismatch(shape, prev);
+            return Err(self.error(span, message));
+        };
+        if name != shape.ctor || args.len() != shape.arity {
+            let message = self.host_mismatch(shape, prev);
+            return Err(self.error(span, message));
+        }
+        for param in &shape.params {
+            if let Some(arg) = args.get(param.index).copied() {
+                self.match_host(arg, &param.inner, span, subst)?;
             }
         }
+        Ok(Some(shape.clone()))
     }
 
     fn host_image(&mut self, shape: &ShapeTest) -> TyId {
-        match shape {
-            ShapeTest::Num => self.ty_ctor("Num", Vec::new()),
-            ShapeTest::Int => self.ty_ctor("Int", Vec::new()),
-            ShapeTest::Str => self.ty_ctor("Str", Vec::new()),
-            ShapeTest::Bool => self.ty_ctor("Bool", Vec::new()),
-            ShapeTest::Unit => self.ty_ctor("Unit", Vec::new()),
-            ShapeTest::Array(None) => {
-                let elem = self.ty_var();
-                self.ty_ctor("Array", vec![elem])
-            }
-            ShapeTest::Array(Some(elem)) => {
-                let elem = self.host_image(elem);
-                self.ty_ctor("Array", vec![elem])
+        let mut params = Vec::with_capacity(shape.arity);
+        for index in 0..shape.arity {
+            if let Some(param) = shape.params.iter().find(|param| param.index == index) {
+                params.push(self.host_image(&param.inner));
+            } else {
+                params.push(self.ty_var());
             }
         }
+        self.ty_ctor(&shape.ctor, params)
     }
 
     fn host_mismatch(&mut self, shape: &ShapeTest, slot: TyId) -> Error {
@@ -1007,6 +1351,7 @@ impl Checker {
         report: Span,
     ) -> Result<(), Diagnostic> {
         let clauses = self.canonical_clauses(clauses);
+        let heads = self.open_heads();
         let mut memo = NeedMemo {
             nodes: HashMap::new(),
             keys: HashMap::new(),
@@ -1017,13 +1362,16 @@ impl Checker {
             .map(|ty| self.need_of(*ty, 0, &mut memo))
             .collect::<Vec<_>>()];
         for clause in clauses {
-            if !rows.iter().any(|row| row_hit(row, &clause.patterns)) {
+            if !rows
+                .iter()
+                .any(|row| row_hit(row, &clause.patterns, &heads))
+            {
                 return Err(self.error(clause.span, Error::RedundantPattern));
             }
             let mut next = Vec::new();
             for row in rows {
-                if row_hit(&row, &clause.patterns) {
-                    next.extend(subtract_row(&row, &clause.patterns));
+                if row_hit(&row, &clause.patterns, &heads) {
+                    next.extend(subtract_row(&row, &clause.patterns, &heads));
                 } else {
                     next.push(row);
                 }
@@ -1072,11 +1420,6 @@ impl Checker {
                     self.canonical_pattern(item);
                 }
             }
-            Pattern::Record(fields) => {
-                for (_, field) in fields {
-                    self.canonical_pattern(field);
-                }
-            }
             Pattern::Wild | Pattern::Spill | Pattern::Bind(_, _) | Pattern::Lit(_) => {}
         }
     }
@@ -1113,16 +1456,6 @@ impl Checker {
                     .collect();
                 TypeKey::Ctor(name, args)
             }
-            TyNode::Record(row) => match self.peel_row(row) {
-                Ok((fields, _)) => {
-                    let fields = fields
-                        .into_iter()
-                        .map(|(name, field)| (name, self.type_key(field, keys)))
-                        .collect();
-                    TypeKey::Record(fields)
-                }
-                Err(_) => TypeKey::Other,
-            },
             _ => TypeKey::Other,
         };
         keys.insert(ty, built.clone());
@@ -1130,9 +1463,6 @@ impl Checker {
     }
 
     fn need_shape(&mut self, ty: TyId, depth: usize, memo: &mut NeedMemo) -> Need {
-        if let TyNode::Record(row) = self.tys[ty.0 as usize].clone() {
-            return self.record_need(row, depth, memo);
-        }
         let TyNode::Ctor(name, args) = self.tys[ty.0 as usize].clone() else {
             return Need::Any;
         };
@@ -1162,6 +1492,7 @@ impl Checker {
                         excluded: Vec::new(),
                     };
                 }
+                "Unit" => return Need::Unit,
                 _ => {}
             }
         }
@@ -1173,10 +1504,19 @@ impl Checker {
             };
         }
         let Some(data) = self.datas.get(&name).cloned() else {
-            return Need::Any;
+            return Need::Open {
+                name,
+                excluded: Vec::new(),
+            };
         };
         if args.len() != data.params.len() {
             return Need::Any;
+        }
+        if data.ctors.is_empty() {
+            return Need::Open {
+                name,
+                excluded: Vec::new(),
+            };
         }
         let mut ctors = Vec::new();
         for ctor in &data.ctors {
@@ -1191,20 +1531,6 @@ impl Checker {
             });
         }
         Need::Data { ctors }
-    }
-
-    fn record_need(&mut self, row: super::RowId, depth: usize, memo: &mut NeedMemo) -> Need {
-        let Ok((fields, _)) = self.peel_row(row) else {
-            return Need::Any;
-        };
-        let mut out = Vec::with_capacity(fields.len());
-        for (name, field_ty) in fields {
-            out.push(FieldNeed {
-                name,
-                need: Rc::new(self.need_of(field_ty, depth + 1, memo)),
-            });
-        }
-        Need::Record { fields: out }
     }
 }
 
@@ -1286,23 +1612,27 @@ fn binds_name_fields(patterns: &[Pattern], names: &[Option<String>]) -> bool {
     true
 }
 
-fn row_hit(row: &[Need], patterns: &[Pattern]) -> bool {
+fn row_hit(row: &[Need], patterns: &[Pattern], heads: &[OpenHead]) -> bool {
     patterns
         .iter()
         .zip(row)
-        .all(|(pattern, need)| overlaps(pattern, need))
+        .all(|(pattern, need)| overlaps(pattern, need, heads))
 }
 
-fn overlaps(pattern: &Pattern, need: &Need) -> bool {
+fn overlaps(pattern: &Pattern, need: &Need, heads: &[OpenHead]) -> bool {
     if matches!(need, Need::Any) {
         return true;
     }
-    if let Some(rel) = host_coverage(pattern, need) {
+    if let Some(rel) = host_coverage(pattern, need, heads) {
         return rel != Rel::Miss;
+    }
+    if matches!(need, Need::Screened { .. }) {
+        return !matches!(pattern, Pattern::Spill);
     }
     match pattern {
         Pattern::Wild | Pattern::Bind(..) => true,
         Pattern::Spill => false,
+        Pattern::Lit(Lit::Unit) => matches!(need, Need::Unit),
         Pattern::Lit(Lit::Bool(true)) => match need {
             Need::Bool { yes, .. } => *yes,
             Need::Exact(Lit::Bool(true)) => true,
@@ -1329,7 +1659,7 @@ fn overlaps(pattern: &Pattern, need: &Need) -> bool {
                 return groups
                     .iter()
                     .zip(fields)
-                    .all(|(group, field)| group_overlaps(group, field));
+                    .all(|(group, field)| group_overlaps(group, field, heads));
             }
             // A named subset covers the constructor. Its binds are irrefutable.
             if patterns.len() != fields.len() {
@@ -1338,21 +1668,18 @@ fn overlaps(pattern: &Pattern, need: &Need) -> bool {
             patterns
                 .iter()
                 .zip(fields)
-                .all(|(pattern, field)| overlaps(pattern, field))
+                .all(|(pattern, field)| overlaps(pattern, field, heads))
         }
         Pattern::Array(patterns) => match need {
             Need::Array { elem, open, apart } => match part_of(apart, patterns.len()) {
-                Some(part) => part.rows.iter().any(|row| row_hit(row, patterns)),
-                None => *open && patterns.iter().all(|pattern| overlaps(pattern, elem)),
+                Some(part) => part.rows.iter().any(|row| row_hit(row, patterns, heads)),
+                None => {
+                    *open
+                        && patterns
+                            .iter()
+                            .all(|pattern| overlaps(pattern, elem, heads))
+                }
             },
-            _ => false,
-        },
-        Pattern::Record(fields) => match need {
-            Need::Record { fields: have } => fields.iter().all(|(name, pattern)| {
-                have.iter()
-                    .find(|field| field.name == *name)
-                    .is_some_and(|field| overlaps(pattern, &field.need))
-            }),
             _ => false,
         },
     }
@@ -1373,21 +1700,21 @@ fn live_ctor<'a>(need: &'a Need, name: &str) -> Option<&'a [Rc<Need>]> {
 
 /// Rows that remain after this pattern. An empty result means the row is covered.
 /// The first slot splits into "missed by this pattern" and "hit, then the tail".
-fn subtract_row(row: &[Need], patterns: &[Pattern]) -> Vec<Vec<Need>> {
+fn subtract_row(row: &[Need], patterns: &[Pattern], heads: &[OpenHead]) -> Vec<Vec<Need>> {
     if patterns.is_empty() {
         return Vec::new();
     }
-    if !overlaps(&patterns[0], &row[0]) {
+    if !overlaps(&patterns[0], &row[0], heads) {
         return vec![row.to_vec()];
     }
     let mut out = Vec::new();
-    for left in subtract_slot(&row[0], &patterns[0]) {
+    for left in subtract_slot(&row[0], &patterns[0], heads) {
         let mut next = vec![left];
         next.extend(row[1..].iter().cloned());
         out.push(next);
     }
-    if let Some(covered) = covered_slot(&patterns[0], &row[0]) {
-        for tail in subtract_row(&row[1..], &patterns[1..]) {
+    if let Some(covered) = covered_slot(&patterns[0], &row[0], heads) {
+        for tail in subtract_row(&row[1..], &patterns[1..], heads) {
             let mut next = vec![covered.clone()];
             next.extend(tail);
             out.push(next);
@@ -1396,20 +1723,25 @@ fn subtract_row(row: &[Need], patterns: &[Pattern]) -> Vec<Vec<Need>> {
     out
 }
 
-fn subtract_slot(need: &Need, pattern: &Pattern) -> Vec<Need> {
-    if !overlaps(pattern, need) {
+fn subtract_slot(need: &Need, pattern: &Pattern, heads: &[OpenHead]) -> Vec<Need> {
+    if !overlaps(pattern, need, heads) {
         return vec![need.clone()];
     }
-    if let Some(rel) = host_coverage(pattern, need) {
+    if let Some(rel) = host_coverage(pattern, need, heads) {
         return match rel {
             Rel::Hit => Vec::new(),
-            Rel::Partial | Rel::Miss => vec![need.clone()],
+            Rel::Partial => vec![screen_check(need, pattern, heads)],
+            Rel::Miss => vec![need.clone()],
         };
     }
     match pattern {
         Pattern::Wild | Pattern::Bind(..) => Vec::new(),
         Pattern::Spill => vec![need.clone()],
         _ if matches!(need, Need::Any) => vec![Need::Any],
+        Pattern::Lit(Lit::Unit) => match need {
+            Need::Unit => Vec::new(),
+            _ => vec![need.clone()],
+        },
         Pattern::Lit(Lit::Bool(true)) => match need {
             Need::Bool { no: true, .. } => vec![Need::Bool {
                 yes: false,
@@ -1455,17 +1787,16 @@ fn subtract_slot(need: &Need, pattern: &Pattern) -> Vec<Need> {
                     return vec![need.clone()];
                 };
                 if let Some(groups) = group_type_tests(patterns, fields.len()) {
-                    return subtract_grouped(need, name, &fields, &groups, others);
+                    return subtract_grouped(need, name, &fields, &groups, others, heads);
                 }
                 if patterns.len() != fields.len() {
                     return without_ctor(need, name);
                 }
-                assemble(name, others, subtract_fields(&fields, patterns))
+                assemble(name, others, subtract_fields(&fields, patterns, heads))
             }
             _ => vec![need.clone()],
         },
-        Pattern::Array(patterns) => subtract_array(need, patterns),
-        Pattern::Record(fields) => subtract_record(need, fields),
+        Pattern::Array(patterns) => subtract_array(need, patterns, heads),
     }
 }
 
@@ -1476,56 +1807,71 @@ enum Rel {
     Hit,
 }
 
-fn scalar_shape(name: &str) -> Option<ShapeTest> {
-    match name {
-        "Num" => Some(ShapeTest::Num),
-        "Int" => Some(ShapeTest::Int),
-        "Str" => Some(ShapeTest::Str),
-        "Bool" => Some(ShapeTest::Bool),
-        "Unit" => Some(ShapeTest::Unit),
-        _ => None,
-    }
-}
-
-/// A pattern JavaScript can test without a constructor tag.
-/// `(Array x)` and `(Array _)` leave the element unnamed. `x` is not a value.
-/// `(Array Num ..)` is not a shape: `..` is a spill, not an element type.
-pub(super) fn host_spec(pattern: &Pattern) -> Option<ShapeTest> {
+/// `Num`, `(Array Num)`, `(Array _)`, `(Map _ Num)`. A spill is not a check.
+/// `(Array x)` does not bind `x`.
+fn check_view(pattern: &Pattern) -> Option<CheckView<'_>> {
     match pattern {
-        Pattern::Unpack(name) if name == "Array" => Some(ShapeTest::Array(None)),
-        Pattern::Unpack(name) => scalar_shape(name),
-        Pattern::Ctor(name, args) if name == "Array" && args.len() == 1 => {
-            if matches!(args[0], Pattern::Bind(..) | Pattern::Wild) {
-                Some(ShapeTest::Array(None))
-            } else {
-                Some(ShapeTest::Array(Some(Box::new(host_spec(&args[0])?))))
-            }
+        Pattern::Unpack(name) => Some(CheckView::Unpack(name)),
+        Pattern::Ctor(name, args) if args.is_empty() => Some(CheckView::Nullary(name)),
+        Pattern::Ctor(name, args) if args.iter().all(is_check_arg) => {
+            Some(CheckView::Applied { name, args })
         }
-        Pattern::Ctor(name, args) if args.is_empty() => scalar_shape(name),
         _ => None,
     }
 }
 
-fn shape_of_pattern(pattern: &Pattern) -> Option<ShapeTest> {
-    host_spec(pattern)
-}
-
-fn shape_ctor(shape: &ShapeTest) -> Option<&str> {
-    match shape {
-        ShapeTest::Num => Some("Num"),
-        ShapeTest::Int => Some("Int"),
-        ShapeTest::Str => Some("Str"),
-        ShapeTest::Bool => Some("Bool"),
-        ShapeTest::Unit => Some("Unit"),
-        ShapeTest::Array(_) => None,
+fn is_check_arg(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Wild | Pattern::Bind(..) => true,
+        other => check_view(other).is_some(),
     }
 }
 
-/// A constructor of this need wins over a shape of the same name.
-/// `Unit ->` on `Unit` stays the constructor. `Num ->` on `Num` is a shape,
-/// because `Num` has no constructors.
-fn host_coverage(pattern: &Pattern, need: &Need) -> Option<Rel> {
-    let shape = host_spec(pattern)?;
+fn shape_from(open: &OpenCheck, params: Vec<ParamTest>) -> ShapeTest {
+    ShapeTest {
+        word: open.word.clone(),
+        ctor: open.ctor.clone(),
+        arity: open.arity,
+        params,
+        origin: open.origin.clone(),
+    }
+}
+
+/// The check a coverage walk can see. The word and its module are not needed here.
+fn check_shape(pattern: &Pattern, heads: &[OpenHead]) -> Option<SeenCheck> {
+    let view = check_view(pattern)?;
+    let name = view.name();
+    let head = heads.iter().find(|head| head.ctor == name)?;
+    let params = match &view {
+        CheckView::Nullary(_) if head.arity != 0 => return None,
+        CheckView::Unpack(_) | CheckView::Nullary(_) => Vec::new(),
+        CheckView::Applied { args, .. } => {
+            if args.len() != head.arity {
+                return None;
+            }
+            let mut params = Vec::new();
+            for (index, arg) in args.iter().enumerate() {
+                if matches!(arg, Pattern::Wild | Pattern::Bind(..)) {
+                    continue;
+                }
+                params.push(SeenParam {
+                    index,
+                    inner: Box::new(check_shape(arg, heads)?),
+                });
+            }
+            params
+        }
+    };
+    Some(SeenCheck {
+        ctor: name.to_string(),
+        params,
+    })
+}
+
+/// A constructor of this need wins over a check of the same name.
+/// `Num ->` on `Num` is a check, because `Num` has no constructors.
+fn host_coverage(pattern: &Pattern, need: &Need, heads: &[OpenHead]) -> Option<Rel> {
+    let shape = check_shape(pattern, heads)?;
     let name = match pattern {
         Pattern::Unpack(name) | Pattern::Open(name) | Pattern::Ctor(name, _) => name.as_str(),
         _ => return None,
@@ -1536,64 +1882,98 @@ fn host_coverage(pattern: &Pattern, need: &Need) -> Option<Rel> {
     Some(shape_rel(&shape, need))
 }
 
+/// A head with no parameter tests covers a later tighter head.
+/// A tighter head does not cover a later wider one.
+fn covers(prev: &SeenCheck, next: &SeenCheck) -> bool {
+    if prev.ctor != next.ctor {
+        return false;
+    }
+    prev.params.iter().all(|test| {
+        next.params
+            .iter()
+            .any(|other| other.index == test.index && covers(&test.inner, &other.inner))
+    })
+}
+
+/// A check on a variable slot remembers the head. A concrete slot stays as it is.
+fn screen_check(need: &Need, pattern: &Pattern, heads: &[OpenHead]) -> Need {
+    let Some(shape) = check_shape(pattern, heads) else {
+        return need.clone();
+    };
+    match need {
+        Need::Any => Need::Screened { seen: vec![shape] },
+        Need::Screened { seen } => {
+            let mut seen = seen.clone();
+            seen.push(shape);
+            Need::Screened { seen }
+        }
+        _ => need.clone(),
+    }
+}
+
 pub(super) fn arm_subst(map: &HashMap<TyId, TyId>) -> super::Subst {
     super::Subst {
         ty: map.clone(),
         stack: HashMap::new(),
-        row: HashMap::new(),
         effect: HashMap::new(),
     }
 }
 
-fn type_rel(pattern: &Pattern, need: &Need) -> Rel {
-    match shape_of_pattern(pattern) {
-        Some(shape) => shape_rel(&shape, need),
-        // A data type is accepted only when the field is already that type.
-        None => match need {
-            Need::Any | Need::Deep => Rel::Partial,
-            _ => Rel::Hit,
-        },
+fn type_rel(pattern: &Pattern, need: &Need, heads: &[OpenHead]) -> Rel {
+    if let Some(rel) = host_coverage(pattern, need, heads) {
+        return rel;
+    }
+    // A data type is accepted only when the field is already that type.
+    match need {
+        Need::Any | Need::Deep | Need::Screened { .. } => Rel::Partial,
+        _ => Rel::Hit,
     }
 }
 
-fn shape_rel(shape: &ShapeTest, need: &Need) -> Rel {
-    match (shape, need) {
-        (_, Need::Any | Need::Deep) => Rel::Partial,
-        (ShapeTest::Num, Need::Open { name, .. }) if name == "Num" => Rel::Hit,
-        (ShapeTest::Num, Need::Exact(Lit::Number(_))) => Rel::Hit,
-        (ShapeTest::Int, Need::Open { name, .. }) if name == "Int" => Rel::Hit,
-        (ShapeTest::Int, Need::Exact(Lit::Int(_))) => Rel::Hit,
-        (ShapeTest::Str, Need::Open { name, .. }) if name == "Str" => Rel::Hit,
-        (ShapeTest::Str, Need::Exact(Lit::String(_))) => Rel::Hit,
-        (ShapeTest::Bool, Need::Bool { .. } | Need::Exact(Lit::Bool(_))) => Rel::Hit,
-        (ShapeTest::Unit, Need::Data { ctors })
-            if ctors.iter().any(|ctor| ctor.name == "Unit" && ctor.fields.is_some())
-                && ctors.iter().filter(|ctor| ctor.fields.is_some()).count() == 1 =>
-        {
-            Rel::Hit
+fn shape_rel(shape: &SeenCheck, need: &Need) -> Rel {
+    let open = shape.params.is_empty();
+    match need {
+        Need::Any | Need::Deep => Rel::Partial,
+        Need::Screened { seen } => {
+            if seen.iter().any(|item| covers(item, shape)) {
+                Rel::Miss
+            } else {
+                Rel::Partial
+            }
         }
-        (ShapeTest::Array(None), Need::Array { .. }) => Rel::Hit,
-        (
-            ShapeTest::Array(Some(elem)),
-            Need::Array {
-                elem: need_elem, ..
-            },
-        ) => shape_rel(elem, need_elem),
+        Need::Open { name, .. } if name == &shape.ctor => {
+            if open {
+                Rel::Hit
+            } else {
+                Rel::Partial
+            }
+        }
+        Need::Exact(Lit::Number(_)) if shape.ctor == "Num" && open => Rel::Hit,
+        Need::Exact(Lit::Int(_)) if shape.ctor == "Int" && open => Rel::Hit,
+        Need::Exact(Lit::String(_)) if shape.ctor == "Str" && open => Rel::Hit,
+        Need::Bool { .. } | Need::Exact(Lit::Bool(_)) if shape.ctor == "Bool" && open => Rel::Hit,
+        Need::Unit if shape.ctor == "Unit" && open => Rel::Hit,
+        Need::Array { elem, .. } if shape.ctor == "Array" => {
+            match shape.params.iter().find(|param| param.index == 0) {
+                None => Rel::Hit,
+                Some(param) => shape_rel(&param.inner, elem),
+            }
+        }
         _ => Rel::Miss,
     }
 }
 
-fn group_overlaps(group: &SlotPat, field: &Need) -> bool {
+fn group_overlaps(group: &SlotPat, field: &Need, heads: &[OpenHead]) -> bool {
     match group {
-        SlotPat::Plain(pattern) => overlaps(pattern, field),
-        SlotPat::Test { ty, .. } => type_rel(ty, field) != Rel::Miss,
+        SlotPat::Plain(pattern) => overlaps(pattern, field, heads),
+        SlotPat::Test { ty, .. } => type_rel(ty, field, heads) != Rel::Miss,
     }
 }
 
 /// The test can fail, so the constructor stays in the uncovered set.
-fn group_partial_test(group: &SlotPat, field: &Need) -> bool {
+fn group_partial_test(group: &SlotPat, field: &Need, heads: &[OpenHead]) -> bool {
     match group {
-        SlotPat::Test { ty, .. } => type_rel(ty, field) == Rel::Partial,
+        SlotPat::Test { ty, .. } => type_rel(ty, field, heads) == Rel::Partial,
         SlotPat::Plain(_) => false,
     }
 }
@@ -1611,28 +1991,33 @@ fn subtract_grouped(
     fields: &[Rc<Need>],
     groups: &[SlotPat],
     others: Vec<CtorNeed>,
+    heads: &[OpenHead],
 ) -> Vec<Need> {
     if groups
         .iter()
         .zip(fields)
-        .any(|(group, field)| !group_overlaps(group, field))
+        .any(|(group, field)| !group_overlaps(group, field, heads))
     {
         return vec![need.clone()];
     }
     if groups
         .iter()
         .zip(fields)
-        .any(|(group, field)| group_partial_test(group, field))
+        .any(|(group, field)| group_partial_test(group, field, heads))
     {
         return vec![need.clone()];
     }
     let flat: Vec<Pattern> = groups.iter().map(slot_as_cover).collect();
-    assemble(name, others, subtract_fields(fields, &flat))
+    assemble(name, others, subtract_fields(fields, &flat, heads))
 }
 
-fn subtract_fields(fields: &[Rc<Need>], patterns: &[Pattern]) -> Vec<Vec<Need>> {
+fn subtract_fields(
+    fields: &[Rc<Need>],
+    patterns: &[Pattern],
+    heads: &[OpenHead],
+) -> Vec<Vec<Need>> {
     let owned: Vec<Need> = fields.iter().map(|field| (**field).clone()).collect();
-    subtract_row(&owned, patterns)
+    subtract_row(&owned, patterns, heads)
 }
 
 fn assemble(name: &str, others: Vec<CtorNeed>, remainders: Vec<Vec<Need>>) -> Vec<Need> {
@@ -1651,10 +2036,15 @@ fn assemble(name: &str, others: Vec<CtorNeed>, remainders: Vec<Vec<Need>>) -> Ve
     out
 }
 
-fn covered_fields(name: &str, fields: &[Rc<Need>], patterns: &[Pattern]) -> Option<Need> {
+fn covered_fields(
+    name: &str,
+    fields: &[Rc<Need>],
+    patterns: &[Pattern],
+    heads: &[OpenHead],
+) -> Option<Need> {
     let mut covered = Vec::new();
     for (pattern, field) in patterns.iter().zip(fields) {
-        covered.push(Rc::new(covered_slot(pattern, field)?));
+        covered.push(Rc::new(covered_slot(pattern, field, heads)?));
     }
     Some(Need::Data {
         ctors: vec![CtorNeed {
@@ -1708,7 +2098,7 @@ fn rows_for(elem: &Need, open: bool, apart: &[Apart], len: usize) -> Option<Vec<
     }
 }
 
-fn subtract_array(need: &Need, patterns: &[Pattern]) -> Vec<Need> {
+fn subtract_array(need: &Need, patterns: &[Pattern], heads: &[OpenHead]) -> Vec<Need> {
     let Need::Array { elem, open, apart } = need else {
         return vec![need.clone()];
     };
@@ -1718,7 +2108,7 @@ fn subtract_array(need: &Need, patterns: &[Pattern]) -> Vec<Need> {
     };
     let remainders: Vec<Vec<Need>> = base
         .iter()
-        .flat_map(|row| subtract_row(row, patterns))
+        .flat_map(|row| subtract_row(row, patterns, heads))
         .collect();
     let mut next: Vec<Apart> = apart
         .iter()
@@ -1739,8 +2129,8 @@ fn subtract_array(need: &Need, patterns: &[Pattern]) -> Vec<Need> {
     }]
 }
 
-fn covered_slot(pattern: &Pattern, need: &Need) -> Option<Need> {
-    if let Some(rel) = host_coverage(pattern, need) {
+fn covered_slot(pattern: &Pattern, need: &Need, heads: &[OpenHead]) -> Option<Need> {
+    if let Some(rel) = host_coverage(pattern, need, heads) {
         return match rel {
             Rel::Hit => Some(need.clone()),
             Rel::Partial | Rel::Miss => None,
@@ -1750,6 +2140,10 @@ fn covered_slot(pattern: &Pattern, need: &Need) -> Option<Need> {
         Pattern::Wild | Pattern::Bind(..) => Some(need.clone()),
         Pattern::Spill => None,
         _ if matches!(need, Need::Any) => None,
+        Pattern::Lit(Lit::Unit) => match need {
+            Need::Unit => Some(Need::Unit),
+            _ => None,
+        },
         Pattern::Lit(Lit::Bool(true)) => match need {
             Need::Bool { yes: true, .. } => Some(Need::Bool {
                 yes: true,
@@ -1789,24 +2183,24 @@ fn covered_slot(pattern: &Pattern, need: &Need) -> Option<Need> {
                 if groups
                     .iter()
                     .zip(fields.iter())
-                    .any(|(group, field)| group_partial_test(group, field))
+                    .any(|(group, field)| group_partial_test(group, field, heads))
                 {
                     return None;
                 }
                 if !groups
                     .iter()
                     .zip(fields.iter())
-                    .all(|(group, field)| group_overlaps(group, field))
+                    .all(|(group, field)| group_overlaps(group, field, heads))
                 {
                     return None;
                 }
                 let flat: Vec<Pattern> = groups.iter().map(slot_as_cover).collect();
-                return covered_fields(name, fields, &flat);
+                return covered_fields(name, fields, &flat, heads);
             }
             if patterns.len() != fields.len() {
                 return covered_ctor(need, name);
             }
-            covered_fields(name, fields, patterns)
+            covered_fields(name, fields, patterns, heads)
         }
         Pattern::Array(patterns) => {
             let Need::Array { elem, open, apart } = need else {
@@ -1818,13 +2212,13 @@ fn covered_slot(pattern: &Pattern, need: &Need) -> Option<Need> {
             };
             let mut hit = Vec::new();
             for row in &base {
-                if !row_hit(row, patterns) {
+                if !row_hit(row, patterns, heads) {
                     continue;
                 }
                 let mut covered = Vec::new();
                 let mut ok = true;
                 for (pattern, slot) in patterns.iter().zip(row) {
-                    match covered_slot(pattern, slot) {
+                    match covered_slot(pattern, slot, heads) {
                         Some(need) => covered.push(need),
                         None => {
                             ok = false;
@@ -1845,61 +2239,7 @@ fn covered_slot(pattern: &Pattern, need: &Need) -> Option<Need> {
                 apart: vec![Apart { len, rows: hit }],
             })
         }
-        Pattern::Record(fields) => covered_record(need, fields),
     }
-}
-
-/// Residuals of a record pattern. An empty pattern covers the whole record.
-/// A field the pattern does not name stays as it is.
-fn subtract_record(need: &Need, fields: &[(String, Pattern)]) -> Vec<Need> {
-    let Need::Record { fields: have } = need else {
-        return vec![need.clone()];
-    };
-    if fields.is_empty() {
-        return Vec::new();
-    }
-    let Some((indexes, row)) = project_fields(have, fields) else {
-        return vec![need.clone()];
-    };
-    let patterns: Vec<Pattern> = fields.iter().map(|(_, pattern)| pattern.clone()).collect();
-    let remainders = subtract_row(&row, &patterns);
-    remainders
-        .into_iter()
-        .map(|remainder| {
-            let mut next = have.clone();
-            for (offset, index) in indexes.iter().enumerate() {
-                next[*index].need = Rc::new(remainder[offset].clone());
-            }
-            Need::Record { fields: next }
-        })
-        .collect()
-}
-
-fn covered_record(need: &Need, fields: &[(String, Pattern)]) -> Option<Need> {
-    let Need::Record { fields: have } = need else {
-        return None;
-    };
-    let mut next = have.clone();
-    for (name, pattern) in fields {
-        let index = next.iter().position(|field| field.name == *name)?;
-        next[index].need = Rc::new(covered_slot(pattern, &next[index].need)?);
-    }
-    Some(Need::Record { fields: next })
-}
-
-/// Mentioned fields in pattern order, paired with their index in `have`.
-fn project_fields(
-    have: &[FieldNeed],
-    fields: &[(String, Pattern)],
-) -> Option<(Vec<usize>, Vec<Need>)> {
-    let mut indexes = Vec::with_capacity(fields.len());
-    let mut row = Vec::with_capacity(fields.len());
-    for (name, _) in fields {
-        let index = have.iter().position(|field| field.name == *name)?;
-        indexes.push(index);
-        row.push((*have[index].need).clone());
-    }
-    Some((indexes, row))
 }
 
 fn lit_name(lit: &Lit) -> Option<&str> {
@@ -1907,7 +2247,7 @@ fn lit_name(lit: &Lit) -> Option<&str> {
         Lit::Int(_) => Some("Int"),
         Lit::Number(_) => Some("Num"),
         Lit::String(_) => Some("Str"),
-        Lit::Bool(_) => None,
+        Lit::Bool(_) | Lit::Unit => None,
     }
 }
 
@@ -1952,7 +2292,8 @@ fn render_row(row: &[Need]) -> Vec<String> {
 
 fn render_need(need: &Need) -> Vec<String> {
     match need {
-        Need::Any | Need::Deep => vec!["_".to_string()],
+        Need::Any | Need::Deep | Need::Screened { .. } => vec!["_".to_string()],
+        Need::Unit => vec!["unit".to_string()],
         Need::Bool { yes, no } => {
             let mut parts = Vec::new();
             if *yes {
@@ -1980,45 +2321,7 @@ fn render_need(need: &Need) -> Vec<String> {
             parts
         }
         Need::Array { .. } => vec!["Array".to_string()],
-        Need::Record { fields } => render_record(fields),
     }
-}
-
-fn render_record(fields: &[FieldNeed]) -> Vec<String> {
-    if fields.is_empty() {
-        return vec!["{}".to_string()];
-    }
-    let mut acc = vec![String::new()];
-    for (index, field) in fields.iter().enumerate() {
-        let parts = render_need(&field.need);
-        if parts.is_empty() {
-            return Vec::new();
-        }
-        let mut next = Vec::new();
-        for prefix in &acc {
-            for part in &parts {
-                if next.len() == EXAMPLE_CAP {
-                    break;
-                }
-                let shown =
-                    if part.contains(' ') && !part.starts_with('{') && !part.starts_with('(') {
-                        format!("({part})")
-                    } else {
-                        part.clone()
-                    };
-                let text = if index == 0 {
-                    format!("{} : {shown}", field.name)
-                } else {
-                    format!("{prefix}, {} : {shown}", field.name)
-                };
-                next.push(text);
-            }
-        }
-        acc = next;
-    }
-    acc.into_iter()
-        .map(|text| format!("{{ {text} }}"))
-        .collect()
 }
 
 fn render_ctor(name: &str, fields: &[Rc<Need>]) -> Vec<String> {
@@ -2055,6 +2358,7 @@ fn show_lit(lit: &Lit) -> String {
         Lit::Int(lexeme) => format!("{lexeme}n"),
         Lit::Number(lexeme) => lexeme.clone(),
         Lit::Bool(value) => value.to_string(),
+        Lit::Unit => "unit".to_string(),
         Lit::String(value) => {
             let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
             format!("\"{escaped}\"")

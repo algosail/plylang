@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use crate::anf::{
     js_ident, Access, AnfCtor, AnfData, AnfDef, AnfModule, AnfPlace, Choice, Cond, DictField,
-    DictValue, Expr, Let, LocalId, MethodHome, PatTest, QuoteForm, ShapeTest, Value,
+    DictValue, Expr, Let, LocalId, MethodHome, ParamTest, PatTest, QuoteForm, ShapeTest, Value,
 };
 use crate::ast::{Item, Lit, Module, Pattern, Term, TermNode};
 use crate::builtin::{self, Lowering};
@@ -130,31 +130,15 @@ impl Frame {
 impl Checker {
     fn lower_module(&mut self, module: &Module) -> Result<AnfModule, Diagnostic> {
         self.prepare(module)?;
-        self.check_ready(module)?;
+        self.check_bodies(module)?;
         self.lower_prepared(module)
     }
 
     pub(crate) fn lower_prepared(&mut self, module: &Module) -> Result<AnfModule, Diagnostic> {
-        let added_show =
-            self.inline_show_cat && self.install_derive_word("ply_show_cat", "( Str Str -- Str )");
-        let added_hash =
-            self.inline_hash_mix && self.install_derive_word("ply_hash_mix", "( Int Int -- Int )");
-        let result = self.lower_prepared_body(module);
-        if added_show {
-            self.words.remove("ply_show_cat");
-        }
-        if added_hash {
-            self.words.remove("ply_hash_mix");
-        }
-        result
-    }
-
-    fn lower_prepared_body(&mut self, module: &Module) -> Result<AnfModule, Diagnostic> {
         let mut defs = Vec::new();
         let bodies: Vec<crate::ast::Def> = module
             .items
             .iter()
-            .chain(self.derived.iter())
             .filter_map(|item| match item {
                 Item::Def(def) if !def.body.is_empty() || !def.clauses.is_empty() => {
                     Some(def.clone())
@@ -206,15 +190,13 @@ impl Checker {
         } else {
             Vec::new()
         };
-        let mut anf = AnfModule {
+        let anf = AnfModule {
             datas,
             defs,
             places,
             checks,
-            needs_unit: false,
             method_homes: std::mem::take(&mut self.method_homes),
         };
-        anf.needs_unit = module_uses_unit(&anf);
         Ok(anf)
     }
 
@@ -400,8 +382,7 @@ impl Checker {
         }
         Ok(AnfDef {
             name: def.name.clone(),
-            export: crate::surface::js_exports_def(module, def)
-                || self.publishes_derived_word(&def.name),
+            export: crate::surface::js_exports_def(module, def),
             params,
             body: Expr {
                 lets: frame.lets,
@@ -469,13 +450,9 @@ impl Checker {
                 output
             }
             TermNode::FieldSet(name) => self.lower_set_field(term.span, name, stack, frame)?,
-            TermNode::FieldInsert(name) => {
-                self.lower_insert_field(term.span, name, stack, frame)?
-            }
             TermNode::PlaceSet(name) => self.lower_place_set(term.span, name, stack, frame)?,
             TermNode::PlaceBind(name) => self.lower_place_bind(term.span, name, stack, frame)?,
             TermNode::Array(elements) => self.lower_array(elements, stack, frame)?,
-            TermNode::Record(fields) => self.lower_record(fields, stack, frame)?,
             TermNode::Bind(names) => self.lower_bind(term.span, names, stack, frame)?,
         };
         let concrete = self.cons_len(output);
@@ -495,6 +472,7 @@ impl Checker {
             Lit::Number(_) => self.ty_ctor("Num", Vec::new()),
             Lit::String(_) => self.ty_ctor("Str", Vec::new()),
             Lit::Bool(_) => self.ty_ctor("Bool", Vec::new()),
+            Lit::Unit => self.ty_ctor("Unit", Vec::new()),
         };
         let id = self.fresh_local();
         frame.lets.push(Let {
@@ -605,31 +583,6 @@ impl Checker {
         Ok(output)
     }
 
-    fn lower_insert_field(
-        &mut self,
-        span: Span,
-        name: &str,
-        stack: StackId,
-        frame: &mut Frame,
-    ) -> Result<StackId, Diagnostic> {
-        let output = self.insert_field(span, name, stack)?;
-        let value = frame.pop_one(self);
-        let base = frame.pop_one(self);
-        let value = frame.force(self, value)?;
-        let base = frame.force(self, base)?;
-        let id = self.fresh_local();
-        frame.lets.push(Let {
-            binds: vec![id],
-            value: Value::SetProp {
-                base,
-                name: name.to_string(),
-                value,
-            },
-        });
-        frame.stack.push(Operand::Local(id));
-        Ok(output)
-    }
-
     /// The body runs on its own empty stack. Locals of the caller stay visible.
     /// The values left on that stack are the elements, bottom first.
     fn lower_array(
@@ -687,56 +640,6 @@ impl Checker {
         frame.stack.push(Operand::Local(id));
         let ty = self.ty_ctor("Array", vec![elem_ty]);
         Ok(self.stack_cons(stack, ty))
-    }
-
-    fn lower_record(
-        &mut self,
-        fields: &[(String, Term)],
-        stack: StackId,
-        frame: &mut Frame,
-    ) -> Result<StackId, Diagnostic> {
-        let mut pairs = Vec::new();
-        let mut locals = Vec::new();
-        for (name, term) in fields {
-            let (ty, local) = self.lower_element(term, frame)?;
-            pairs.push((name.clone(), ty));
-            locals.push((name.clone(), local));
-        }
-        let id = self.fresh_local();
-        frame.lets.push(Let {
-            binds: vec![id],
-            value: Value::Record { fields: locals },
-        });
-        frame.stack.push(Operand::Local(id));
-        let row = self.row_fields(pairs, None);
-        let ty = self.ty_record(row);
-        Ok(self.stack_cons(stack, ty))
-    }
-
-    /// An element does not read the surrounding stack. Its lets join the caller.
-    fn lower_element(
-        &mut self,
-        term: &Term,
-        frame: &mut Frame,
-    ) -> Result<(TyId, LocalId), Diagnostic> {
-        let mut inner = Frame {
-            stack: Vec::new(),
-            params: Vec::new(),
-            flexible: false,
-            lets: Vec::new(),
-            env: frame.env.clone(),
-        };
-        let empty = self.stack_empty();
-        let output = self.lower_term(term, empty, &mut inner)?;
-        let output = self.find_stack(output);
-        let ty = match self.stacks[output.0 as usize].clone() {
-            StackNode::Cons(rest, ty) if self.cons_len(rest) == 0 && inner.stack.len() == 1 => ty,
-            _ => return Err(self.error(term.span, Error::ExpectedElement)),
-        };
-        let operand = inner.stack.pop().expect("element");
-        let local = inner.force(self, operand)?;
-        frame.lets.extend(inner.lets);
-        Ok((ty, local))
     }
 
     /// Lower a quotation after its input has been ascribed.
@@ -951,7 +854,7 @@ impl Checker {
                 self.lower_shuffle(frame, take, put);
                 return Ok(output);
             }
-            Some(Lowering::Unit) | None => {}
+            None => {}
         }
         let consumed = self.own_len(input);
         let produced = self.own_len(output);
@@ -1067,28 +970,7 @@ impl Checker {
             args.push(self.materialize_dict(dict, frame));
         }
         args.extend(stack_args);
-        let call = self.derived_js_word(name);
-        self.emit_call(&call, args, produced, frame);
-    }
-
-    /// `ply_show_cat` and `ply_hash_mix` are not functions. The renderer
-    /// turns these sentinels into `+` and `* 31n +`.
-    fn derived_js_word(&self, name: &str) -> String {
-        if self.inline_show_cat && name == "ply_show_cat" {
-            return "#show_cat".to_string();
-        }
-        if self.inline_hash_mix && name == "ply_hash_mix" {
-            return "#hash_mix".to_string();
-        }
-        name.to_string()
-    }
-
-    /// A public derived instance's word is exported even though the definition
-    /// was not in the module when the export flag was decided.
-    fn publishes_derived_word(&self, name: &str) -> bool {
-        self.derived.iter().any(|item| {
-            matches!(item, Item::Instance(instance) if instance.methods.iter().any(|bind| bind.word == name))
-        })
+        self.emit_call(name, args, produced, frame);
     }
 
     /// JavaScript name of an instance word. The same word from the same module
@@ -1113,6 +995,27 @@ impl Checker {
             origin: origin.to_string(),
         });
         local
+    }
+
+    /// The arm calls the instance word. An importer pulls that word from the
+    /// module that wrote the `#`, even when the source did not name it.
+    fn plant_shape(&mut self, shape: &ShapeTest) -> ShapeTest {
+        let mut params = Vec::with_capacity(shape.params.len());
+        for param in &shape.params {
+            params.push(ParamTest {
+                index: param.index,
+                word: self.note_method_home(&param.word, &param.origin),
+                origin: param.origin.clone(),
+                inner: Box::new(self.plant_shape(&param.inner)),
+            });
+        }
+        ShapeTest {
+            word: self.note_method_home(&shape.word, &shape.origin),
+            ctor: shape.ctor.clone(),
+            arity: shape.arity,
+            params,
+            origin: shape.origin.clone(),
+        }
     }
 
     fn emit_call(&mut self, word: &str, args: Vec<LocalId>, produced: usize, frame: &mut Frame) {
@@ -1684,14 +1587,12 @@ impl Checker {
                     arm.stack.push(Operand::Local(id));
                     Ok(())
                 }
-                Err(error) => {
-                    if super::clauses::host_spec(pattern).is_none() {
-                        return Err(error);
-                    }
-                    self.lower_host(
+                Err(error) => match self.decide_check(pattern, span)? {
+                    super::clauses::CheckDecision::Use(_) => self.lower_host(
                         pattern, ty, root, steps, conds, learned, arm_stack, arm, span,
-                    )
-                }
+                    ),
+                    super::clauses::CheckDecision::NotCheck => Err(error),
+                },
             },
             Pattern::Open(name) => {
                 self.spill_ctor(name, ty, root, steps, conds, arm_stack, arm, span)
@@ -1699,14 +1600,14 @@ impl Checker {
             Pattern::Ctor(name, patterns) => {
                 let shape = match self.ctor_shape(name, ty, span) {
                     Ok(shape) => shape,
-                    Err(error) => {
-                        if super::clauses::host_spec(pattern).is_none() {
-                            return Err(error);
+                    Err(error) => match self.decide_check(pattern, span)? {
+                        super::clauses::CheckDecision::Use(_) => {
+                            return self.lower_host(
+                                pattern, ty, root, steps, conds, learned, arm_stack, arm, span,
+                            );
                         }
-                        return self.lower_host(
-                            pattern, ty, root, steps, conds, learned, arm_stack, arm, span,
-                        );
-                    }
+                        super::clauses::CheckDecision::NotCheck => return Err(error),
+                    },
                 };
                 if let Some(groups) = group_type_tests(patterns, shape.fields.len()) {
                     if self.type_test_heads(&groups) {
@@ -1758,18 +1659,6 @@ impl Checker {
                     child.push(Access::Index(index));
                     self.lower_pattern(
                         pattern, elem, root, &child, conds, binds, schemes, learned, arm_stack,
-                        arm, span,
-                    )?;
-                }
-                Ok(())
-            }
-            Pattern::Record(fields) => {
-                let types = self.open_record_pattern(fields, ty, span)?;
-                for ((name, pattern), field_ty) in fields.iter().zip(types) {
-                    let mut child = steps.to_vec();
-                    child.push(Access::Prop(name.clone()));
-                    self.lower_pattern(
-                        pattern, field_ty, root, &child, conds, binds, schemes, learned, arm_stack,
                         arm, span,
                     )?;
                 }
@@ -1829,7 +1718,7 @@ impl Checker {
                         conds.push(Cond {
                             root,
                             steps: child.clone(),
-                            test: PatTest::Shape(test),
+                            test: PatTest::Shape(self.plant_shape(&test)),
                         });
                     }
                     match bind {
@@ -1871,14 +1760,14 @@ impl Checker {
         arm: &mut Frame,
         span: Span,
     ) -> Result<(), Diagnostic> {
-        let Some(shape) = super::clauses::host_spec(pattern) else {
+        let super::clauses::CheckDecision::Use(shape) = self.decide_check(pattern, span)? else {
             return Err(self.error(span, Error::ExpectedPattern));
         };
         if let Some(test) = self.match_host(ty, &shape, span, learned)? {
             conds.push(Cond {
                 root,
                 steps: steps.to_vec(),
-                test: PatTest::Shape(test),
+                test: PatTest::Shape(self.plant_shape(&test)),
             });
         }
         let id = self.materialize(arm, root, steps);
@@ -2111,12 +2000,6 @@ impl Checker {
                 value: local(value),
             },
             Value::Array(items) => Value::Array(items.iter().map(local).collect()),
-            Value::Record { fields } => Value::Record {
-                fields: fields
-                    .iter()
-                    .map(|(name, id)| (name.clone(), local(id)))
-                    .collect(),
-            },
             Value::Dict { fields } => Value::Dict {
                 fields: fields
                     .iter()
@@ -2383,18 +2266,14 @@ impl Checker {
     }
 }
 
-/// Unit is `undefined`. Reading `.tag` would throw.
 fn pat_tag(tag: &str) -> PatTest {
-    if tag == "Unit" {
-        PatTest::Shape(ShapeTest::Unit)
-    } else {
-        PatTest::Tag(tag.to_string())
-    }
+    PatTest::Tag(tag.to_string())
 }
 
 fn pat_test(lit: &Lit) -> PatTest {
     match lit {
         Lit::Bool(value) => PatTest::Bool(*value),
+        Lit::Unit => PatTest::Undefined,
         Lit::Int(lexeme) => PatTest::Int(lexeme.clone()),
         Lit::Number(lexeme) => PatTest::Number(lexeme.clone()),
         Lit::String(value) => PatTest::String(value.clone()),
@@ -2450,32 +2329,6 @@ fn place_is_exported(module: &crate::ast::Module, name: &str) -> bool {
     }
 }
 
-fn module_uses_unit(module: &AnfModule) -> bool {
-    module.defs.iter().any(|def| expr_uses_unit(&def.body))
-        || module
-            .places
-            .iter()
-            .any(|place| expr_uses_unit(&place.init.body))
-        || module
-            .checks
-            .iter()
-            .any(|check| expr_uses_unit(&check.want.body) || expr_uses_unit(&check.body.body))
-}
-
-fn expr_uses_unit(expr: &Expr) -> bool {
-    expr.lets.iter().any(|let_| value_uses_unit(&let_.value))
-}
-
-fn value_uses_unit(value: &Value) -> bool {
-    match value {
-        Value::Ctor { name, .. } => name == "Unit",
-        Value::Quote(quote) => expr_uses_unit(&quote.body),
-        Value::If { yes, no, .. } => expr_uses_unit(yes) || expr_uses_unit(no),
-        Value::Choose { arms } => arms.iter().any(|arm| expr_uses_unit(&arm.body)),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -2486,9 +2339,7 @@ mod tests {
     use crate::paths::ParseMode;
 
     fn module(body: &str) -> crate::ast::Module {
-        let source = format!("{body}");
-        parse(&source, ParseMode::Source)
-            .unwrap_or_else(|error| panic!("{}\n{source}", error.message))
+        parse(body, ParseMode::Source).unwrap_or_else(|error| panic!("{}\n{body}", error.message))
     }
 
     fn anf(body: &str) -> String {
@@ -2501,6 +2352,26 @@ mod tests {
     fn js(body: &str) -> String {
         let module = module(body);
         javascript(&module).unwrap_or_else(|error| panic!("{}\n{body}", error.message))
+    }
+
+    /// JavaScript for the foreign words in `SERVICE_CHECKS`.
+    const CHECK_JS: &str = r#"
+function isNum(v) { return typeof v === "number" }
+function isInt(v) { return typeof v === "bigint" }
+function isStr(v) { return typeof v === "string" }
+function isBool(v) { return typeof v === "boolean" }
+function isUnit(v) { return v === undefined }
+function isArray(v) { return Array.isArray(v) }
+function everyArray(xs, pred) {
+  for (let i = 0; i < xs.length; i += 1) {
+    if (!pred(xs[i])) return false
+  }
+  return true
+}
+"#;
+
+    fn checks(body: &str) -> String {
+        format!("{}{body}", super::super::SERVICE_CHECKS)
     }
 
     fn js_err(body: &str) -> String {
@@ -2801,8 +2672,8 @@ mod tests {
 : pairSnd ( a b. a b -- b )
   Pair takeSnd
 
-: unit ( -- Unit )
-  Unit
+: lone ( -- Unit )
+  unit
 
 : label ( -- Str )
   "hi"
@@ -2858,7 +2729,7 @@ if (fact(5n) !== 120n) throw new Error("fact5 " + fact(5n));
 if (wrapped !== 2n) throw new Error("pair");
 const pair = Pair(1n, 2n);
 if (pair.frs !== 1n || pair.snd !== 2n || pair.value0 !== undefined) throw new Error("pair fields");
-if (unit() !== undefined) throw new Error("unit");
+if (lone() !== undefined) throw new Error("unit");
 if (label() !== "hi") throw new Error("string");
 if (flag(true) !== false) throw new Error("not");
 if (sub(5n, 1n) !== 4n) throw new Error("sub");
@@ -3036,33 +2907,40 @@ if (mapped.tag !== "Just" || mapped.value !== 42n) throw new Error("map just " +
 
     #[test]
     fn javascript_runs_a_type_test() {
-        let code = js(r#"
+        let code = js(&checks(
+            r#"
 ; Option a = None | Some a
 
 : take ( (Option (Array Num)) -- (Array Num) )
   (Some (Array Num) items) -> items
   (None ..) -> < >
-"#);
+"#,
+        ));
         assert!(
-            !code.contains("Array.isArray") && !code.contains("typeof"),
+            !code.contains("isArray") && !code.contains("isNum") && !code.contains("everyArray"),
             "{code}"
         );
-        let code = js(r#"
+        let code = js(&checks(
+            r#"
 ; Option a = None | Some a
 
 : normalized ( (Option a) -- (Array Num) )
   (Some (Array Num) items) -> items
   (Some (Array (Array Num)) _) -> < >
   _ -> drop < >
-"#);
+"#,
+        ));
         assert!(
-            code.contains("Array.isArray(v0.value)")
-                && code.contains("typeof e0 === \"number\"")
-                && code.contains("typeof e1 === \"number\""),
+            code.contains("isArray(v0.value)")
+                && code.contains("everyArray(v0.value, isNum)")
+                && code.contains("everyArray(e0, isNum)")
+                && !code.contains(".every")
+                && !code.contains("typeof"),
             "{code}"
         );
         run(
-            r#"
+            &checks(
+                r#"
 ; Option a = None | Some a
 
 : normalized ( (Option a) -- (Array Num) )
@@ -3078,7 +2956,10 @@ if (mapped.tag !== "Just" || mapped.value !== 42n) throw new Error("map just " +
   (Some (Array (Array Num)) _) -> 5
   _ -> drop 0
 "#,
-            r#"
+            ),
+            &format!(
+                "{CHECK_JS}{}",
+                r#"
 const nums = normalized(Some([1, 2]));
 if (nums.length !== 2 || nums[0] !== 1 || nums[1] !== 2) throw new Error("nums " + nums);
 if (normalized(Some([])).length !== 0) throw new Error("empty");
@@ -3102,19 +2983,19 @@ if (kind(Some([[1, 2]])) !== 5) throw new Error("grid");
 if (kind(Some([["a"]])) !== 0) throw new Error("grid str");
 if (kind(Some([1, 2])) !== 0) throw new Error("flat");
 if (kind(None) !== 0) throw new Error("kind none");
-"#,
+"#
+            ),
         );
     }
 
     #[test]
     fn javascript_tests_a_host_shape() {
-        let unit = js(
-            ": both ( Unit Bool -- Bool )\n  Unit true -> drop true\n  Unit false -> drop false\n",
-        );
+        let unit = js(": both ( Unit Bool -- Bool )\n  unit true -> true\n  unit false -> false\n");
         assert!(unit.contains("=== undefined"), "{unit}");
         assert!(!unit.contains(".tag"), "{unit}");
         run(
-            r#"
+            &checks(
+                r#"
 : held ( a. a -- a )
   Num ->
   x -> x
@@ -3132,7 +3013,10 @@ if (kind(None) !== 0) throw new Error("kind none");
   (Array Num) -> drop 1
   _ -> drop 0
 "#,
-            r#"
+            ),
+            &format!(
+                "{CHECK_JS}{}",
+                r#"
 if (held(1) !== 1) throw new Error("held num");
 if (held("hi") !== "hi") throw new Error("held str");
 if (kind(1) !== 1) throw new Error("num");
@@ -3146,13 +3030,15 @@ if (kind(null) !== 0) throw new Error("null");
 if (nums([1, 2]) !== 1) throw new Error("nums");
 if (nums([1, "a"]) !== 0) throw new Error("mixed");
 if (nums("a") !== 0) throw new Error("not array");
-"#,
+"#
+            ),
         );
     }
 
     #[test]
     fn javascript_runs_a_spilled_type_test() {
-        let concrete = js(r#"
+        let concrete = js(&checks(
+            r#"
 ; Option a = None | Some a
 ; Age == Age Num
 
@@ -3162,10 +3048,15 @@ if (nums("a") !== 0) throw new Error("not array");
 
 : years ( Age -- Num )
   (Age (Num) ..) ->
-"#);
-        assert!(!concrete.contains("typeof"), "{concrete}");
+"#,
+        ));
+        assert!(
+            !concrete.contains("isNum") && !concrete.contains("everyArray"),
+            "{concrete}"
+        );
         run(
-            r#"
+            &checks(
+                r#"
 ; Option a = None | Some a
 ; Pair a b = Pair frs : a, snd : b
 ; Age == Age Num
@@ -3189,7 +3080,10 @@ if (nums("a") !== 0) throw new Error("not array");
 : years ( Age -- Num )
   (Age (Num) ..) ->
 "#,
-            r#"
+            ),
+            &format!(
+                "{CHECK_JS}{}",
+                r#"
 if (amount(Some(1)) !== 1) throw new Error("one");
 if (amount(Some("a")) !== 0) throw new Error("str");
 if (amount(None) !== 0) throw new Error("none");
@@ -3210,14 +3104,16 @@ if (bad[0] !== 0 || bad[1] !== "") throw new Error("bad " + bad);
 if (take(Some(4)) !== 4) throw new Error("take");
 if (take(None) !== 0) throw new Error("take none");
 if (years(36) !== 36) throw new Error("years");
-"#,
+"#
+            ),
         );
     }
 
     #[test]
     fn javascript_leaves_a_wild_slot() {
         run(
-            r#"
+            &checks(
+                r#"
 : kept ( a. a -- a )
   Num ->
   _ ->
@@ -3225,13 +3121,66 @@ if (years(36) !== 36) throw new Error("years");
   Num -> drop 1
   _ -> drop 0
 "#,
-            r#"
+            ),
+            &format!(
+                "{CHECK_JS}{}",
+                r#"
 if (kept(1) !== 1) throw new Error("num");
 if (kept("hi") !== "hi") throw new Error("str");
 if (tag(1) !== 1) throw new Error("tag num");
 if (tag("hi") !== 0) throw new Error("tag str");
 if (tag(null) !== 0) throw new Error("tag null");
+"#
+            ),
+        );
+    }
+
+    #[test]
+    fn javascript_calls_a_buffer_check() {
+        let code = js(&checks(
+            r#"
+; foreign Buffer
+: foreign isBuffer ( b. b -- Bool )
+: foreign sizeBuffer ( Buffer -- Num )
+# Nullary Buffer
+  checkNullary = isBuffer
+
+: bytes ( b. b -- Num )
+  Buffer -> sizeBuffer
+  _ -> drop 0
 "#,
+        ));
+        assert!(code.contains("isBuffer("), "{code}");
+        assert!(!code.contains("typeof"), "{code}");
+    }
+
+    #[test]
+    fn javascript_calls_a_binary_check() {
+        let code = js(&checks(
+            r#"
+; foreign Map k a
+: foreign isMap ( b. b -- Bool )
+: foreign keyMap ( k a. (Map k a) (k -- Bool) -- Bool )
+: foreign valMap ( k a. (Map k a) (a -- Bool) -- Bool )
+# Binary Map
+  checkBinary = isMap
+  checkBinary_1 = keyMap
+  checkBinary_2 = valMap
+
+: picked ( b. b -- Num )
+  (Map Str Num) -> drop 1
+  _ -> drop 0
+"#,
+        ));
+        assert!(
+            code.contains("isMap(")
+                && code.contains("keyMap(")
+                && code.contains("valMap(")
+                && code.contains("isStr")
+                && code.contains("isNum")
+                && !code.contains(".every")
+                && !code.contains("typeof"),
+            "{code}"
         );
     }
 
@@ -3422,84 +3371,6 @@ if (use(1n, 1n) !== true) throw new Error("eq");
 if (use(1n, 2n) !== false) throw new Error("neq");
 if (useBoth(1n, 1n) !== true) throw new Error("both");
 if (useBoth(1n, 2n) !== false) throw new Error("both neq");
-"#,
-        );
-    }
-
-    #[test]
-    fn derived_show_lte_and_hash_run() {
-        let body = r#"
-& Setoid a
-  eq ( a a -- Bool )
-
-& Show a
-  show ( a -- Str )
-
-& Setoid a => Ord a
-  lte ( a a -- Bool )
-
-& Setoid a => Hash a
-  hash ( a -- Int )
-
-: foreign showInt ( Int -- Str )
-: foreign eqInt ( Int Int -- Bool )
-: foreign lteInt ( Int Int -- Bool )
-
-: hashInt ( Int -- Int )
-  dup drop
-
-# Setoid Int
-  eq = eqInt
-
-# Show Int
-  show = showInt
-
-# Ord Int
-  lte = lteInt
-
-# Hash Int
-  hash = hashInt
-
-; Answer = No | Yes Int
-; Pair = Pair left : Int, right : Int
-
-: shown ( Answer -- Str )
-  show
-
-: paired ( Pair -- Str )
-  show
-
-: ordered ( Answer Answer -- Bool )
-  lte
-
-: ranked ( Pair Pair -- Bool )
-  lte
-
-: hashed ( Pair -- Int )
-  hash
-"#;
-        let code = js(body);
-        assert!(code.contains('+'), "{code}");
-        assert!(!code.contains("ply_show_cat"), "{code}");
-        assert!(code.contains("* 31n +"), "{code}");
-        assert!(!code.contains("ply_hash_mix"), "{code}");
-        run(
-            body,
-            r#"
-function showInt(n) { return n.toString() + "n"; }
-function eqInt(a, b) { return a === b; }
-function lteInt(a, b) { return a <= b; }
-if (shown(No) !== "No") throw new Error("show no " + shown(No));
-if (shown(Yes(1n)) !== "(Yes 1n)") throw new Error("show yes " + shown(Yes(1n)));
-if (paired(Pair(1n, 2n)) !== "(Pair 1n 2n)") throw new Error("show pair " + paired(Pair(1n, 2n)));
-if (ordered(No, No) !== true) throw new Error("ord nn");
-if (ordered(No, Yes(1n)) !== true) throw new Error("ord ny");
-if (ordered(Yes(1n), No) !== false) throw new Error("ord yn");
-if (ranked(Pair(1n, 2n), Pair(1n, 3n)) !== true) throw new Error("rank lt");
-if (ranked(Pair(2n, 0n), Pair(1n, 9n)) !== false) throw new Error("rank gt");
-if (ranked(Pair(1n, 2n), Pair(1n, 2n)) !== true) throw new Error("rank eq");
-if (ranked(Pair(1n, 9n), Pair(2n, 0n)) !== true) throw new Error("rank first");
-if (hashed(Pair(1n, 2n)) !== 33n) throw new Error("hash " + hashed(Pair(1n, 2n)));
 "#,
         );
     }

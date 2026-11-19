@@ -12,7 +12,7 @@ use crate::ast::{
 use crate::build::{
     available_import_paths, load_provider, load_surface, provider_file, read_module, stack_sites,
 };
-use crate::builtin::{self, Lowering};
+use crate::builtin;
 use crate::check::StackAt;
 use crate::lexer::tokenize;
 use crate::parser::{is_lower, is_upper, parse};
@@ -503,13 +503,10 @@ fn builtin_words() -> Vec<(&'static str, CompletionKind, &'static str, &'static 
     let mut names = vec![
         ("true", CompletionKind::Keyword, "-- Bool", ""),
         ("false", CompletionKind::Keyword, "-- Bool", ""),
+        ("unit", CompletionKind::Keyword, "-- Unit", ""),
     ];
     for word in builtin::WORDS {
-        let kind = match word.lowering {
-            Lowering::Unit => CompletionKind::Constructor,
-            _ => CompletionKind::Word,
-        };
-        names.push((word.name, kind, word.scheme, word.doc));
+        names.push((word.name, CompletionKind::Word, word.scheme, word.doc));
     }
     names
 }
@@ -1284,12 +1281,12 @@ fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
             _ => {}
         },
         Place::Signature => match &token.kind {
-            TokenKind::LParen | TokenKind::LBrace => {
+            TokenKind::LParen => {
                 walked.depth += 1;
                 walked.binders = false;
             }
             TokenKind::RParen if walked.depth == 0 => walked.state = Place::Body,
-            TokenKind::RParen | TokenKind::RBrace => {
+            TokenKind::RParen => {
                 walked.depth = walked.depth.saturating_sub(1);
             }
             TokenKind::Dot | TokenKind::StackArrow if walked.depth == 0 => walked.binders = false,
@@ -1313,10 +1310,10 @@ fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
             }
         }
         Place::ProbePicture => match &token.kind {
-            TokenKind::LParen | TokenKind::LBrack | TokenKind::LBrace | TokenKind::LAngle => {
+            TokenKind::LParen | TokenKind::LBrack | TokenKind::LAngle => {
                 walked.depth += 1;
             }
-            TokenKind::RParen | TokenKind::RBrack | TokenKind::RBrace => {
+            TokenKind::RParen | TokenKind::RBrack => {
                 walked.depth = walked.depth.saturating_sub(1);
             }
             TokenKind::RAngle => {
@@ -1334,10 +1331,10 @@ fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
             }
         }
         Place::ProbeProgram => match &token.kind {
-            TokenKind::LParen | TokenKind::LBrack | TokenKind::LBrace | TokenKind::LAngle => {
+            TokenKind::LParen | TokenKind::LBrack | TokenKind::LAngle => {
                 walked.depth += 1;
             }
-            TokenKind::RParen | TokenKind::RBrace | TokenKind::RAngle => {
+            TokenKind::RParen | TokenKind::RAngle => {
                 walked.depth = walked.depth.saturating_sub(1);
             }
             TokenKind::RBrack => {
@@ -1371,8 +1368,8 @@ fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
             _ => {}
         },
         Place::DataFields => match &token.kind {
-            TokenKind::LParen | TokenKind::LBrace => walked.depth += 1,
-            TokenKind::RParen | TokenKind::RBrace => {
+            TokenKind::LParen => walked.depth += 1,
+            TokenKind::RParen => {
                 walked.depth = walked.depth.saturating_sub(1);
             }
             TokenKind::Pipe if walked.depth == 0 => walked.state = Place::DataCtor,
@@ -1886,11 +1883,6 @@ fn collect_type(ty: &Type, env: &FieldEnv, out: &mut Vec<(String, String)>) {
             collect_stack(&effect.input, env, out);
             collect_stack(&effect.output, env, out);
         }
-        Type::Record(row) => {
-            for (_, field) in &row.fields {
-                collect_type(field, env, out);
-            }
-        }
         Type::Var(_) | Type::Ctor(_) => {}
     }
 }
@@ -2058,7 +2050,7 @@ fn fields_of_type(
             let args: Vec<String> = args.iter().map(|arg| show_subst(arg, map)).collect();
             Some(fields_of_head(&head, &args, env, depth).unwrap_or_default())
         }
-        Type::Fun(_) | Type::Record(_) => Some(Vec::new()),
+        Type::Fun(_) => Some(Vec::new()),
     }
 }
 
@@ -2131,7 +2123,6 @@ fn show_subst(ty: &Type, map: &HashMap<String, String>) -> String {
             out
         }
         Type::Fun(effect) => format!("({})", show_effect(effect, map)),
-        Type::Record(row) => type_string(&Type::Record(row.clone())),
     }
 }
 
@@ -2311,7 +2302,7 @@ fn fields_of_type_ctor(
             let args: Vec<String> = args.iter().map(|arg| show_subst(arg, map)).collect();
             fields_of_ctor(&head, &args, ctor, env, depth)
         }
-        Type::Fun(_) | Type::Record(_) => Some(Vec::new()),
+        Type::Fun(_) => Some(Vec::new()),
     }
 }
 

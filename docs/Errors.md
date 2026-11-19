@@ -307,14 +307,6 @@ A constructor with named fields needed a field label.
 
 Fix: write the label, `name : Type`. A constructor with one field has no label: `Some a`. `|` separates constructors.
 
-## PL0036
-
-`expected '}'`
-
-Source does not produce this message. `{` is an unexpected character (`PL0001`).
-
-Fix: delete `{` and `}`.
-
 ## PL0037
 
 `duplicate field name`
@@ -395,20 +387,6 @@ A type atom was required: an uppercase name, a lowercase variable, or a parenthe
 
 Fix: write one of those.
 
-## PL0047
-
-`expected row variable`
-
-Source does not produce this message. `|` separates constructors.
-
-Fix: write `Nothing | Just a`. `{` and `}` are an unexpected character (`PL0001`).
-
-## PL0048
-
-`expected element`
-
-Source does not produce this message. An array is a program between `<` and `>`. `{` and `}` are an unexpected character (`PL0001`).
-
 ## PL0049
 
 `expected name`
@@ -465,7 +443,7 @@ Fix: declare it, import it, or correct the spelling. A name left off the `@` lis
 
 The type is not a builtin, a type in this module, or a type you imported.
 
-Fix: declare it, import it, or correct the spelling. Builtin types include `Int`, `Num`, `Str`, `Bool`, `Unit`, `Array`, and `StrMap`.
+Fix: declare it, import it, or correct the spelling. Builtin types include `Int`, `Num`, `Str`, `Bool`, `Unit`, and `Array`.
 
 ## PL0056
 
@@ -499,14 +477,6 @@ The constructor was given the wrong number of arguments. One argument uses `argu
 
 Fix: pass that many arguments. `Maybe` takes one: `Maybe a`.
 
-## PL0060
-
-`duplicate field NAME`
-
-Source does not produce this message. A constructor that repeats a label is `PL0037`.
-
-Fix: keep one field of that name. To change a value that is already there, use `>>name`.
-
 ## PL0061
 
 `type mismatch: expected A, found B`
@@ -514,14 +484,6 @@ Fix: keep one field of that name. To change a value that is already there, use `
 A type or a stack does not match. There is no subtyping. `Int` and `Num` are different types.
 
 Fix: change the value or the signature so both sides print as the same type.
-
-## PL0062
-
-`type mismatch: expected a record, found TYPE`
-
-Source does not produce this message. `name>>` and `>>name` on a type that is not a data type are `PL0063`. `{`, `}`, and `+` are an unexpected character (`PL0001`).
-
-Fix: read a field of a data type.
 
 ## PL0063
 
@@ -578,22 +540,6 @@ Fix: if the source does not mention effects, report the diagnostic as a compiler
 A nested effect variable was fixed to a concrete row. It has to stay the open row `{ | _ }`.
 
 Fix: if the source does not mention effects, report the diagnostic as a compiler bug.
-
-## PL0070
-
-`record has no field NAME`
-
-Source does not produce this message. A type with one constructor that has no field of this name is `PL0120`.
-
-Fix: use the field's name, or match with `->`.
-
-## PL0071
-
-`record tail must be closed`
-
-Source does not produce this message. `{`, `}`, and `+` are an unexpected character (`PL0001`).
-
-Fix: declare the fields on the constructor and replace one with `>>name`.
 
 ## PL0072
 
@@ -699,7 +645,7 @@ Fix: split the instance into one head per class, or give the methods different n
 
 `orphan instance HEAD`
 
-This module defines neither the class nor a type constructor in the instance head. `HEAD` is that class and the types written after it, such as `Eq (Maybe a)`. A builtin type in the head (`Num`, `Maybe` from the compiler, and the other builtins) counts as defined here.
+This module defines neither the class nor a type constructor in the instance head. `HEAD` is that class and the types written after it, such as `Eq (Maybe a)`. A builtin type in the head (`Int`, `Num`, `Str`, `Bool`, `Unit`, or `Array`) counts as defined here.
 
 Fix: move the instance into the module that defines the class, or into the module that defines one of the head types.
 
@@ -959,7 +905,7 @@ Fix: if this text is the diagnostic you see, report it as a compiler bug. An ins
 
 A word named `main` is the program of its module. The scheme has no constraints and no effects, takes no inputs, and returns `Unit`. It may stay off the `@` list. Any other scheme is this error. A module with no word named `main` is a library module.
 
-Fix: write `: main ( -- Unit )` and a body that returns `Unit`, or rename the word. `( . -- . Unit )` and `( ..s -- ..s Unit )` are the same shape and are accepted.
+Fix: write `: main ( -- Unit )` and a body that returns `unit`, or rename the word. `( . -- . Unit )` and `( ..s -- ..s Unit )` are the same shape and are accepted.
 
 **Foreign data**
 
@@ -1131,9 +1077,9 @@ Fix: keep the value with `Page`, spill every field with `(Page ..)`, or name the
 
 `pattern cannot test TYPE`
 
-`(Some (Option Num) value)` asks whether the field is `(Option Num)`. A number, an integer, a string, a boolean, a unit, or an array of those is a check the runtime can make. The same check can test the value itself: `Num ->`, `Unit ->`, `Array ->`. `TYPE` is not one of those, and the value is not already `TYPE`.
+`(Some (Option Num) value)` asks whether the field is `(Option Num)`. A visible `Nullary`, `Unary`, or `Binary` instance can test a value: `Num ->`, `(Array Num)`, or `Buffer ->` when that module defines `Nullary`. A type with constructors is not that test, and the value is not already `TYPE`.
 
-Fix: test a shape the runtime can see, `(Some (Array Num) items)` or `Array ->`. When the value is already `TYPE`, there is nothing to test.
+Fix: match a constructor, or a service instance this module can see, `(Some (Array Num) items)` or `Array ->`. When the value is already `TYPE`, there is nothing to test.
 
 ## PL0138
 
@@ -1166,3 +1112,11 @@ Fix: write the picture before the quotation.
 A `?` check runs one quotation. The quotation starts from an empty stack and must leave the picture.
 
 Fix: write `[ program ]` after the picture.
+
+## PL0142
+
+`NAME has no element test`
+
+A pattern names a parameter of a type whose arity is above two. `Nullary`, `Unary`, and `Binary` cover arities zero, one, and two. A missing instance is `no instance for Unary Hub`, not this error. `(Array Num)` calls that instance's parameter word.
+
+Fix: match the head once that module defines `Unary`. A type of arity above two has no parameter test.

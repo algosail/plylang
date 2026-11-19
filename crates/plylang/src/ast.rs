@@ -230,7 +230,6 @@ pub struct Clause {
 /// pattern as a type test when the count is not the field count.
 /// `(Some (Num) ..)` is that test with `Spill`: the value is pushed at once.
 /// An array matches one fixed length. Index 0 is the left element.
-/// A record reads the fields it names. The row tail stays in the type.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
     /// Any value. A stack slot stays. A field was not on the stack, so it is not pushed.
@@ -249,8 +248,6 @@ pub enum Pattern {
     Spill,
     Ctor(String, Vec<Pattern>),
     Array(Vec<Pattern>),
-    /// `{ name : n, age : a }`. Empty `{}` binds nothing.
-    Record(Vec<(String, Pattern)>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -331,30 +328,6 @@ pub enum Type {
     /// Saturated application. The head is a variable, a constructor, or another type.
     App(Box<Type>, Vec<Type>),
     Fun(Box<StackEffect>),
-    Record(RecordRow),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RecordRow {
-    pub fields: Vec<(String, Type)>,
-    pub tail: Option<RecordTail>,
-}
-
-/// What follows `|` in a record type. A bare lowercase name is a row variable.
-/// Any other type is spliced, and it must elaborate to a closed record.
-#[derive(Debug, Clone, PartialEq)]
-pub enum RecordTail {
-    Var(String),
-    Type(Box<Type>),
-}
-
-impl RecordRow {
-    pub(crate) fn tail_ty(&self) -> Option<&Type> {
-        match &self.tail {
-            Some(RecordTail::Type(ty)) => Some(ty),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -382,13 +355,9 @@ pub enum TermNode {
     PlaceSet(String),
     /// `=>name` runs the quotation under a new frame and restores the previous one.
     PlaceBind(String),
-    /// `+name`. The record is below the new value. The label must be absent.
-    FieldInsert(String),
     /// `< 1 2 3 >`. The terms are a program on an empty stack. What it leaves
     /// are the elements, bottom first.
     Array(Vec<Term>),
-    /// `{ name: "Ada", age: 36 }`. Each value is one constant. `{}` is empty.
-    Record(Vec<(String, Term)>),
     /// Quotation header `x y ->`. The leftmost name is the deepest value.
     /// The rightmost name is the top.
     Bind(Vec<String>),
@@ -400,6 +369,8 @@ pub enum Lit {
     Number(String),
     String(String),
     Bool(bool),
+    /// The literal `unit`. JavaScript emits `undefined`.
+    Unit,
 }
 
 impl fmt::Display for Module {
@@ -797,22 +768,7 @@ pub(crate) fn type_string(ty: &Type) -> String {
             out
         }
         Type::Fun(effect) => format!("({})", effect_string(effect)),
-        Type::Record(row) => record_string(row),
     }
-}
-
-fn record_string(row: &RecordRow) -> String {
-    let tail = row.tail.as_ref().map(|tail| match tail {
-        RecordTail::Var(name) => name.clone(),
-        RecordTail::Type(ty) => type_string(ty),
-    });
-    brace_string(
-        &row.fields
-            .iter()
-            .map(|(name, ty)| format!("{name} : {}", type_string(ty)))
-            .collect::<Vec<_>>(),
-        &tail,
-    )
 }
 
 fn effect_row_string(row: &EffectRow) -> String {
@@ -885,18 +841,6 @@ fn pattern_string(pattern: &Pattern) -> String {
                 format!("< {inner} >")
             }
         }
-        Pattern::Record(fields) => {
-            if fields.is_empty() {
-                "{}".to_string()
-            } else {
-                let inner = fields
-                    .iter()
-                    .map(|(name, pattern)| format!("{name} : {}", pattern_string(pattern)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{{ {inner} }}")
-            }
-        }
     }
 }
 
@@ -905,6 +849,7 @@ fn lit_string(lit: &Lit) -> String {
         Lit::Int(lexeme) => format!("{lexeme}n"),
         Lit::Number(lexeme) => lexeme.clone(),
         Lit::Bool(value) => value.to_string(),
+        Lit::Unit => "unit".to_string(),
         Lit::String(value) => format!("\"{}\"", escape_string(value)),
     }
 }
@@ -932,7 +877,6 @@ fn term_string(term: &Term, indent: usize) -> String {
         TermNode::FieldSet(name) => format!(">>{name}"),
         TermNode::PlaceSet(name) => format!("={name}"),
         TermNode::PlaceBind(name) => format!("=>{name}"),
-        TermNode::FieldInsert(name) => format!("+{name}"),
         TermNode::Lit(lit) => lit_string(lit),
         TermNode::Array(elements) => {
             if elements.is_empty() {
@@ -944,18 +888,6 @@ fn term_string(term: &Term, indent: usize) -> String {
                     .collect::<Vec<_>>()
                     .join(" ");
                 format!("< {inner} >")
-            }
-        }
-        TermNode::Record(fields) => {
-            if fields.is_empty() {
-                "{}".to_string()
-            } else {
-                let inner = fields
-                    .iter()
-                    .map(|(name, term)| format!("{name}: {}", term_string(term, indent)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{{ {inner} }}")
             }
         }
         TermNode::Quote(terms) => {

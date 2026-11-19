@@ -1,9 +1,8 @@
 //! Compiler builtins. Checking, lowering, hover, and completion read this table.
 //!
-//! Value operations live in the prelude. The compiler keeps the stack, quotations,
-//! and the word `Unit`. `Unit` is also a nullary constructor; the checker installs
-//! that data type while loading the table. A digit, `-`, `*`, or `@` cannot start
-//! one identifier.
+//! Value operations live in the prelude. The compiler keeps the stack and quotations.
+//! The one value of type `Unit` is the literal `unit`. A digit, `-`, `*`, or `@`
+//! cannot start one identifier.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lowering {
@@ -38,7 +37,6 @@ pub enum Lowering {
     Quote,
     /// Push the value under the quotation, then run the quotation.
     Cons,
-    Unit,
 }
 
 pub struct Word {
@@ -91,10 +89,6 @@ pub const TYPES: &[Type] = &[
     },
     Type {
         name: "Array",
-        arity: 1,
-    },
-    Type {
-        name: "StrMap",
         arity: 1,
     },
 ];
@@ -273,12 +267,6 @@ pub const WORDS: &[Word] = &[
         "..s Bool (..s -- ..t) (..s -- ..t) -- ..t",
         "Pops a `Bool` and two quotations. The `true` branch is pushed first, so the `false` branch is on top.",
         Lowering::If,
-    ),
-    w(
-        "Unit",
-        "..s -- ..s Unit",
-        "The only value of type `Unit`.",
-        Lowering::Unit,
     ),
 ];
 

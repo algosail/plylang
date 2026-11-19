@@ -772,9 +772,9 @@ impl Parser {
                 return count > 0 && !token.line_start;
             }
             let Some(next) = self.skip_one_pattern(index) else {
-                // An unclosed `<` or `{` is still a pattern. The pattern parser
+                // An unclosed `<` is still a pattern. The pattern parser
                 // reports the missing closer; a term would blame the binder.
-                return matches!(token.kind, TokenKind::LBrace | TokenKind::LAngle);
+                return matches!(token.kind, TokenKind::LAngle);
             };
             count += 1;
             index = next;
@@ -840,12 +840,12 @@ impl Parser {
             TokenKind::Ident(name) if is_upper(name) => Some(self.skip_qualifier(index)),
             TokenKind::True
             | TokenKind::False
+            | TokenKind::Unit
             | TokenKind::Int(_)
             | TokenKind::Number(_)
             | TokenKind::String(_) => Some(index + 1),
             TokenKind::LParen => self.skip_balanced(index, &TokenKind::LParen, &TokenKind::RParen),
             TokenKind::LAngle => self.skip_balanced(index, &TokenKind::LAngle, &TokenKind::RAngle),
-            TokenKind::LBrace => self.skip_balanced(index, &TokenKind::LBrace, &TokenKind::RBrace),
             _ => None,
         }
     }
@@ -943,6 +943,10 @@ impl Parser {
                 self.bump();
                 Ok(Pattern::Lit(Lit::Bool(false)))
             }
+            TokenKind::Unit => {
+                self.bump();
+                Ok(Pattern::Lit(Lit::Unit))
+            }
             TokenKind::Int(lexeme) => {
                 self.bump();
                 Ok(Pattern::Lit(Lit::Int(lexeme)))
@@ -957,56 +961,8 @@ impl Parser {
             }
             TokenKind::LParen => self.parse_paren_pattern(),
             TokenKind::LAngle => self.parse_array_pattern(),
-            TokenKind::LBrace => self.parse_record_pattern(),
             _ => Err(self.error(Error::ExpectedPattern)),
         }
-    }
-
-    /// `{ name : n }` is one slot. The right of `:` is a pattern.
-    /// `{}` binds nothing. `|` is not a tail here.
-    fn parse_record_pattern(&mut self) -> Result<Pattern, Diagnostic> {
-        self.bump();
-        self.group_depth += 1;
-        let mut fields = Vec::new();
-        let mut seen = HashSet::new();
-        loop {
-            self.skip_newlines();
-            if self.is(TokenKind::RBrace) {
-                break;
-            }
-            if self.is(TokenKind::Pipe) {
-                return Err(self.error(Error::ExpectedFieldName));
-            }
-            if self.is_eof() {
-                return Err(self.error(Error::ExpectedRBrace));
-            }
-            let name_span = self.cur().span;
-            let name = self.expect_ident(Error::ExpectedFieldName)?;
-            if !seen.insert(name.clone()) {
-                return Err(self.error_at(name_span, Error::DuplicateFieldName));
-            }
-            self.expect(&TokenKind::Colon, Error::ExpectedColon)?;
-            self.skip_newlines();
-            if !self.starts_pattern() {
-                return Err(self.error(Error::ExpectedPattern));
-            }
-            fields.push((name, self.parse_slot_pattern()?));
-            self.skip_newlines();
-            if self.is(TokenKind::Pipe) {
-                return Err(self.error(Error::ExpectedFieldName));
-            }
-            if self.eat(&TokenKind::Comma) {
-                continue;
-            }
-            break;
-        }
-        self.skip_newlines();
-        if self.is(TokenKind::Pipe) {
-            return Err(self.error(Error::ExpectedFieldName));
-        }
-        self.expect(&TokenKind::RBrace, Error::ExpectedRBrace)?;
-        self.group_depth -= 1;
-        Ok(Pattern::Record(fields))
     }
 
     /// `< 0n 1n a b _ >` is one slot of exactly that length. `<>` is empty.
@@ -1089,12 +1045,12 @@ impl Parser {
         match &self.cur().kind {
             TokenKind::True
             | TokenKind::False
+            | TokenKind::Unit
             | TokenKind::Int(_)
             | TokenKind::Number(_)
             | TokenKind::String(_)
             | TokenKind::LParen
-            | TokenKind::LAngle
-            | TokenKind::LBrace => true,
+            | TokenKind::LAngle => true,
             TokenKind::Ident(name) => name == "_" || is_lower(name) || is_upper(name),
             _ => false,
         }
@@ -1347,8 +1303,8 @@ impl Parser {
                 TokenKind::Eof => return false,
                 TokenKind::FatArrow if depth == self.group_depth => return true,
                 TokenKind::StackArrow if depth == self.group_depth => return false,
-                TokenKind::LParen | TokenKind::LBrace => depth += 1,
-                TokenKind::RParen | TokenKind::RBrace => {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => {
                     if depth == self.group_depth {
                         return false;
                     }
@@ -1415,7 +1371,7 @@ impl Parser {
         if self.group_depth == 0 && self.is(TokenKind::Newline) {
             return true;
         }
-        if self.group_depth > 0 && (self.is(TokenKind::RParen) || self.is(TokenKind::RBrace)) {
+        if self.group_depth > 0 && self.is(TokenKind::RParen) {
             return true;
         }
         false
@@ -1452,9 +1408,6 @@ impl Parser {
         }
         if self.eat_group(&TokenKind::LParen) {
             return self.parse_paren();
-        }
-        if self.eat_group(&TokenKind::LBrace) {
-            return Ok(Type::Record(self.parse_record_body()?));
         }
         Err(self.error(Error::ExpectedType))
     }
@@ -1504,62 +1457,14 @@ impl Parser {
             match &self.tokens[index].kind {
                 TokenKind::Eof => return false,
                 TokenKind::StackArrow if depth == self.group_depth => return true,
-                TokenKind::RParen | TokenKind::RBrace if depth == self.group_depth => return false,
-                TokenKind::LParen | TokenKind::LBrace => depth += 1,
-                TokenKind::RParen | TokenKind::RBrace => depth = depth.saturating_sub(1),
+                TokenKind::RParen if depth == self.group_depth => return false,
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => depth = depth.saturating_sub(1),
                 _ => {}
             }
             index += 1;
         }
         false
-    }
-
-    fn parse_record_body(&mut self) -> Result<RecordRow, Diagnostic> {
-        // `{` already consumed and group_depth incremented.
-        let mut fields = Vec::new();
-        let mut tail = None;
-        loop {
-            self.skip_newlines();
-            if self.is(TokenKind::RBrace) {
-                break;
-            }
-            if self.eat(&TokenKind::Pipe) {
-                tail = Some(self.parse_record_tail()?);
-                break;
-            }
-            let name = self.expect_ident(Error::ExpectedFieldName)?;
-            self.expect(&TokenKind::Colon, Error::ExpectedColon)?;
-            let ty = self.parse_type_item()?;
-            fields.push((name, ty));
-            self.skip_newlines();
-            if self.eat(&TokenKind::Comma) {
-                continue;
-            }
-            break;
-        }
-        self.skip_newlines();
-        if tail.is_none() && self.eat(&TokenKind::Pipe) {
-            tail = Some(self.parse_record_tail()?);
-            self.skip_newlines();
-        }
-        self.expect(&TokenKind::RBrace, Error::ExpectedRBrace)?;
-        self.group_depth -= 1;
-        Ok(RecordRow { fields, tail })
-    }
-
-    /// `| r` is a row variable. `| Person`, `| (Person a)`, and `| { ... }` splice a type.
-    /// A bare lowercase name is never a type. One tail: the next token is `}`.
-    fn parse_record_tail(&mut self) -> Result<RecordTail, Diagnostic> {
-        self.skip_newlines();
-        if self.is_lower_ident() {
-            return Ok(RecordTail::Var(
-                self.expect_lower(Error::ExpectedRowVariable)?,
-            ));
-        }
-        if self.starts_type_item() {
-            return Ok(RecordTail::Type(Box::new(self.parse_type_item()?)));
-        }
-        Err(self.error(Error::ExpectedRowVariable))
     }
 
     fn parse_body(&mut self) -> Result<Vec<Term>, Diagnostic> {
@@ -1608,10 +1513,6 @@ impl Parser {
                 self.bump();
                 Ok(self.term(start, TermNode::FieldSet(name)))
             }
-            TokenKind::FieldInsert(name) => {
-                self.bump();
-                Ok(self.term(start, TermNode::FieldInsert(name)))
-            }
             TokenKind::PlaceSet(name) => {
                 self.bump();
                 Ok(self.term(start, TermNode::PlaceSet(name)))
@@ -1620,11 +1521,6 @@ impl Parser {
                 self.bump();
                 Ok(self.term(start, TermNode::PlaceBind(name)))
             }
-            TokenKind::LBrace => {
-                self.bump();
-                self.group_depth += 1;
-                self.parse_record_literal(start)
-            }
             TokenKind::True => {
                 self.bump();
                 Ok(self.term(start, TermNode::Lit(Lit::Bool(true))))
@@ -1632,6 +1528,10 @@ impl Parser {
             TokenKind::False => {
                 self.bump();
                 Ok(self.term(start, TermNode::Lit(Lit::Bool(false))))
+            }
+            TokenKind::Unit => {
+                self.bump();
+                Ok(self.term(start, TermNode::Lit(Lit::Unit)))
             }
             TokenKind::Int(lexeme) => {
                 self.bump();
@@ -1674,79 +1574,6 @@ impl Parser {
         }
         self.group_depth -= 1;
         Ok(self.term(start.merge(self.last_span), TermNode::Array(terms)))
-    }
-
-    /// `{` is already consumed and `group_depth` includes it.
-    /// `{ name: "Ada" }` is a record. `{}` is an empty record, not an array.
-    fn parse_record_literal(&mut self, start: Span) -> Result<Term, Diagnostic> {
-        let mut fields = Vec::new();
-        let mut seen = HashSet::new();
-        loop {
-            self.skip_newlines();
-            if self.is(TokenKind::RBrace) {
-                break;
-            }
-            let name_span = self.cur().span;
-            let name = self.expect_ident(Error::ExpectedFieldName)?;
-            if !seen.insert(name.clone()) {
-                return Err(self.error_at(name_span, Error::DuplicateFieldName));
-            }
-            self.expect(&TokenKind::Colon, Error::ExpectedColon)?;
-            let value = self.parse_element()?;
-            fields.push((name, value));
-            self.skip_newlines();
-            if self.eat(&TokenKind::Comma) {
-                continue;
-            }
-            break;
-        }
-        self.skip_newlines();
-        self.expect(&TokenKind::RBrace, Error::ExpectedRBrace)?;
-        self.group_depth -= 1;
-        Ok(self.term(start.merge(self.last_span), TermNode::Record(fields)))
-    }
-
-    /// A literal, a quotation, an array, or a record. Not a word and not a stack program.
-    fn parse_element(&mut self) -> Result<Term, Diagnostic> {
-        self.skip_newlines();
-        let start = self.cur().span;
-        match self.cur().kind.clone() {
-            TokenKind::True => {
-                self.bump();
-                Ok(self.term(start, TermNode::Lit(Lit::Bool(true))))
-            }
-            TokenKind::False => {
-                self.bump();
-                Ok(self.term(start, TermNode::Lit(Lit::Bool(false))))
-            }
-            TokenKind::Int(lexeme) => {
-                self.bump();
-                Ok(self.term(start, TermNode::Lit(Lit::Int(lexeme))))
-            }
-            TokenKind::Number(lexeme) => {
-                self.bump();
-                Ok(self.term(start, TermNode::Lit(Lit::Number(lexeme))))
-            }
-            TokenKind::String(value) => {
-                self.bump();
-                Ok(self.term(start, TermNode::Lit(Lit::String(value))))
-            }
-            TokenKind::LBrack => {
-                self.bump();
-                self.parse_quote(start)
-            }
-            TokenKind::LAngle => {
-                self.bump();
-                self.group_depth += 1;
-                self.parse_array(start)
-            }
-            TokenKind::LBrace => {
-                self.bump();
-                self.group_depth += 1;
-                self.parse_record_literal(start)
-            }
-            _ => Err(self.error(Error::ExpectedElement)),
-        }
     }
 
     fn parse_quote(&mut self, start: Span) -> Result<Term, Diagnostic> {
@@ -2022,10 +1849,7 @@ impl Parser {
     }
 
     fn starts_type_item(&self) -> bool {
-        self.is_lower_ident()
-            || self.is_upper_ident()
-            || self.is(TokenKind::LParen)
-            || self.is(TokenKind::LBrace)
+        self.is_lower_ident() || self.is_upper_ident() || self.is(TokenKind::LParen)
     }
 
     fn starts_atom(&self) -> bool {
@@ -2041,14 +1865,13 @@ impl Parser {
                 | TokenKind::String(_)
                 | TokenKind::True
                 | TokenKind::False
+                | TokenKind::Unit
                 | TokenKind::Field(_)
                 | TokenKind::FieldSet(_)
-                | TokenKind::FieldInsert(_)
                 | TokenKind::PlaceSet(_)
                 | TokenKind::PlaceBind(_)
                 | TokenKind::LBrack
                 | TokenKind::LAngle
-                | TokenKind::LBrace
         )
     }
 }
@@ -2566,13 +2389,13 @@ mod tests {
         let listed = ok("@ Maybe, Nothing, Just\n\n; Maybe a = Nothing | Just a\n");
         assert!(listed.contains("@ Maybe, Nothing, Just\n"), "{listed}");
         let after_import =
-            ok("~ \"Data/Clock\" Time\n\n@ Time, soon\n\n: soon ( -- Unit )\n  Unit\n");
+            ok("~ \"Data/Clock\" Time\n\n@ Time, soon\n\n: soon ( -- Unit )\n  unit\n");
         assert!(after_import.starts_with("@ Time, soon\n"), "{after_import}");
         assert!(
             after_import.contains("~ \"Data/Clock\" Time"),
             "{after_import}"
         );
-        let after_word = ok(": soon ( -- Unit )\n  Unit\n\n@ soon\n");
+        let after_word = ok(": soon ( -- Unit )\n  unit\n\n@ soon\n");
         assert!(after_word.starts_with("@ soon\n"), "{after_word}");
         assert!(after_word.contains(": soon ( -- Unit )"), "{after_word}");
         let between = ok("~ \"Data/Clock\" Time\n\n@ Time\n\n~ \"Data/Sink\" Sink\n");
@@ -2584,7 +2407,7 @@ mod tests {
             wrapped.contains("@ Stream, Behavior, listen\n"),
             "{wrapped}"
         );
-        let empty = ok("@\n\n: main ( -- Unit )\n  Unit\n");
+        let empty = ok("@\n\n: main ( -- Unit )\n  unit\n");
         assert!(empty.contains("@\n"), "{empty}");
         assert!(!empty.contains("@ main"), "{empty}");
         assert_eq!(
@@ -2593,7 +2416,7 @@ mod tests {
         );
         assert_eq!(
             err(
-                ": soon ( -- Unit )\n  Unit\n@ soon\n@ again\n",
+                ": soon ( -- Unit )\n  unit\n@ soon\n@ again\n",
                 ParseMode::Source
             ),
             "duplicate definition @"
@@ -2868,7 +2691,7 @@ mod tests {
         assert!(qualified.contains("Bus:Maybe"), "{qualified}");
         assert!(qualified.contains("(Bus:Just x)"), "{qualified}");
         assert!(qualified.contains("Bus:Nothing"), "{qualified}");
-        let word = ok("~ \"Data/Bus\"\n: idle ( -- Unit )\n  Unit\n");
+        let word = ok("~ \"Data/Bus\"\n: idle ( -- Unit )\n  unit\n");
         assert!(word.contains("~ \"Data/Bus\"\n"), "{word}");
         assert!(word.contains(": idle ( -- Unit )"), "{word}");
         assert_eq!(

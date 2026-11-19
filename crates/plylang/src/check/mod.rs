@@ -18,16 +18,15 @@
 //! and a program cannot name a label.
 
 mod clauses;
-mod derive;
 mod instance;
 mod lower;
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::ast::{
-    Class, Def, EffectRow, Exports, Import, Item, Lit, Module, Place, RecordTail, Scheme, Stack,
-    StackEffect, StackTail, Synonym, Term, TermNode, Type, Vis,
+    Class, Def, EffectRow, Exports, Import, Item, Lit, Module, Place, Scheme, Stack, StackEffect,
+    StackTail, Synonym, Term, TermNode, Type, Vis,
 };
 
 use crate::builtin;
@@ -76,8 +75,6 @@ pub(crate) struct ResolvedImport<'a> {
 pub(crate) struct CheckedModule {
     pub anf: crate::anf::AnfModule,
     pub foreign_arity: Vec<(String, usize)>,
-    /// Derived definitions and the instances of public types.
-    pub derived: Vec<Item>,
 }
 
 /// Stack at one term, rendered after the whole definition has been checked.
@@ -132,7 +129,7 @@ pub(crate) fn check_with_imports_key(
             checker.import_instances(imported.known)?;
         }
         checker.prepare(module)?;
-        checker.check_ready(module)?;
+        checker.check_bodies(module)?;
         let mut foreign_arity = Vec::new();
         for item in &module.items {
             if let Item::Def(def) = item {
@@ -144,12 +141,7 @@ pub(crate) fn check_with_imports_key(
             }
         }
         let anf = checker.lower_prepared(module)?;
-        let derived = checker.derived.clone();
-        Ok(CheckedModule {
-            anf,
-            foreign_arity,
-            derived,
-        })
+        Ok(CheckedModule { anf, foreign_arity })
     })
 }
 
@@ -202,12 +194,6 @@ pub(crate) fn check_and_note(
             return ImportNotes {
                 error: Some(error),
                 sites: Vec::new(),
-            };
-        }
-        if let Err(error) = checker.derive_instances(module) {
-            return ImportNotes {
-                error: Some(error),
-                sites: checker.render_sites(),
             };
         }
         let error = checker.check_bodies(module).err();
@@ -275,7 +261,6 @@ pub(crate) fn collect_sites_with_imports_key(
         if checker.prepare(module).is_err() {
             return Vec::new();
         }
-        let _ = checker.derive_instances(module);
         let _ = checker.check_bodies(module);
         checker.render_sites()
     })
@@ -286,9 +271,6 @@ struct TyId(u32);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct StackId(u32);
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-struct RowId(u32);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct EffectId(u32);
@@ -304,8 +286,6 @@ enum TyNode {
     /// Application whose head is a variable, not a type constructor.
     App(TyId, Vec<TyId>),
     Fun(StackId, StackId, EffectId),
-    /// Record row. Fields live on the row node; this id is that row.
-    Record(RowId),
     /// A saturated `-` synonym. Unification reads `body`. The stack note prints `name`.
     /// `find_ty` stops here, so a later link cannot erase the name.
     Alias {
@@ -330,19 +310,6 @@ enum StackNode {
     Cons(StackId, TyId),
 }
 
-/// A record tail. `Fields` is a flat extension; a variable is only a tail.
-#[derive(Clone, Debug)]
-enum RowNode {
-    Template,
-    Var,
-    Rigid(String),
-    Link(RowId),
-    Fields {
-        fields: Vec<(String, TyId)>,
-        tail: Option<RowId>,
-    },
-}
-
 /// An effect row. Labels have no types. A variable is only a tail.
 #[derive(Clone, Debug)]
 enum EffectNode {
@@ -365,14 +332,6 @@ struct QuantTail {
 }
 
 #[derive(Clone, Debug)]
-struct QuantRow {
-    name: String,
-    id: RowId,
-    /// Rigid when this scheme is the signature being checked.
-    skolem: bool,
-}
-
-#[derive(Clone, Debug)]
 struct QuantEffect {
     name: String,
     id: EffectId,
@@ -384,7 +343,6 @@ struct QuantEffect {
 struct SemScheme {
     tys: Vec<(String, TyId)>,
     tails: Vec<QuantTail>,
-    rows: Vec<QuantRow>,
     constraints: Vec<SemConstraint>,
     input: StackId,
     output: StackId,
@@ -433,7 +391,6 @@ enum KindNode {
 struct Seen {
     ty: HashSet<TyId>,
     stack: HashSet<StackId>,
-    row: HashSet<RowId>,
     effect: HashSet<EffectId>,
     kind: HashSet<KindId>,
 }
@@ -459,7 +416,6 @@ struct InstanceInfo {
     class_name: String,
     vars: Vec<(String, TyId)>,
     tails: Vec<QuantTail>,
-    rows: Vec<QuantRow>,
     args: Vec<TyId>,
     methods: Vec<InstanceMethod>,
     /// Superclass constraints at this head. Type variables are this instance's.
@@ -510,7 +466,6 @@ struct ResolvedMethod {
 enum Edit {
     Ty(u32, TyNode),
     Stack(u32, StackNode),
-    Row(u32, RowNode),
     Effect(u32, EffectNode),
 }
 
@@ -520,7 +475,7 @@ struct CtorInfo {
     fields: Vec<TyId>,
     /// Parallel to `fields`. `None` is a positional field.
     names: Vec<Option<String>>,
-    /// Constructor word. Filled for every data type except builtin Unit.
+    /// Constructor word.
     word: Option<SemScheme>,
 }
 
@@ -545,14 +500,12 @@ struct SynBody {
 struct Subst {
     ty: HashMap<TyId, TyId>,
     stack: HashMap<StackId, StackId>,
-    row: HashMap<RowId, RowId>,
     effect: HashMap<EffectId, EffectId>,
 }
 
 struct Memo {
     ty: HashMap<TyId, TyId>,
     stack: HashMap<StackId, StackId>,
-    row: HashMap<RowId, RowId>,
     effect: HashMap<EffectId, EffectId>,
 }
 
@@ -560,13 +513,11 @@ struct Memo {
 struct Scope {
     tys: HashMap<String, TyId>,
     tails: HashMap<String, StackId>,
-    rows: HashMap<String, RowId>,
     effects: HashMap<String, EffectId>,
     /// One omitted `!` for the whole scheme, shared with nested quotation types.
     implicit_effect: Option<EffectId>,
     quantified_tys: Vec<(String, TyId)>,
     quantified_tails: Vec<QuantTail>,
-    quantified_rows: Vec<QuantRow>,
     quantified_effects: Vec<QuantEffect>,
     /// Nested quotation types. Their implicit tails and effects are not skolems.
     nested: bool,
@@ -581,7 +532,6 @@ struct CtorWord {
 struct Checker {
     tys: Vec<TyNode>,
     stacks: Vec<StackNode>,
-    rows: Vec<RowNode>,
     effects: Vec<EffectNode>,
     /// Effect row of the definition or quotation currently being checked.
     ambient: Option<EffectId>,
@@ -638,7 +588,6 @@ struct Checker {
     recording: bool,
     frozen_ty: HashSet<TyId>,
     frozen_stack: HashSet<StackId>,
-    frozen_row: HashSet<RowId>,
     frozen_effect: HashSet<EffectId>,
     /// Nested effect variables of the signature currently being checked.
     /// A body that instantiates one has outgrown the annotation.
@@ -654,13 +603,6 @@ struct Checker {
     ctor_words: HashMap<String, CtorWord>,
     /// Local spelling of an import to the name the provider published.
     renamed: HashMap<String, String>,
-    /// Instances derived for this module. The def is lowered.
-    /// A public type's instance is also appended to the module.
-    derived: Vec<Item>,
-    /// Derived `show` calls `ply_show_cat`. Lowering inlines string addition.
-    inline_show_cat: bool,
-    /// Derived `hash` calls `ply_hash_mix`. Lowering inlines the mix.
-    inline_hash_mix: bool,
     /// Place names in this check. The reader scheme lives in `words`.
     places: HashSet<String>,
     /// Modules whose instances are already in `instances`. The import graph
@@ -678,7 +620,6 @@ impl Checker {
         let mut checker = Self {
             tys: Vec::new(),
             stacks: Vec::new(),
-            rows: Vec::new(),
             effects: Vec::new(),
             ambient: None,
             empty: None,
@@ -718,7 +659,6 @@ impl Checker {
             recording: false,
             frozen_ty: HashSet::new(),
             frozen_stack: HashSet::new(),
-            frozen_row: HashSet::new(),
             frozen_effect: HashSet::new(),
             guarded: Vec::new(),
             relax_visibility: false,
@@ -726,9 +666,6 @@ impl Checker {
             check_probes: false,
             ctor_words: HashMap::new(),
             renamed: HashMap::new(),
-            derived: Vec::new(),
-            inline_show_cat: false,
-            inline_hash_mix: false,
             places: HashSet::new(),
             seen_instances: HashSet::new(),
             refinements: HashMap::new(),
@@ -740,7 +677,6 @@ impl Checker {
     fn reset(&mut self) {
         self.tys.clear();
         self.stacks.clear();
-        self.rows.clear();
         self.effects.clear();
         self.ambient = None;
         self.empty = None;
@@ -780,7 +716,6 @@ impl Checker {
         self.recording = false;
         self.frozen_ty.clear();
         self.frozen_stack.clear();
-        self.frozen_row.clear();
         self.frozen_effect.clear();
         self.guarded.clear();
         self.relax_visibility = false;
@@ -788,9 +723,6 @@ impl Checker {
         self.check_probes = false;
         self.ctor_words.clear();
         self.renamed.clear();
-        self.derived.clear();
-        self.inline_show_cat = false;
-        self.inline_hash_mix = false;
         self.places.clear();
         self.seen_instances.clear();
         self.refinements.clear();
@@ -800,12 +732,6 @@ impl Checker {
     fn check_module(&mut self, module: &Module) -> Result<(), Diagnostic> {
         self.check_probes = true;
         self.prepare(module)?;
-        self.check_ready(module)
-    }
-
-    /// Derived instances are visible to the bodies that follow them.
-    fn check_ready(&mut self, module: &Module) -> Result<(), Diagnostic> {
-        self.derive_instances(module)?;
         self.check_bodies(module)
     }
 
@@ -1007,26 +933,7 @@ impl Checker {
         for word in builtin::WORDS {
             self.load_aliases(&[word.name], word.scheme);
         }
-        self.install_unit();
-    }
-
-    fn install_unit(&mut self) {
-        self.datas.insert(
-            "Unit".to_string(),
-            DataType {
-                params: Vec::new(),
-                ctors: vec![CtorInfo {
-                    name: "Unit".to_string(),
-                    fields: Vec::new(),
-                    names: Vec::new(),
-                    word: None,
-                }],
-                newtype: false,
-                origin: "*builtin*".to_string(),
-            },
-        );
-        self.installed.insert("Unit".to_string());
-        self.note_ctor("Unit", "Unit", 0);
+        self.install_service_classes();
     }
 
     fn load_aliases(&mut self, names: &[&str], signature: &str) {
@@ -1093,12 +1000,10 @@ impl Checker {
             let mut scope = Scope {
                 tys: param_scope.tys.clone(),
                 tails: HashMap::new(),
-                rows: HashMap::new(),
                 effects: HashMap::new(),
                 implicit_effect: None,
                 quantified_tys: param_scope.quantified_tys.clone(),
                 quantified_tails: Vec::new(),
-                quantified_rows: Vec::new(),
                 quantified_effects: Vec::new(),
                 nested: false,
             };
@@ -1117,7 +1022,6 @@ impl Checker {
             let scheme = SemScheme {
                 tys: scope.quantified_tys,
                 tails: scope.quantified_tails,
-                rows: scope.quantified_rows,
                 constraints: Vec::new(),
                 input,
                 output,
@@ -1753,7 +1657,6 @@ impl Checker {
             SemScheme {
                 tys: scope.quantified_tys,
                 tails: scope.quantified_tails,
-                rows: scope.quantified_rows,
                 constraints: Vec::new(),
                 input: tail,
                 output,
@@ -1927,13 +1830,8 @@ impl Checker {
             }
             TermNode::Field(name) => self.project_field(term.span, name, stack),
             TermNode::FieldSet(name) => self.set_field(term.span, name, stack),
-            TermNode::FieldInsert(name) => self.insert_field(term.span, name, stack),
             TermNode::Array(elements) => {
                 let ty = self.check_array(elements)?;
-                Ok(self.stack_cons(stack, ty))
-            }
-            TermNode::Record(fields) => {
-                let ty = self.check_record(term.span, fields)?;
                 Ok(self.stack_cons(stack, ty))
             }
             TermNode::Bind(names) => self.check_bind(term.span, names, stack),
@@ -2433,7 +2331,6 @@ impl Checker {
                 id: tail,
                 skolem: false,
             }],
-            rows: Vec::new(),
             constraints: Vec::new(),
             input: tail,
             output,
@@ -2607,60 +2504,13 @@ impl Checker {
         Ok(output)
     }
 
-    /// `+name` adds one label. The record below must already be a closed row
-    /// that does not have the label. The value on top supplies the field type.
-    /// An open tail is not extended, and a missing label is not a constraint.
-    fn insert_field(
-        &mut self,
-        span: Span,
-        name: &str,
-        stack: StackId,
-    ) -> Result<StackId, Diagnostic> {
-        let (rest, value_ty) = self.pop_slot(stack, span)?;
-        let (rest, record_ty) = self.pop_slot(rest, span)?;
-        let record_ty = self.expose(record_ty);
-        let TyNode::Record(row) = self.tys[record_ty.0 as usize].clone() else {
-            return Err(self.error(span, Error::ExpectedRecord(self.show_ty(record_ty))));
-        };
-        let (mut fields, tail) = self
-            .peel_row(row)
-            .map_err(|message| self.error(span, message))?;
-        if tail.is_some() {
-            return Err(self.error(span, Error::RecordTailOpen));
-        }
-        if fields.contains_key(name) {
-            return Err(self.error(span, Error::DuplicateField(name.to_string())));
-        }
-        fields.insert(name.to_string(), self.find_ty(value_ty));
-        let pairs = fields.into_iter().collect();
-        let row = self.row_fields(pairs, None);
-        let record = self.ty_record(row);
-        let output = self.stack_cons(rest, record);
-        let effect = match self.ambient {
-            Some(effect) => effect,
-            None => self.effect_var(),
-        };
-        self.pending_here = Some((stack, output, effect));
-        Ok(output)
-    }
-
     fn lit_ty(&mut self, lit: &Lit) -> TyId {
         match lit {
             Lit::Int(_) => self.ty_ctor("Int", Vec::new()),
             Lit::Number(_) => self.ty_ctor("Num", Vec::new()),
             Lit::String(_) => self.ty_ctor("Str", Vec::new()),
             Lit::Bool(_) => self.ty_ctor("Bool", Vec::new()),
-        }
-    }
-
-    /// One constant: a literal, a quotation, or a nested array or record.
-    fn check_element(&mut self, term: &Term) -> Result<TyId, Diagnostic> {
-        match &term.node {
-            TermNode::Lit(lit) => Ok(self.lit_ty(lit)),
-            TermNode::Quote(terms) => self.check_quote(term.span, terms),
-            TermNode::Array(elements) => self.check_array(elements),
-            TermNode::Record(fields) => self.check_record(term.span, fields),
-            _ => Err(self.error(term.span, Error::ExpectedElement)),
+            Lit::Unit => self.ty_ctor("Unit", Vec::new()),
         }
     }
 
@@ -2718,19 +2568,6 @@ impl Checker {
         Ok(self.ty_ctor("Array", vec![elem_ty]))
     }
 
-    fn check_record(&mut self, span: Span, fields: &[(String, Term)]) -> Result<TyId, Diagnostic> {
-        let mut seen = HashSet::new();
-        let mut pairs = Vec::new();
-        for (name, term) in fields {
-            if !seen.insert(name.clone()) {
-                return Err(self.error(span, Error::DuplicateField(name.to_string())));
-            }
-            pairs.push((name.clone(), self.check_element(term)?));
-        }
-        let row = self.row_fields(pairs, None);
-        Ok(self.ty_record(row))
-    }
-
     fn lookup(&self, name: &str) -> Option<SemScheme> {
         for frame in self.locals.iter().rev() {
             if let Some(scheme) = frame.get(name) {
@@ -2764,14 +2601,6 @@ impl Checker {
                 self.stack_var()
             };
             subst.stack.insert(tail.id, fresh);
-        }
-        for row in &scheme.rows {
-            let fresh = if skolemize && row.skolem {
-                self.row_rigid(&row.name)
-            } else {
-                self.row_var()
-            };
-            subst.row.insert(row.id, fresh);
         }
         let mut guarded = Vec::new();
         for effect in &scheme.effect_vars {
@@ -2853,13 +2682,6 @@ impl Checker {
                 self.tys[fresh.0 as usize] = TyNode::Fun(input, output, effect);
                 fresh
             }
-            TyNode::Record(row) => {
-                let fresh = self.ty_var();
-                memo.ty.insert(id, fresh);
-                let row = self.copy_row(row, subst, memo);
-                self.tys[fresh.0 as usize] = TyNode::Record(row);
-                fresh
-            }
             TyNode::Alias { name, args, body } => {
                 let fresh = self.ty_var();
                 memo.ty.insert(id, fresh);
@@ -2869,36 +2691,6 @@ impl Checker {
                     .collect();
                 let body = self.copy_ty(body, subst, memo);
                 self.tys[fresh.0 as usize] = TyNode::Alias { name, args, body };
-                fresh
-            }
-        }
-    }
-
-    fn copy_row(&mut self, id: RowId, subst: &Subst, memo: &mut Memo) -> RowId {
-        let id = self.find_row(id);
-        if let Some(replaced) = subst.row.get(&id) {
-            return *replaced;
-        }
-        if let Some(copied) = memo.row.get(&id) {
-            return *copied;
-        }
-        match self.rows[id.0 as usize].clone() {
-            RowNode::Template => {
-                let fresh = self.row_var();
-                memo.row.insert(id, fresh);
-                fresh
-            }
-            RowNode::Var | RowNode::Rigid(_) => id,
-            RowNode::Link(next) => self.copy_row(next, subst, memo),
-            RowNode::Fields { fields, tail } => {
-                let fresh = self.row_var();
-                memo.row.insert(id, fresh);
-                let fields = fields
-                    .into_iter()
-                    .map(|(name, ty)| (name, self.copy_ty(ty, subst, memo)))
-                    .collect();
-                let tail = tail.map(|tail| self.copy_row(tail, subst, memo));
-                self.rows[fresh.0 as usize] = RowNode::Fields { fields, tail };
                 fresh
             }
         }
@@ -2985,7 +2777,7 @@ impl Checker {
         }
         // A lowercase name written in the scheme is quantified for the whole
         // scheme. Class parameters and an explicit `a b.` list are already bound.
-        // Row tails, effect tails, and stack tails are not type variables.
+        // Effect tails and stack tails are not type variables.
         let mut inferred = Vec::new();
         collect_scheme_vars(scheme, &mut inferred);
         for name in inferred {
@@ -3007,7 +2799,6 @@ impl Checker {
         Ok(SemScheme {
             tys: scope.quantified_tys,
             tails: scope.quantified_tails,
-            rows: scope.quantified_rows,
             constraints,
             input,
             output,
@@ -3036,7 +2827,7 @@ impl Checker {
     }
 
     /// Programs cannot write an effect row. A missing row is one open variable
-    /// for the whole scheme, distinct from a record `| name`.
+    /// for the whole scheme.
     fn elab_effect_row(
         &mut self,
         row: Option<&EffectRow>,
@@ -3117,7 +2908,7 @@ impl Checker {
         Ok(acc)
     }
 
-    /// A stack slot or a record field. Kind must be `Type`.
+    /// A stack slot. Kind must be `Type`.
     fn elab_type(&mut self, ty: &Type, scope: &mut Scope, span: Span) -> Result<TyId, Diagnostic> {
         let (id, kind) = self.elab_ty(ty, scope, span)?;
         self.demand_type(id, kind, span)?;
@@ -3184,7 +2975,6 @@ impl Checker {
                 scope.nested = saved;
                 Ok((self.ty_fun(input, output, row), self.kind_type()))
             }
-            Type::Record(row) => Ok((self.elab_record(row, scope, span)?, self.kind_type())),
         }
     }
 
@@ -3249,60 +3039,6 @@ impl Checker {
         }
     }
 
-    fn elab_record(
-        &mut self,
-        row: &crate::ast::RecordRow,
-        scope: &mut Scope,
-        span: Span,
-    ) -> Result<TyId, Diagnostic> {
-        let mut seen = HashSet::new();
-        let mut fields = Vec::new();
-        for (name, ty) in &row.fields {
-            if !seen.insert(name.clone()) {
-                return Err(self.error(span, Error::DuplicateField(name.to_string())));
-            }
-            fields.push((name.clone(), self.elab_type(ty, scope, span)?));
-        }
-        let tail = match &row.tail {
-            Some(RecordTail::Var(name)) => Some(self.named_row(scope, name, span)?),
-            Some(RecordTail::Type(ty)) => {
-                let spliced = self.elab_type(ty, scope, span)?;
-                self.splice_closed_record(spliced, span, &mut seen, &mut fields)?;
-                None
-            }
-            None => None,
-        };
-        let row = self.row_fields(fields, tail);
-        Ok(self.ty_record(row))
-    }
-
-    /// Copy fields from a tail type. The tail must be a record with no `| r`.
-    fn splice_closed_record(
-        &mut self,
-        spliced: TyId,
-        span: Span,
-        seen: &mut HashSet<String>,
-        fields: &mut Vec<(String, TyId)>,
-    ) -> Result<(), Diagnostic> {
-        let spliced = self.expose(spliced);
-        let TyNode::Record(row_id) = self.tys[spliced.0 as usize].clone() else {
-            return Err(self.error(span, Error::ExpectedRecord(self.show_ty(spliced))));
-        };
-        let (spliced_fields, spliced_tail) = self
-            .peel_row(row_id)
-            .map_err(|message| self.error(span, message))?;
-        if spliced_tail.is_some() {
-            return Err(self.error(span, Error::RecordTailOpen));
-        }
-        for (name, ty) in spliced_fields {
-            if !seen.insert(name.clone()) {
-                return Err(self.error(span, Error::DuplicateField(name.to_string())));
-            }
-            fields.push((name, ty));
-        }
-        Ok(())
-    }
-
     fn arity_of(&self, name: &str, span: Span) -> Result<usize, Diagnostic> {
         if let Some(arity) = self
             .type_arity
@@ -3353,36 +3089,6 @@ impl Checker {
         id
     }
 
-    /// `| name` is one quantified row for the whole scheme. A type variable
-    /// already bound before the dot cannot be reused as that tail.
-    fn named_row(
-        &mut self,
-        scope: &mut Scope,
-        name: &str,
-        span: Span,
-    ) -> Result<RowId, Diagnostic> {
-        if scope.tys.contains_key(name) {
-            return Err(self.error(span, Error::DuplicateTypeVariable(name.to_string())));
-        }
-        if let Some(id) = scope.rows.get(name) {
-            return Ok(*id);
-        }
-        Ok(self.fresh_row(scope, name))
-    }
-
-    fn fresh_row(&mut self, scope: &mut Scope, name: &str) -> RowId {
-        let id = self.push_row(RowNode::Template);
-        if !name.is_empty() {
-            scope.rows.insert(name.to_string(), id);
-        }
-        scope.quantified_rows.push(QuantRow {
-            name: name.to_string(),
-            id,
-            skolem: true,
-        });
-        id
-    }
-
     fn unify_ty(&mut self, have: TyId, need: TyId) -> Result<(), Error> {
         let have = self.find_ty(have);
         let need = self.find_ty(need);
@@ -3424,9 +3130,6 @@ impl Checker {
                 self.unify_stack(have_in, need_in)?;
                 self.unify_stack(have_out, need_out)?;
                 self.unify_effect(have_effect, need_effect)
-            }
-            (TyNode::Record(have_row), TyNode::Record(need_row)) => {
-                self.unify_record(have_row, need_row)
             }
             (TyNode::App(have_head, have_args), TyNode::App(need_head, need_args))
                 if have_args.len() == need_args.len() =>
@@ -3482,13 +3185,7 @@ impl Checker {
 
     /// Same type after links and synonyms. This does not unify, so it does not commit.
     fn congruent_ty(&self, left: TyId, right: TyId) -> bool {
-        self.congruent_ty_seen(
-            left,
-            right,
-            &mut HashSet::new(),
-            &mut HashSet::new(),
-            &mut HashSet::new(),
-        )
+        self.congruent_ty_seen(left, right, &mut HashSet::new(), &mut HashSet::new())
     }
 
     fn congruent_ty_seen(
@@ -3497,7 +3194,6 @@ impl Checker {
         right: TyId,
         types: &mut HashSet<(u32, u32)>,
         stacks: &mut HashSet<(u32, u32)>,
-        rows: &mut HashSet<(u32, u32)>,
     ) -> bool {
         let left = self.expose(left);
         let right = self.expose(right);
@@ -3516,27 +3212,26 @@ impl Checker {
             (TyNode::Ctor(left_name, left_args), TyNode::Ctor(right_name, right_args)) => {
                 left_name == right_name
                     && left_args.len() == right_args.len()
-                    && left_args.iter().zip(right_args).all(|(left, right)| {
-                        self.congruent_ty_seen(*left, *right, types, stacks, rows)
-                    })
+                    && left_args
+                        .iter()
+                        .zip(right_args)
+                        .all(|(left, right)| self.congruent_ty_seen(*left, *right, types, stacks))
             }
             (TyNode::App(left_head, left_args), TyNode::App(right_head, right_args)) => {
                 left_args.len() == right_args.len()
-                    && self.congruent_ty_seen(*left_head, *right_head, types, stacks, rows)
-                    && left_args.iter().zip(right_args).all(|(left, right)| {
-                        self.congruent_ty_seen(*left, *right, types, stacks, rows)
-                    })
+                    && self.congruent_ty_seen(*left_head, *right_head, types, stacks)
+                    && left_args
+                        .iter()
+                        .zip(right_args)
+                        .all(|(left, right)| self.congruent_ty_seen(*left, *right, types, stacks))
             }
             (
                 TyNode::Fun(left_in, left_out, left_effect),
                 TyNode::Fun(right_in, right_out, right_effect),
             ) => {
-                self.congruent_stack(*left_in, *right_in, types, stacks, rows)
-                    && self.congruent_stack(*left_out, *right_out, types, stacks, rows)
+                self.congruent_stack(*left_in, *right_in, types, stacks)
+                    && self.congruent_stack(*left_out, *right_out, types, stacks)
                     && self.congruent_effect(*left_effect, *right_effect)
-            }
-            (TyNode::Record(left_row), TyNode::Record(right_row)) => {
-                self.congruent_row(*left_row, *right_row, types, stacks, rows)
             }
             (TyNode::Rigid(left_name), TyNode::Rigid(right_name)) => left_name == right_name,
             _ => false,
@@ -3549,7 +3244,6 @@ impl Checker {
         right: StackId,
         types: &mut HashSet<(u32, u32)>,
         stacks: &mut HashSet<(u32, u32)>,
-        rows: &mut HashSet<(u32, u32)>,
     ) -> bool {
         let left = self.find_stack(left);
         let right = self.find_stack(right);
@@ -3569,8 +3263,8 @@ impl Checker {
             &self.stacks[right.0 as usize],
         ) {
             (StackNode::Cons(left_rest, left_ty), StackNode::Cons(right_rest, right_ty)) => {
-                self.congruent_ty_seen(*left_ty, *right_ty, types, stacks, rows)
-                    && self.congruent_stack(*left_rest, *right_rest, types, stacks, rows)
+                self.congruent_ty_seen(*left_ty, *right_ty, types, stacks)
+                    && self.congruent_stack(*left_rest, *right_rest, types, stacks)
             }
             (StackNode::Empty, StackNode::Empty) => true,
             (
@@ -3581,52 +3275,6 @@ impl Checker {
                     name: right_name, ..
                 },
             ) => left_name == right_name,
-            _ => false,
-        }
-    }
-
-    fn congruent_row(
-        &self,
-        left: RowId,
-        right: RowId,
-        types: &mut HashSet<(u32, u32)>,
-        stacks: &mut HashSet<(u32, u32)>,
-        rows: &mut HashSet<(u32, u32)>,
-    ) -> bool {
-        let left_id = self.find_row(left);
-        let right_id = self.find_row(right);
-        if left_id == right_id {
-            return true;
-        }
-        let key = if left_id.0 < right_id.0 {
-            (left_id.0, right_id.0)
-        } else {
-            (right_id.0, left_id.0)
-        };
-        if !rows.insert(key) {
-            return true;
-        }
-        match (self.peel_row(left), self.peel_row(right)) {
-            (Ok((left_fields, left_tail)), Ok((right_fields, right_tail))) => {
-                if left_fields.len() != right_fields.len() {
-                    return false;
-                }
-                for (name, left_ty) in &left_fields {
-                    let Some(right_ty) = right_fields.get(name) else {
-                        return false;
-                    };
-                    if !self.congruent_ty_seen(*left_ty, *right_ty, types, stacks, rows) {
-                        return false;
-                    }
-                }
-                match (left_tail, right_tail) {
-                    (None, None) => true,
-                    (Some(left_tail), Some(right_tail)) => {
-                        self.congruent_row(left_tail, right_tail, types, stacks, rows)
-                    }
-                    _ => false,
-                }
-            }
             _ => false,
         }
     }
@@ -3720,225 +3368,6 @@ impl Checker {
         }
         self.stacks[var_id.0 as usize] = StackNode::Link(target);
         Ok(())
-    }
-
-    /// Rows are commutative. An open tail absorbs labels the other side lacks.
-    /// A second peel runs after field types unify, because that can instantiate a tail.
-    fn unify_record(&mut self, have: RowId, need: RowId) -> Result<(), Error> {
-        // Unifying a field can instantiate a tail and reveal more labels.
-        // The name set only grows. A repeated set that did not settle is a cycle.
-        let mut seen = HashSet::new();
-        loop {
-            let (have_fields, _) = self.peel_row(have)?;
-            let (need_fields, _) = self.peel_row(need)?;
-            let mut before = BTreeSet::new();
-            before.extend(have_fields.keys().cloned());
-            before.extend(need_fields.keys().cloned());
-            if !seen.insert(before.clone()) {
-                return Err(Error::OccursCheck);
-            }
-            for (name, have_ty) in &have_fields {
-                if let Some(need_ty) = need_fields.get(name) {
-                    self.unify_ty(*have_ty, *need_ty)?;
-                }
-            }
-            let (have_fields, have_tail) = self.peel_row(have)?;
-            let (need_fields, need_tail) = self.peel_row(need)?;
-            let mut after = BTreeSet::new();
-            after.extend(have_fields.keys().cloned());
-            after.extend(need_fields.keys().cloned());
-            if before != after {
-                continue;
-            }
-            let mut only_have = Vec::new();
-            let mut only_need = Vec::new();
-            for (name, ty) in &have_fields {
-                if !need_fields.contains_key(name) {
-                    only_have.push((name.clone(), *ty));
-                }
-            }
-            for (name, ty) in &need_fields {
-                if !have_fields.contains_key(name) {
-                    only_need.push((name.clone(), *ty));
-                }
-            }
-            return self.unify_row_tails(have_tail, need_tail, only_have, only_need, have, need);
-        }
-    }
-
-    fn unify_row_tails(
-        &mut self,
-        have_tail: Option<RowId>,
-        need_tail: Option<RowId>,
-        only_have: Vec<(String, TyId)>,
-        only_need: Vec<(String, TyId)>,
-        have: RowId,
-        need: RowId,
-    ) -> Result<(), Error> {
-        let have_end = have_tail.map(|id| self.row_end(id));
-        let need_end = need_tail.map(|id| self.row_end(id));
-        match (have_end, need_end) {
-            (None, None) => self.missing_or_ok(&only_need, &only_have),
-            (Some(RowEnd::Flex(var)), None) => {
-                if let Some((name, _)) = only_have.first() {
-                    Err(Error::RecordHasNoField(name.to_string()))
-                } else {
-                    self.bind_extension(var, only_need, None)
-                }
-            }
-            (None, Some(RowEnd::Flex(var))) => {
-                if let Some((name, _)) = only_need.first() {
-                    Err(Error::RecordHasNoField(name.to_string()))
-                } else {
-                    self.bind_extension(var, only_have, None)
-                }
-            }
-            (Some(RowEnd::Flex(left)), Some(RowEnd::Flex(right))) => {
-                if left == right {
-                    if only_have.is_empty() && only_need.is_empty() {
-                        Ok(())
-                    } else {
-                        Err(Error::OccursCheck)
-                    }
-                } else {
-                    let fresh = self.row_var();
-                    self.bind_extension(left, only_need, Some(fresh))?;
-                    self.bind_extension(right, only_have, Some(fresh))
-                }
-            }
-            (Some(RowEnd::Skolem(_)), None) | (None, Some(RowEnd::Skolem(_))) => {
-                if let Some(name) = first_missing(&only_need, &only_have) {
-                    Err(Error::RecordHasNoField(name.to_string()))
-                } else {
-                    self.row_mismatch(need, have)
-                }
-            }
-            (Some(RowEnd::Skolem(_)), Some(RowEnd::Flex(var))) => {
-                if let Some((name, _)) = only_need.first() {
-                    Err(Error::RecordHasNoField(name.to_string()))
-                } else {
-                    let tail = have_tail.expect("skolem row tail");
-                    self.bind_extension(var, only_have, Some(tail))
-                }
-            }
-            (Some(RowEnd::Flex(var)), Some(RowEnd::Skolem(_))) => {
-                if let Some((name, _)) = only_have.first() {
-                    Err(Error::RecordHasNoField(name.to_string()))
-                } else {
-                    let tail = need_tail.expect("skolem row tail");
-                    self.bind_extension(var, only_need, Some(tail))
-                }
-            }
-            (Some(RowEnd::Skolem(left)), Some(RowEnd::Skolem(right))) => {
-                if left == right && only_have.is_empty() && only_need.is_empty() {
-                    Ok(())
-                } else if left == right {
-                    Err(Error::OccursCheck)
-                } else if let Some(name) = first_missing(&only_need, &only_have) {
-                    Err(Error::RecordHasNoField(name.to_string()))
-                } else {
-                    self.row_mismatch(need, have)
-                }
-            }
-        }
-    }
-
-    fn missing_or_ok(
-        &self,
-        only_need: &[(String, TyId)],
-        only_have: &[(String, TyId)],
-    ) -> Result<(), Error> {
-        if let Some(name) = first_missing(only_need, only_have) {
-            Err(Error::RecordHasNoField(name.to_string()))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn row_mismatch(&self, need: RowId, have: RowId) -> Result<(), Error> {
-        Err(Error::TypeMismatch {
-            expected: self.show_record(need, 0, false),
-            found: self.show_record(have, 0, false),
-        })
-    }
-
-    fn bind_extension(
-        &mut self,
-        var: RowId,
-        fields: Vec<(String, TyId)>,
-        tail: Option<RowId>,
-    ) -> Result<(), Error> {
-        let target = if fields.is_empty() {
-            match tail {
-                Some(tail) => tail,
-                None => self.row_fields(Vec::new(), None),
-            }
-        } else {
-            self.row_fields(fields, tail)
-        };
-        self.bind_row(var, target)
-    }
-
-    fn bind_row(&mut self, var_id: RowId, target: RowId) -> Result<(), Error> {
-        let var_id = self.find_row(var_id);
-        let target = self.find_row(target);
-        if self.frozen_row.contains(&var_id) {
-            return Err(Error::Frozen);
-        }
-        if !matches!(self.rows[var_id.0 as usize], RowNode::Var) {
-            panic!("binding a rigid row");
-        }
-        if var_id == target {
-            return Ok(());
-        }
-        if self.occurs_row(var_id, target, &mut Seen::default()) {
-            return Err(Error::OccursCheck);
-        }
-        if self.recording {
-            self.trail
-                .push(Edit::Row(var_id.0, self.rows[var_id.0 as usize].clone()));
-        }
-        self.rows[var_id.0 as usize] = RowNode::Link(target);
-        Ok(())
-    }
-
-    fn peel_row(&self, id: RowId) -> Result<(BTreeMap<String, TyId>, Option<RowId>), Error> {
-        let mut fields = BTreeMap::new();
-        let mut current = Some(id);
-        let mut seen = HashSet::new();
-        while let Some(row) = current {
-            let row = self.find_row(row);
-            if !seen.insert(row) {
-                return Err(Error::OccursCheck);
-            }
-            match &self.rows[row.0 as usize] {
-                RowNode::Fields {
-                    fields: found,
-                    tail,
-                } => {
-                    for (name, ty) in found {
-                        if fields.insert(name.clone(), *ty).is_some() {
-                            return Err(Error::DuplicateField(name.to_string()));
-                        }
-                    }
-                    current = *tail;
-                }
-                RowNode::Link(next) => current = Some(*next),
-                RowNode::Var | RowNode::Rigid(_) | RowNode::Template => {
-                    return Ok((fields, Some(row)));
-                }
-            }
-        }
-        Ok((fields, None))
-    }
-
-    fn row_end(&self, id: RowId) -> RowEnd {
-        let id = self.find_row(id);
-        match &self.rows[id.0 as usize] {
-            RowNode::Var => RowEnd::Flex(id),
-            RowNode::Rigid(_) | RowNode::Template => RowEnd::Skolem(id),
-            other => panic!("row tail is {other:?}"),
-        }
     }
 
     /// Effect rows are commutative and carry no types. An open tail absorbs
@@ -4150,30 +3579,12 @@ impl Checker {
             TyNode::Fun(input, output, _) => {
                 self.ty_in_stack(var_id, input, seen) || self.ty_in_stack(var_id, output, seen)
             }
-            TyNode::Record(row) => self.ty_in_row(var_id, row, seen),
             TyNode::Alias { args, body, .. } => {
                 args.into_iter()
                     .any(|arg| self.occurs_ty(var_id, arg, seen))
                     || self.occurs_ty(var_id, body, seen)
             }
             TyNode::Link(next) => self.occurs_ty(var_id, next, seen),
-            _ => false,
-        }
-    }
-
-    fn ty_in_row(&self, var_id: TyId, row: RowId, seen: &mut Seen) -> bool {
-        let row = self.find_row(row);
-        if !seen.row.insert(row) {
-            return false;
-        }
-        match self.rows[row.0 as usize].clone() {
-            RowNode::Fields { fields, tail } => {
-                fields
-                    .iter()
-                    .any(|(_, ty)| self.occurs_ty(var_id, *ty, seen))
-                    || tail.is_some_and(|tail| self.ty_in_row(var_id, tail, seen))
-            }
-            RowNode::Link(next) => self.ty_in_row(var_id, next, seen),
             _ => false,
         }
     }
@@ -4227,93 +3638,12 @@ impl Checker {
                         .into_iter()
                         .any(|arg| self.stack_in_ty(var_id, arg, seen))
             }
-            TyNode::Record(row) => self.stack_in_row(var_id, row, seen),
             TyNode::Alias { args, body, .. } => {
                 args.into_iter()
                     .any(|arg| self.stack_in_ty(var_id, arg, seen))
                     || self.stack_in_ty(var_id, body, seen)
             }
             TyNode::Link(next) => self.stack_in_ty(var_id, next, seen),
-            _ => false,
-        }
-    }
-
-    fn stack_in_row(&self, var_id: StackId, row: RowId, seen: &mut Seen) -> bool {
-        let row = self.find_row(row);
-        if !seen.row.insert(row) {
-            return false;
-        }
-        match self.rows[row.0 as usize].clone() {
-            RowNode::Fields { fields, tail } => {
-                fields
-                    .iter()
-                    .any(|(_, ty)| self.stack_in_ty(var_id, *ty, seen))
-                    || tail.is_some_and(|tail| self.stack_in_row(var_id, tail, seen))
-            }
-            RowNode::Link(next) => self.stack_in_row(var_id, next, seen),
-            _ => false,
-        }
-    }
-
-    fn occurs_row(&self, var_id: RowId, in_row: RowId, seen: &mut Seen) -> bool {
-        let in_row = self.find_row(in_row);
-        if in_row == var_id {
-            return true;
-        }
-        if !seen.row.insert(in_row) {
-            return false;
-        }
-        match self.rows[in_row.0 as usize].clone() {
-            RowNode::Fields { fields, tail } => {
-                fields
-                    .iter()
-                    .any(|(_, ty)| self.row_in_ty(var_id, *ty, seen))
-                    || tail.is_some_and(|tail| self.occurs_row(var_id, tail, seen))
-            }
-            RowNode::Link(next) => self.occurs_row(var_id, next, seen),
-            _ => false,
-        }
-    }
-
-    fn row_in_ty(&self, var_id: RowId, ty: TyId, seen: &mut Seen) -> bool {
-        let ty = self.find_ty(ty);
-        if !seen.ty.insert(ty) {
-            return false;
-        }
-        match self.tys[ty.0 as usize].clone() {
-            TyNode::Record(row) => self.occurs_row(var_id, row, seen),
-            TyNode::Ctor(_, args) => args
-                .into_iter()
-                .any(|arg| self.row_in_ty(var_id, arg, seen)),
-            TyNode::App(head, args) => {
-                self.row_in_ty(var_id, head, seen)
-                    || args
-                        .into_iter()
-                        .any(|arg| self.row_in_ty(var_id, arg, seen))
-            }
-            TyNode::Fun(input, output, _) => {
-                self.row_in_stack(var_id, input, seen) || self.row_in_stack(var_id, output, seen)
-            }
-            TyNode::Alias { args, body, .. } => {
-                args.into_iter()
-                    .any(|arg| self.row_in_ty(var_id, arg, seen))
-                    || self.row_in_ty(var_id, body, seen)
-            }
-            TyNode::Link(next) => self.row_in_ty(var_id, next, seen),
-            _ => false,
-        }
-    }
-
-    fn row_in_stack(&self, var_id: RowId, stack: StackId, seen: &mut Seen) -> bool {
-        let stack = self.find_stack(stack);
-        if !seen.stack.insert(stack) {
-            return false;
-        }
-        match self.stacks[stack.0 as usize].clone() {
-            StackNode::Cons(rest, ty) => {
-                self.row_in_ty(var_id, ty, seen) || self.row_in_stack(var_id, rest, seen)
-            }
-            StackNode::Link(next) => self.row_in_stack(var_id, next, seen),
             _ => false,
         }
     }
@@ -4356,7 +3686,6 @@ impl Checker {
                     self.effect_suffix(effect)
                 )
             }
-            TyNode::Record(row) => self.show_record(row, depth + 1, fold),
             TyNode::Alias { name, args, body } => {
                 if !fold {
                     return self.show_ty_at(body, depth + 1, false);
@@ -4374,51 +3703,6 @@ impl Checker {
                 }
             }
         }
-    }
-
-    /// Labels are alphabetical. An unsolved tail is `| _`.
-    fn show_record(&self, id: RowId, depth: usize, fold: bool) -> String {
-        if depth > 32 {
-            return "_".to_string();
-        }
-        let mut fields = Vec::new();
-        let mut seen = HashSet::new();
-        let mut current = Some(id);
-        let mut guard = 0;
-        let tail = loop {
-            guard += 1;
-            if guard > 64 {
-                break Some("_".to_string());
-            }
-            let Some(row) = current else {
-                break None;
-            };
-            let row = self.find_row(row);
-            match &self.rows[row.0 as usize] {
-                RowNode::Fields {
-                    fields: found,
-                    tail,
-                } => {
-                    for (name, ty) in found {
-                        if seen.insert(name.clone()) {
-                            fields.push((name.clone(), self.show_ty_at(*ty, depth + 1, fold)));
-                        }
-                    }
-                    current = *tail;
-                }
-                RowNode::Var | RowNode::Template => break Some("_".to_string()),
-                RowNode::Rigid(name) => {
-                    break Some(if name.is_empty() {
-                        "_".to_string()
-                    } else {
-                        name.clone()
-                    });
-                }
-                RowNode::Link(next) => current = Some(*next),
-            }
-        };
-        fields.sort_by(|left, right| left.0.cmp(&right.0));
-        format_row(&fields, tail.as_deref())
     }
 
     fn show_effect(&self, input: StackId, output: StackId, depth: usize, fold: bool) -> String {
@@ -4603,20 +3887,6 @@ impl Checker {
     }
 
     /// Follow links to a node that is not a link. A repeated id is a link cycle.
-    fn find_row(&self, mut id: RowId) -> RowId {
-        let mut seen = HashSet::new();
-        loop {
-            if !seen.insert(id) {
-                return id;
-            }
-            match &self.rows[id.0 as usize] {
-                RowNode::Link(next) => id = *next,
-                _ => return id,
-            }
-        }
-    }
-
-    /// Follow links to a node that is not a link. A repeated id is a link cycle.
     fn find_stack(&self, mut id: StackId) -> StackId {
         let mut seen = HashSet::new();
         loop {
@@ -4642,12 +3912,6 @@ impl Checker {
         id
     }
 
-    fn push_row(&mut self, node: RowNode) -> RowId {
-        let id = RowId(self.rows.len() as u32);
-        self.rows.push(node);
-        id
-    }
-
     fn ty_var(&mut self) -> TyId {
         self.push_ty(TyNode::Var)
     }
@@ -4662,22 +3926,6 @@ impl Checker {
 
     fn ty_fun(&mut self, input: StackId, output: StackId, effect: EffectId) -> TyId {
         self.push_ty(TyNode::Fun(input, output, effect))
-    }
-
-    fn ty_record(&mut self, row: RowId) -> TyId {
-        self.push_ty(TyNode::Record(row))
-    }
-
-    fn row_var(&mut self) -> RowId {
-        self.push_row(RowNode::Var)
-    }
-
-    fn row_rigid(&mut self, name: &str) -> RowId {
-        self.push_row(RowNode::Rigid(name.to_string()))
-    }
-
-    fn row_fields(&mut self, fields: Vec<(String, TyId)>, tail: Option<RowId>) -> RowId {
-        self.push_row(RowNode::Fields { fields, tail })
     }
 
     fn push_effect(&mut self, node: EffectNode) -> EffectId {
@@ -4892,7 +4140,6 @@ impl Checker {
             match self.trail.pop().unwrap() {
                 Edit::Ty(id, node) => self.tys[id as usize] = node,
                 Edit::Stack(id, node) => self.stacks[id as usize] = node,
-                Edit::Row(id, node) => self.rows[id as usize] = node,
                 Edit::Effect(id, node) => self.effects[id as usize] = node,
             }
         }
@@ -4920,7 +4167,6 @@ impl Checker {
                 self.freeze_stack(output);
                 self.freeze_effect(effect);
             }
-            TyNode::Record(row) => self.freeze_row(row),
             TyNode::Alias { args, body, .. } => {
                 for arg in args {
                     self.freeze_ty(arg);
@@ -4940,24 +4186,6 @@ impl Checker {
             StackNode::Cons(rest, ty) => {
                 self.freeze_stack(rest);
                 self.freeze_ty(ty);
-            }
-            _ => {}
-        }
-    }
-
-    fn freeze_row(&mut self, row: RowId) {
-        let row = self.find_row(row);
-        match self.rows[row.0 as usize].clone() {
-            RowNode::Var => {
-                self.frozen_row.insert(row);
-            }
-            RowNode::Fields { fields, tail } => {
-                for (_, ty) in fields {
-                    self.freeze_ty(ty);
-                }
-                if let Some(tail) = tail {
-                    self.freeze_row(tail);
-                }
             }
             _ => {}
         }
@@ -4992,7 +4220,6 @@ impl Checker {
             TyNode::Fun(input, output, _) => {
                 self.flexible_stack(input, seen) || self.flexible_stack(output, seen)
             }
-            TyNode::Record(row) => self.flexible_row(row, seen),
             TyNode::Alias { args, body, .. } => {
                 args.into_iter().any(|arg| self.flexible(arg, seen)) || self.flexible(body, seen)
             }
@@ -5010,22 +4237,6 @@ impl Checker {
             StackNode::Var => true,
             StackNode::Cons(rest, ty) => self.flexible_stack(rest, seen) || self.flexible(ty, seen),
             StackNode::Link(next) => self.flexible_stack(next, seen),
-            _ => false,
-        }
-    }
-
-    fn flexible_row(&self, row: RowId, seen: &mut Seen) -> bool {
-        let row = self.find_row(row);
-        if !seen.row.insert(row) {
-            return false;
-        }
-        match self.rows[row.0 as usize].clone() {
-            RowNode::Var => true,
-            RowNode::Fields { fields, tail } => {
-                fields.into_iter().any(|(_, ty)| self.flexible(ty, seen))
-                    || tail.is_some_and(|tail| self.flexible_row(tail, seen))
-            }
-            RowNode::Link(next) => self.flexible_row(next, seen),
             _ => false,
         }
     }
@@ -5100,8 +4311,8 @@ fn file_key(path: &str) -> String {
     name.strip_suffix(".ply").unwrap_or(name).to_string()
 }
 
-/// Free type variables in a scheme, in source order. Stack, row, and effect
-/// tails are not included: those names live in other spaces.
+/// Free type variables in a scheme, in source order. Stack and effect tails
+/// are not included: those names live in other spaces.
 fn collect_scheme_vars(scheme: &Scheme, names: &mut Vec<String>) {
     for constraint in &scheme.constraints {
         for arg in &constraint.args {
@@ -5139,14 +4350,6 @@ fn collect_ty_vars(ty: &Type, names: &mut Vec<String>) {
                 collect_ty_vars(item, names);
             }
         }
-        Type::Record(row) => {
-            for (_, field) in &row.fields {
-                collect_ty_vars(field, names);
-            }
-            if let Some(ty) = row.tail_ty() {
-                collect_ty_vars(ty, names);
-            }
-        }
     }
 }
 
@@ -5155,12 +4358,10 @@ impl Scope {
         Self {
             tys: HashMap::new(),
             tails: HashMap::new(),
-            rows: HashMap::new(),
             effects: HashMap::new(),
             implicit_effect: None,
             quantified_tys: Vec::new(),
             quantified_tails: Vec::new(),
-            quantified_rows: Vec::new(),
             quantified_effects: Vec::new(),
             nested: false,
         }
@@ -5172,7 +4373,6 @@ impl Default for Subst {
         Self {
             ty: HashMap::new(),
             stack: HashMap::new(),
-            row: HashMap::new(),
             effect: HashMap::new(),
         }
     }
@@ -5183,15 +4383,9 @@ impl Default for Memo {
         Self {
             ty: HashMap::new(),
             stack: HashMap::new(),
-            row: HashMap::new(),
             effect: HashMap::new(),
         }
     }
-}
-
-enum RowEnd {
-    Flex(RowId),
-    Skolem(RowId),
 }
 
 enum EffectEnd {
@@ -5207,38 +4401,6 @@ fn format_effect(labels: &[String], tail: Option<&str>) -> String {
     out.push_str(&labels.join(", "));
     if let Some(name) = tail {
         if !labels.is_empty() {
-            out.push(' ');
-        }
-        out.push_str("| ");
-        out.push_str(name);
-    }
-    out.push_str(" }");
-    out
-}
-
-fn first_missing<'a>(
-    only_need: &'a [(String, TyId)],
-    only_have: &'a [(String, TyId)],
-) -> Option<&'a str> {
-    only_need
-        .first()
-        .or(only_have.first())
-        .map(|(name, _)| name.as_str())
-}
-
-fn format_row(fields: &[(String, String)], tail: Option<&str>) -> String {
-    if fields.is_empty() && tail.is_none() {
-        return "{}".to_string();
-    }
-    let mut out = String::from("{ ");
-    let items = fields
-        .iter()
-        .map(|(name, ty)| format!("{name} : {ty}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    out.push_str(&items);
-    if let Some(name) = tail {
-        if !items.is_empty() {
             out.push(' ');
         }
         out.push_str("| ");
@@ -5285,11 +4447,6 @@ fn hidden_type(module: &Module, ty: &Type) -> Option<String> {
         Type::App(head, args) => hidden_type(module, head)
             .or_else(|| args.iter().find_map(|arg| hidden_type(module, arg))),
         Type::Fun(effect) => hidden_in_stacks(module, effect),
-        Type::Record(row) => row
-            .fields
-            .iter()
-            .find_map(|(_, ty)| hidden_type(module, ty))
-            .or_else(|| row.tail_ty().and_then(|ty| hidden_type(module, ty))),
     }
 }
 
@@ -5364,15 +4521,6 @@ fn unready_mention(
             TermNode::Quote(inner) | TermNode::Array(inner) => {
                 if let Some(found) = unready_mention(inner, unready, graph) {
                     return Some(found);
-                }
-            }
-            TermNode::Record(fields) => {
-                for (_, value) in fields {
-                    if let Some(found) =
-                        unready_mention(std::slice::from_ref(value), unready, graph)
-                    {
-                        return Some(found);
-                    }
                 }
             }
             _ => {}
@@ -5451,11 +4599,6 @@ fn collect_place_uses(
             }
             TermNode::Quote(inner) | TermNode::Array(inner) => {
                 collect_place_uses(inner, place_names, places, calls);
-            }
-            TermNode::Record(fields) => {
-                for (_, value) in fields {
-                    collect_place_uses(std::slice::from_ref(value), place_names, places, calls);
-                }
             }
             _ => {}
         }
@@ -5570,17 +4713,6 @@ fn subst_type(ty: &Type, params: &[String], args: &[Type]) -> Type {
             output: subst_stack(&effect.output, params, args),
             effects: effect.effects.clone(),
         })),
-        Type::Record(row) => Type::Record(crate::ast::RecordRow {
-            fields: row
-                .fields
-                .iter()
-                .map(|(name, field)| (name.clone(), subst_type(field, params, args)))
-                .collect(),
-            tail: row.tail.as_ref().map(|tail| match tail {
-                RecordTail::Var(name) => RecordTail::Var(name.clone()),
-                RecordTail::Type(ty) => RecordTail::Type(Box::new(subst_type(ty, params, args))),
-            }),
-        }),
     }
 }
 
@@ -5640,6 +4772,33 @@ fn parsed_scheme(signature: &str) -> Scheme {
     }
 }
 
+/// Service instances shared by the checker tests and the lowering tests.
+/// The classes are already in scope. A snippet that matches `Num` or `(Array Num)` needs them.
+#[cfg(test)]
+const SERVICE_CHECKS: &str = "\
+: foreign isNum ( b. b -- Bool )
+: foreign isInt ( b. b -- Bool )
+: foreign isStr ( b. b -- Bool )
+: foreign isBool ( b. b -- Bool )
+: foreign isUnit ( b. b -- Bool )
+: foreign isArray ( b. b -- Bool )
+: foreign everyArray ( a. (Array a) (a -- Bool) -- Bool )
+# Nullary Num
+  checkNullary = isNum
+# Nullary Int
+  checkNullary = isInt
+# Nullary Str
+  checkNullary = isStr
+# Nullary Bool
+  checkNullary = isBool
+# Nullary Unit
+  checkNullary = isUnit
+# Unary Array
+  checkUnary = isArray
+  checkUnary_1 = everyArray
+
+";
+
 #[cfg(test)]
 mod tests {
     use super::check;
@@ -5658,6 +4817,10 @@ mod tests {
     fn err(body: &str, message: &str) {
         let got = check_source(body, ParseMode::Source).expect_err(body);
         assert_eq!(got, message, "{body}");
+    }
+
+    fn checks(body: &str) -> String {
+        format!("{}{body}", super::SERVICE_CHECKS)
     }
 
     #[test]
@@ -5704,8 +4867,8 @@ mod tests {
         ok(": flag ( -- Bool )\n  true");
         ok(": label ( -- Str )\n  \"hi\"");
         ok(": half ( (Num) (Num) -- Num )\n  drop");
-        ok(": unit_value ( -- Unit )\n  Unit");
-        ok(": match_unit ( Unit -- Int )\n  (Unit ..) -> 1n");
+        ok(": unit_value ( -- Unit )\n  unit");
+        ok(": match_unit ( Unit -- Int )\n  unit -> 1n");
         ok(": maybe_int ( (Maybe Int) -- Int )\n  (Nothing ..) -> 0n\n  (Just ..) ->\n\n; Maybe a = Nothing | Just a");
         ok(": foreign add ( (Int) (Int) -- Int )\n\n: use ( (Int) (Int) -- Int )\n  add");
         ok(": ignore_quote ( a. a -- a )\n  [ drop ] drop");
@@ -5934,11 +5097,13 @@ mod tests {
             "None has no field a",
         );
         err(
-            "; Option a = None | Some a\n\n: bad ( a. (Option a) -- a )\n  (Some (Array Num)) ->\n",
+            &checks("; Option a = None | Some a\n\n: bad ( a. (Option a) -- a )\n  (Some (Array Num)) ->\n"),
             "non-exhaustive match: None, Some",
         );
         err(
-            "; Option a = None | Some a\n\n: bad ( a. (Option a) -- a )\n  (Some Array) ->\n",
+            &checks(
+                "; Option a = None | Some a\n\n: bad ( a. (Option a) -- a )\n  (Some Array) ->\n",
+            ),
             "non-exhaustive match: None, Some",
         );
         err(
@@ -5957,7 +5122,8 @@ mod tests {
 
     #[test]
     fn a_type_test_names_the_array() {
-        ok("\
+        ok(&checks(
+            "\
 ; Option a = None | Some a
 
 : normalizedItems ( (Option a) -- (Array Num) )
@@ -5989,8 +5155,10 @@ mod tests {
   (Some (Array Num) items) -> items
   (Some (Array Num) _) -> < >
   _ -> drop < >
-");
-        ok("\
+",
+        ));
+        ok(&checks(
+            "\
 ; Option a = None | Some a
 ; Pair a b = Pair frs : a, snd : b
 - Time Num
@@ -6002,8 +5170,10 @@ mod tests {
 : time ( (Option a) -- Num )
   (Some (Time) n) -> n
   _ -> drop 0
-");
-        ok("\
+",
+        ));
+        ok(&checks(
+            "\
 ; Option a = None | Some a
 ; Person = Person who : (Option Str), age : Num
 
@@ -6014,13 +5184,14 @@ mod tests {
 : nested ( Person -- Str )
   (Person (Some name) age) -> age drop name
   (Person (None ..) _) -> \"\"
-");
+",
+        ));
         err(
-            "; Option a = None | Some a\n\n: bad ( (Option a) -- (Array Num) )\n  (Some (Array Num) items) -> items\n",
+            &checks("; Option a = None | Some a\n\n: bad ( (Option a) -- (Array Num) )\n  (Some (Array Num) items) -> items\n"),
             "non-exhaustive match: None, Some",
         );
         err(
-            "; Option a = None | Some a\n\n: bad ( (Option (Array Str)) -- (Array Num) )\n  (Some (Array Num) items) -> items\n  (None ..) -> < >\n",
+            &checks("; Option a = None | Some a\n\n: bad ( (Option (Array Str)) -- (Array Num) )\n  (Some (Array Num) items) -> items\n  (None ..) -> < >\n"),
             "type mismatch: expected (Array Str), found (Array Num)",
         );
         err(
@@ -6028,12 +5199,12 @@ mod tests {
             "pattern cannot test (Option Num)",
         );
         err(
-            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (StrMap Num) value) -> 0\n  _ -> drop 0\n",
-            "pattern cannot test (StrMap Num)",
+            "; foreign StrMap a\n; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (StrMap Num) value) -> 0\n  _ -> drop 0\n",
+            "no instance for Unary StrMap",
         );
-        ok(
-            "; Option a = None | Some a\n\n: unit ( (Option a) -- Num )\n  (Some (Unit) _) -> 0\n  _ -> drop 1\n",
-        );
+        ok(&checks(
+            "; Option a = None | Some a\n\n: seen ( (Option a) -- Num )\n  (Some (Unit) _) -> 0\n  _ -> drop 1\n",
+        ));
         err(
             "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Array) value) -> 0\n  _ -> drop 0\n",
             "type constructor Array expects 1 argument",
@@ -6043,14 +5214,15 @@ mod tests {
             "pattern Some needs a field name or ..",
         );
         err(
-            "; Option a = None | Some a\n\n: bad ( (Option (Array Num)) -- (Array Num) )\n  (Some (Array Num) items) -> items\n  (Some (Array Num) items) -> items\n  (None ..) -> < >\n",
+            &checks("; Option a = None | Some a\n\n: bad ( (Option (Array Num)) -- (Array Num) )\n  (Some (Array Num) items) -> items\n  (Some (Array Num) items) -> items\n  (None ..) -> < >\n"),
             "redundant pattern",
         );
     }
 
     #[test]
     fn a_type_test_spills_the_value() {
-        ok("\
+        ok(&checks(
+            "\
 ; Option a = None | Some a
 ; Pair a b = Pair frs : a, snd : b
 ; Age == Age Num
@@ -6081,9 +5253,12 @@ mod tests {
 : plain ( a. a (Option a) -- a )
   spare (Some ..) -> spare drop
   spare (None ..) -> spare
-");
+",
+        ));
         err(
-            "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Num) ..) ->\n",
+            &checks(
+                "; Option a = None | Some a\n\n: bad ( (Option a) -- Num )\n  (Some (Num) ..) ->\n",
+            ),
             "non-exhaustive match: None, Some",
         );
         err(
@@ -6114,7 +5289,8 @@ mod tests {
 
     #[test]
     fn a_shape_specializes_only_its_arm() {
-        ok("\
+        ok(&checks(
+            "\
 : held ( a. a -- a )
   Num ->
   x -> x
@@ -6136,8 +5312,10 @@ mod tests {
 
 : text ( -- Str )
   \"a\" \"b\" sum
-");
-        ok("\
+",
+        ));
+        ok(&checks(
+            "\
 ; Option a = None | Some a
 
 : chosen ( a. a (Option a) -- a )
@@ -6150,12 +5328,14 @@ mod tests {
 
 : fromStr ( -- Str )
   \"z\" \"hi\" Some chosen
-");
+",
+        ));
         err(
-            "; Option a = None | Some a\n\n: bad ( a. a (Option a) -- a )\n  spare (Some (Num) n) -> n\n  spare (Some x) -> x\n  spare (None ..) -> 0\n",
+            &checks("; Option a = None | Some a\n\n: bad ( a. a (Option a) -- a )\n  spare (Some (Num) n) -> n\n  spare (Some x) -> x\n  spare (None ..) -> 0\n"),
             "type mismatch: expected a, found Num",
         );
-        ok("\
+        ok(&checks(
+            "\
 & Foldable f
   fold ( (f a) b (b a -- b) -- b )
 
@@ -6175,20 +5355,22 @@ mod tests {
 : take ( f a. (f a) -- (Array Num) )
   (Array Num) ->
   _ -> drop < >
-");
+",
+        ));
         err(
-            "& Foldable f\n  fold ( (f a) b (b a -- b) -- b )\n\n: foreign foldArray ( (Array a) b (b a -- b) -- b )\n\n# Foldable Array\n  fold = foldArray\n\n: bad ( Foldable f => (f a) -- Num )\n  Array -> drop 0\n  _ -> fold\n",
+            &checks("& Foldable f\n  fold ( (f a) b (b a -- b) -- b )\n\n: foreign foldArray ( (Array a) b (b a -- b) -- b )\n\n# Foldable Array\n  fold = foldArray\n\n: bad ( Foldable f => (f a) -- Num )\n  Array -> drop 0\n  _ -> fold\n"),
             "type mismatch: expected (.._ _ _ -- .._ _), found (f a)",
         );
         err(
-            "; Option a = None | Some a\n\n: bad ( a. (Option a) -- a )\n  Array ->\n  x -> x\n",
+            &checks("; Option a = None | Some a\n\n: bad ( a. (Option a) -- a )\n  Array ->\n  x -> x\n"),
             "type mismatch: expected (Option a), found (Array _)",
         );
         err(
-            ": bad ( a. (StrMap a) -- a )\n  StrMap ->\n  x -> x\n",
-            "type mismatch: expected a data type, found (StrMap a)",
+            "; foreign StrMap a\n\n: bad ( a. (StrMap a) -- a )\n  StrMap ->\n  x -> x\n",
+            "no instance for Unary StrMap",
         );
-        ok("\
+        ok(&checks(
+            "\
 : id ( Num -- Num )
   1 -> 1
   Num ->
@@ -6201,26 +5383,98 @@ mod tests {
 
 : same ( (Array a) -- (Array a) )
   Array ->
-");
+",
+        ));
         err(
-            ": bad ( a. a -- a )\n  Num ->\n",
+            &checks(": bad ( a. a -- a )\n  Num ->\n"),
             "non-exhaustive match: _",
         );
         err(
-            ": bad ( Num -- Num )\n  Num ->\n  _ -> drop 0\n",
+            &checks(": bad ( Num -- Num )\n  Num ->\n  _ -> drop 0\n"),
             "redundant pattern",
         );
         err(
-            ": foreign size_array ( (Array a) -- Num )\n\n: bad ( a. a -- Num )\n  (Array x) -> x\n  _ -> drop 0\n",
+            &checks(": foreign size_array ( (Array a) -- Num )\n\n: bad ( a. a -- Num )\n  (Array x) -> x\n  _ -> drop 0\n"),
             "undefined word x",
         );
-        ok("\
+        ok(&checks(
+            "\
 : foreign size_array ( (Array a) -- Num )
 
 : size ( a. a -- Num )
   (Array _) -> size_array
   _ -> drop 0
-");
+",
+        ));
+        err(
+            &checks(": bad ( a. a -- a )\n  Num ->\n  Num ->\n  _ ->\n"),
+            "redundant pattern",
+        );
+        ok(&checks(
+            "\
+: kind ( a. a -- Num )
+  Num -> drop 1
+  Str -> drop 2
+  _ -> drop 0
+",
+        ));
+        err(
+            ": bad ( a. a -- Bool )\n  checkNullary\n",
+            "ambiguous constraint Nullary _",
+        );
+        err(
+            "; foreign Buffer\n\n: bad ( a. a -- a )\n  Buffer ->\n  _ ->\n",
+            "no instance for Nullary Buffer",
+        );
+        err(
+            "; foreign Hub a\n; Option a = None | Some a\n\n: bad ( a. (Option a) -- Num )\n  (Some (Hub Num) value) -> 0\n  _ -> drop 0\n",
+            "no instance for Unary Hub",
+        );
+        err(
+            "; foreign Map k a\n; Option a = None | Some a\n\n: bad ( a. (Option a) -- Num )\n  (Some (Map Str) value) -> 0\n  _ -> drop 0\n",
+            "type constructor Map expects 2 arguments",
+        );
+        err(
+            "; foreign Map k a\n; Option a = None | Some a\n\n: bad ( a. (Option a) -- Num )\n  (Some (Map Str Num) value) -> 0\n  _ -> drop 0\n",
+            "no instance for Binary Map",
+        );
+        ok(&checks(
+            "\
+; foreign Buffer
+: foreign isBuffer ( b. b -- Bool )
+: foreign sizeBuffer ( Buffer -- Num )
+# Nullary Buffer
+  checkNullary = isBuffer
+
+: bytes ( b. b -- Num )
+  Buffer -> sizeBuffer
+  Array -> drop 0
+  Num ->
+  _ -> drop 0
+
+: held ( a. a -- a )
+  Num ->
+  _ ->
+
+; foreign Map k a
+: foreign isMap ( b. b -- Bool )
+: foreign keyMap ( k a. (Map k a) (k -- Bool) -- Bool )
+: foreign valMap ( k a. (Map k a) (a -- Bool) -- Bool )
+# Binary Map
+  checkBinary = isMap
+  checkBinary_1 = keyMap
+  checkBinary_2 = valMap
+
+: picked ( f a. (f a) -- Num )
+  (Map Str Num) -> drop 1
+  Map -> drop 2
+  _ -> drop 0
+
+: values ( a. (Map Str a) -- Num )
+  (Map _ Num) -> drop 1
+  _ -> drop 0
+",
+        ));
     }
 
     #[test]
@@ -6360,7 +5614,7 @@ mod tests {
 
     #[test]
     fn a_wild_slot_leaves_the_value() {
-        ok(": kept ( a. a -- a )\n  Num ->\n  _ ->\n: fromNum ( -- Num )\n  1 kept\n: fromStr ( -- Str )\n  \"hi\" kept\n");
+        ok(&checks(": kept ( a. a -- a )\n  Num ->\n  _ ->\n: fromNum ( -- Num )\n  1 kept\n: fromStr ( -- Str )\n  \"hi\" kept\n"));
         ok("; Option a = None | Some a\n: peek ( a. (Option a) -- Num )\n  (Some _) -> 0\n  (None ..) -> 1\n");
         err(
             ": bad ( a. a -- Num )\n  _ -> 0\n",
@@ -6893,8 +6147,9 @@ mod tests {
     }
 
     #[test]
-    fn comparable_is_derived_for_a_product_of_ints() {
-        ok("\
+    fn a_data_type_does_not_receive_an_instance() {
+        err(
+            "\
 & Setoid a
   eq ( a a -- Bool )
 
@@ -6908,127 +6163,9 @@ mod tests {
 
 : same ( Person Person -- Bool )
   eq
-");
-        ok("\
-& Setoid a
-  eq ( a a -- Bool )
-
-: eqInt ( Int Int -- Bool )
-  drop drop true
-
-# Setoid Int
-  eq = eqInt
-
-; Answer = No | Yes Int
-
-: same ( Answer Answer -- Bool )
-  eq
-");
-        err(
-            "\
-& Setoid a
-  eq ( a a -- Bool )
-
-; Task = Task ( Int -- Int )
-
-: same ( Task Task -- Bool )
-  eq
 ",
-            "no instance for Setoid Task",
+            "no instance for Setoid Person",
         );
-        err(
-            "\
-& Setoid a
-  eq ( a a -- Bool )
-
-; foreign Ref a
-
-; Cell = Cell (Ref Int)
-
-: same ( Cell Cell -- Bool )
-  eq
-",
-            "no instance for Setoid Cell",
-        );
-        err(
-            "\
-& Setoid a
-  eq ( a a -- Bool )
-
-; foreign Cell a
-
-; Box = Box (Cell Int)
-
-: same ( Box Box -- Bool )
-  eq
-",
-            "no instance for Setoid Box",
-        );
-    }
-
-    #[test]
-    fn showable_and_sortable_and_hashable_are_derived() {
-        ok("\
-& Show a
-  show ( a -- Str )
-
-: showInt ( Int -- Str )
-  drop \"n\"
-
-# Show Int
-  show = showInt
-
-; Person = Person name : Int, age : Int
-
-: shown ( Person -- Str )
-  show
-");
-        ok("\
-& Show a
-  show ( a -- Str )
-
-: showInt ( Int -- Str )
-  drop \"n\"
-
-# Show Int
-  show = showInt
-
-; Answer = No | Yes Int
-
-: shown ( Answer -- Str )
-  show
-");
-        ok("\
-& Show a
-  show ( a -- Str )
-
-; Wrap = Wrap Quiet
-; Quiet = Quiet
-
-: shown ( Wrap -- Str )
-  show
-");
-        ok("\
-& Show a
-  show ( a -- Str )
-
-: showInt ( Int -- Str )
-  drop \"n\"
-
-# Show Int
-  show = showInt
-
-; Person = Person Int
-
-: showPerson ( Person -- Str )
-  drop \"hand\"
-
-# Show Person
-  show = showPerson
-
-: shown ( Person -- Str )
-  show
-");
         err(
             "\
 & Show a
@@ -7042,38 +6179,13 @@ mod tests {
 
 ; Person = Person Int
 
-: bad ( Str Str -- Str )
-  ply_show_cat
+: shown ( Person -- Str )
+  show
 ",
-            "undefined word ply_show_cat",
+            "no instance for Show Person",
         );
         err(
             "\
-& Show a
-  show ( a -- Str )
-
-; Task = Task ( Int -- Int )
-
-: same ( Task -- Str )
-  show
-",
-            "no instance for Show Task",
-        );
-        err(
-            "\
-& Show a
-  show ( a -- Str )
-
-; foreign Ref a
-
-; Cell = Cell (Ref Int)
-
-: same ( Cell -- Str )
-  show
-",
-            "no instance for Show Cell",
-        );
-        ok("\
 & Setoid a
   eq ( a a -- Bool )
 
@@ -7096,35 +6208,11 @@ mod tests {
 
 : ordered ( Answer Answer -- Bool )
   lte
-");
+",
+            "no instance for Ord Answer",
+        );
         err(
             "\
-& Setoid a
-  eq ( a a -- Bool )
-
-& Setoid a => Ord a
-  lte ( a a -- Bool )
-
-: eqInt ( Int Int -- Bool )
-  drop drop true
-
-: lteInt ( Int Int -- Bool )
-  drop drop true
-
-# Setoid Int
-  eq = eqInt
-
-# Ord Int
-  lte = lteInt
-
-; Task = Task ( Int -- Int )
-
-: bad ( Task Task -- Bool )
-  lte
-",
-            "no instance for Ord Task",
-        );
-        ok("\
 & Setoid a
   eq ( a a -- Bool )
 
@@ -7147,6 +6235,29 @@ mod tests {
 
 : hashed ( Person -- Int )
   hash
+",
+            "no instance for Hash Person",
+        );
+        ok("\
+& Show a
+  show ( a -- Str )
+
+: showInt ( Int -- Str )
+  drop \"n\"
+
+# Show Int
+  show = showInt
+
+; Person = Person Int
+
+: showPerson ( Person -- Str )
+  drop \"hand\"
+
+# Show Person
+  show = showPerson
+
+: shown ( Person -- Str )
+  show
 ");
     }
 
@@ -7172,7 +6283,7 @@ mod tests {
         ok("; Person = Person name : Str, age : Num\n\n: person ( -- Person )\n  \"Ada\" 36 Person");
         ok("; Person = Person name : Str, age : Num\n\n: older ( Person -- Person )\n  37 >>age");
         ok(": text ( -- Str )\n  \"ab\"");
-        ok(": hold ( (StrMap Num) -- (StrMap Num) )\n  dup drop");
+        ok("; foreign StrMap a\n\n: hold ( (StrMap Num) -- (StrMap Num) )\n  dup drop");
         err(
             ": bad ( -- (Array Num) )\n  < 1 \"a\" >",
             "type mismatch: expected Num, found Str",
@@ -7182,7 +6293,6 @@ mod tests {
             "Person has no field city",
         );
         err("; Array a = Mk a", "cannot redefine builtin Array");
-        err("; StrMap a = Mk a", "cannot redefine builtin StrMap");
         err(": bad ( Int Int -- Int )\n  iadd", "undefined word iadd");
         err(
             ": bad ( -- (Array Num) )\n  < 1 2 3 > [ dup drop ] amap",

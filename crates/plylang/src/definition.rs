@@ -325,9 +325,6 @@ fn binder_in(term: &Term, tokens: &[Token], offset: u32, name: &str) -> Option<S
             None
         }
         TermNode::Array(inner) => binders_in(inner, tokens, offset, name),
-        TermNode::Record(fields) => fields
-            .iter()
-            .find_map(|(_, value)| binder_in(value, tokens, offset, name)),
         _ => None,
     }
 }

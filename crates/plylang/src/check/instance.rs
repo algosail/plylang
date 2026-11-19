@@ -11,7 +11,7 @@ use crate::span::Span;
 use super::{
     collect_ty_vars, find_def, instance_key, known_at, subst_type, Checker, ClassInfo, ClassMethod,
     DeferredUse, Dict, EffectId, InstanceInfo, InstanceMethod, KnownModule, Memo, ResolvedMethod,
-    RowId, RowNode, Scope, Seen, SemConstraint, SemScheme, StackId, StackNode, Subst, TyId, TyNode,
+    Scope, Seen, SemConstraint, SemScheme, StackId, StackNode, Subst, TyId, TyNode,
 };
 
 impl Checker {
@@ -30,6 +30,34 @@ impl Checker {
             return Ok(());
         }
         self.install_class(class, false)
+    }
+
+    /// `Nullary`, `Unary`, and `Binary` are part of the language. Every module
+    /// sees them. They are not defined by the module, so the orphan rule stays.
+    pub(super) fn install_service_classes(&mut self) {
+        const SOURCE: &str = "\
+& Nullary a
+  checkNullary ( b. b -- Bool )
+
+& Unary f
+  checkUnary ( a. (f a) -- Bool )
+  checkUnary_1 ( a. (f a) (a -- Bool) -- Bool )
+
+& Binary f
+  checkBinary ( a b. (f a b) -- Bool )
+  checkBinary_1 ( a b. (f a b) (a -- Bool) -- Bool )
+  checkBinary_2 ( a b. (f a b) (b -- Bool) -- Bool )
+";
+        let module = crate::parser::parse(SOURCE, crate::paths::ParseMode::Source)
+            .unwrap_or_else(|error| panic!("service classes: {}", error.message));
+        for item in &module.items {
+            let Item::Class(class) = item else {
+                continue;
+            };
+            self.install_class(class, true)
+                .unwrap_or_else(|error| panic!("service class {}: {}", class.name, error.message));
+            self.defined_classes.remove(&class.name);
+        }
     }
 
     fn install_class(&mut self, class: &Class, export_methods: bool) -> Result<(), Diagnostic> {
@@ -477,7 +505,6 @@ impl Checker {
             class_name: class_name.to_string(),
             vars: scope.quantified_tys,
             tails: scope.quantified_tails,
-            rows: scope.quantified_rows,
             args: head,
             methods,
             supers,
@@ -533,14 +560,6 @@ impl Checker {
                 .iter()
                 .chain(&effect.output.items)
                 .any(|ty| self.builtin_in_seen(ty, seen)),
-            Type::Record(row) => {
-                row.fields
-                    .iter()
-                    .any(|(_, ty)| self.builtin_in_seen(ty, seen))
-                    || row
-                        .tail_ty()
-                        .is_some_and(|ty| self.builtin_in_seen(ty, seen))
-            }
             Type::Var(_) => false,
         }
     }
@@ -569,14 +588,6 @@ impl Checker {
                 .iter()
                 .chain(&effect.output.items)
                 .any(|ty| self.defines_type_seen(ty, seen)),
-            Type::Record(row) => {
-                row.fields
-                    .iter()
-                    .any(|(_, ty)| self.defines_type_seen(ty, seen))
-                    || row
-                        .tail_ty()
-                        .is_some_and(|ty| self.defines_type_seen(ty, seen))
-            }
             Type::Var(_) => false,
         }
     }
@@ -715,7 +726,6 @@ impl Checker {
                 self.stack_has_skolem(input, skolems, seen)
                     || self.stack_has_skolem(output, skolems, seen)
             }
-            TyNode::Record(row) => self.row_has_skolem(row, skolems, seen),
             TyNode::Alias { args, body, .. } => {
                 args.into_iter()
                     .any(|arg| self.ty_has_skolem(arg, skolems, seen))
@@ -736,23 +746,6 @@ impl Checker {
                 self.stack_has_skolem(rest, skolems, seen) || self.ty_has_skolem(ty, skolems, seen)
             }
             StackNode::Link(next) => self.stack_has_skolem(next, skolems, seen),
-            _ => false,
-        }
-    }
-
-    fn row_has_skolem(&self, row: RowId, skolems: &[TyId], seen: &mut Seen) -> bool {
-        let row = self.find_row(row);
-        if !seen.row.insert(row) {
-            return false;
-        }
-        match self.rows[row.0 as usize].clone() {
-            RowNode::Fields { fields, tail } => {
-                fields
-                    .into_iter()
-                    .any(|(_, ty)| self.ty_has_skolem(ty, skolems, seen))
-                    || tail.is_some_and(|tail| self.row_has_skolem(tail, skolems, seen))
-            }
-            RowNode::Link(next) => self.row_has_skolem(next, skolems, seen),
             _ => false,
         }
     }
@@ -781,9 +774,6 @@ impl Checker {
         }
         for tail in &method.scheme.tails {
             subst.stack.insert(tail.id, self.stack_var());
-        }
-        for row in &method.scheme.rows {
-            subst.row.insert(row.id, self.row_var());
         }
         for effect in &method.scheme.effect_vars {
             let fresh = if effect.skolem {
@@ -831,9 +821,6 @@ impl Checker {
         }
         for tail in &inst.tails {
             subst.stack.insert(tail.id, self.stack_var());
-        }
-        for row in &inst.rows {
-            subst.row.insert(row.id, self.row_var());
         }
         let mut memo = Memo::default();
         let args = inst
@@ -980,7 +967,6 @@ impl Checker {
         let saved = (
             self.frozen_ty.clone(),
             self.frozen_stack.clone(),
-            self.frozen_row.clone(),
             self.frozen_effect.clone(),
         );
         for arg in &constraint.args {
@@ -1055,8 +1041,7 @@ impl Checker {
         }
         self.frozen_ty = saved.0;
         self.frozen_stack = saved.1;
-        self.frozen_row = saved.2;
-        self.frozen_effect = saved.3;
+        self.frozen_effect = saved.2;
         self.solving.pop();
         if let Some(error) = failure {
             return Err(error);
@@ -1083,7 +1068,6 @@ impl Checker {
             let saved = (
                 self.frozen_ty.clone(),
                 self.frozen_stack.clone(),
-                self.frozen_row.clone(),
                 self.frozen_effect.clone(),
             );
             for arg in assumption.args.iter().chain(&wanted.args) {
@@ -1099,8 +1083,7 @@ impl Checker {
                 .is_ok();
             self.frozen_ty = saved.0;
             self.frozen_stack = saved.1;
-            self.frozen_row = saved.2;
-            self.frozen_effect = saved.3;
+            self.frozen_effect = saved.2;
             if ok {
                 return Some(index);
             }
@@ -1120,7 +1103,6 @@ impl Checker {
         let saved = (
             self.frozen_ty.clone(),
             self.frozen_stack.clone(),
-            self.frozen_row.clone(),
             self.frozen_effect.clone(),
         );
         for arg in wanted {
@@ -1134,8 +1116,7 @@ impl Checker {
         });
         self.frozen_ty = saved.0;
         self.frozen_stack = saved.1;
-        self.frozen_row = saved.2;
-        self.frozen_effect = saved.3;
+        self.frozen_effect = saved.2;
         result
     }
 
@@ -1176,7 +1157,6 @@ impl Checker {
         let saved = (
             self.frozen_ty.clone(),
             self.frozen_stack.clone(),
-            self.frozen_row.clone(),
             self.frozen_effect.clone(),
         );
         for arg in wanted {
@@ -1196,8 +1176,7 @@ impl Checker {
         self.recording = recording;
         self.frozen_ty = saved.0;
         self.frozen_stack = saved.1;
-        self.frozen_row = saved.2;
-        self.frozen_effect = saved.3;
+        self.frozen_effect = saved.2;
         ok
     }
 
@@ -1348,9 +1327,7 @@ impl Checker {
             TyNode::Alias { body, .. } => self.show_ty_named(body, names),
             TyNode::Link(next) => self.show_ty_named(next, names),
             TyNode::Rigid(name) => name,
-            TyNode::Fun(_, _, _) | TyNode::Record(_) | TyNode::Var | TyNode::Template => {
-                self.show_ty(id)
-            }
+            TyNode::Fun(_, _, _) | TyNode::Var | TyNode::Template => self.show_ty(id),
         }
     }
 

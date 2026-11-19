@@ -32,7 +32,7 @@ An omitted stack bottom is the same tail on the left and on the right. An explic
 
 ## Values
 
-Five built-in types and two constructors of arity 1 are visible in every module. They cannot be redefined.
+Five built-in types and `Array` are visible in every module. They cannot be redefined.
 
 | Type   | Literal                  | In JavaScript |
 | ------ | ------------------------ | ------------- |
@@ -40,11 +40,11 @@ Five built-in types and two constructors of arity 1 are visible in every module.
 | `Int`  | `0n`, `42n`, `-42n`      | `bigint`      |
 | `Str`  | `"hi"`, `"a\nb"`         | string        |
 | `Bool` | `true`, `false`          | boolean       |
-| `Unit` | the word `Unit`          | `undefined`   |
+| `Unit` | `unit`                   | `undefined`   |
 
-`(Array a)` is an array. `(StrMap a)` is a dictionary with a string key. Bare digits are `Num`, an ordinary number in JavaScript. `Int` is written with the suffix `n` and becomes a `bigint`. In the examples below a number is `Num`. `1.0` is a number. `1.` is the number `1` and a separate dot. A string accepts `\\`, `\"`, `\n`, `\t`, and `\r`.
+`(Array a)` is an array. Bare digits are `Num`, an ordinary number in JavaScript. `Int` is written with the suffix `n` and becomes a `bigint`. In the examples below a number is `Num`. `1.0` is a number. `1.` is the number `1` and a separate dot. A string accepts `\\`, `\"`, `\n`, `\t`, and `\r`.
 
-`Unit` is both a type and a word. The word puts the single value of that type.
+`unit` is the one value of type `Unit`. It needs no import. `Unit ->` leaves that value when `Nullary` for `Unit` is visible.
 
 Operations on these values are imported. This text does not list them.
 
@@ -129,7 +129,7 @@ When the first line of a body is patterns and `->`, the whole body is equations.
   false -> "false"
 ```
 
-`true` together with `false` covers `Bool`. A literal of `Num`, `Int`, or `Str` does not. `Num ->`, `Int ->`, `Str ->`, `Bool ->`, `Array ->`, and `Unit ->` test the JavaScript shape and leave the value. On a wider type they do not cover the slot, so a later name or `_` remains. The arm sees the word's signature with that shape filled in. The other arms do not.
+`true` together with `false` covers `Bool`. `unit` covers `Unit`. A literal of `Num`, `Int`, or `Str` does not. `Num ->`, `Int ->`, `Str ->`, `Bool ->`, `Array ->`, and `Unit ->` match a visible `Nullary` or `Unary` instance and leave the value. The test calls that instance's word. On a wider type they do not cover the slot, so a later name or `_` remains. The arm sees the word's signature with that shape filled in. The other arms do not. A `; foreign` type is matched the same way when its module defines `Nullary`, `Unary`, or `Binary`.
 
 A bare constructor checks the tag and leaves the value. `(Ctor ..)` spills every field, last on top. `(Just x)` names the one field and does not put it until the name is mentioned. `(Person n _)` is positional: the first field is kept under `n` and the second stays off the stack. `(Person age name)` binds by name, in either order, when every name is a field. `(Person)` is an error. `(Some (Array Num) items)` checks that the field is an array of numbers and names that array. The check runs when the field's type is still open. `(Some (Num) ..)` checks and spills that number. `(Some (Num) _)` only checks. `(Array x)` does not bind `x`.
 
@@ -235,10 +235,10 @@ Zero fields, two fields, or two constructors do not fit `==`. A type with `=` is
 
 ## Dictionary
 
-`(StrMap a)` is a dictionary with key `Str`. The key becomes known at run time and is not named in the type ahead of time. There is no literal. An empty dictionary in JavaScript is `Object.create(null)`.
+`(StrMap a)` comes from `@plylang/prelude/Data/StrMap`. The key is `Str`. The program chooses the key when it runs, and the type does not name that key. There is no literal. An empty dictionary in JavaScript is `Object.create(null)`.
 
 ```ply
-~ "@plylang/prelude/Data/StrMap" emptyStrMap, insertStrMap
+~ "@plylang/prelude/Data/StrMap" StrMap, emptyStrMap, insertStrMap
 
 : ages ( -- (StrMap Num) )
   emptyStrMap "Ada" 36 insertStrMap
@@ -268,7 +268,7 @@ The order in the example is the dictionary, the key, and the value on top.
 
 The instance for numbers is declared in `@plylang/prelude/Data/Num`. The bare import brings the instances of that module and brings no names. That import gives `same` that instance.
 
-A hand-written instance is a word for each method. A module may write one when it defines the class, the type, or the wrapper in the head, or when the head contains a built-in constructor `Int`, `Num`, `Bool`, `Str`, `Unit`, `Array`, or `StrMap`.
+A hand-written instance is a word for each method. A module may write one when it defines the class, the type, or the wrapper in the head, or when the head contains a built-in constructor `Int`, `Num`, `Bool`, `Str`, `Unit`, or `Array`.
 
 ```ply
 & Equal a

@@ -22,9 +22,6 @@ pub enum TokenKind {
     Field(String),
     /// `>>name` replaces a field and returns a new value.
     FieldSet(String),
-    /// Kept so error numbers stay put. The lexer does not produce this token.
-    #[allow(dead_code)]
-    FieldInsert(String),
     /// Bare `..` inside parentheses.
     All,
     /// `.`
@@ -57,10 +54,6 @@ pub enum TokenKind {
     RAngle,
     /// `@` opens the module's name list.
     Export,
-    /// Kept so error numbers stay put. The lexer does not produce this token.
-    LBrace,
-    /// Kept so error numbers stay put. The lexer does not produce this token.
-    RBrace,
     Import,
     Language,
     Data,
@@ -73,6 +66,8 @@ pub enum TokenKind {
     Probe,
     True,
     False,
+    /// The one value of type `Unit`. JavaScript emits `undefined`.
+    Unit,
     /// A `..` line at column 0, outside parentheses. One leading space is already stripped.
     Doc(String),
     Eof,
@@ -84,6 +79,7 @@ pub fn keyword(name: &str) -> Option<TokenKind> {
         "foreign" => TokenKind::Foreign,
         "true" => TokenKind::True,
         "false" => TokenKind::False,
+        "unit" => TokenKind::Unit,
         _ => return None,
     })
 }

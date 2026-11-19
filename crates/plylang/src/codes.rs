@@ -49,7 +49,6 @@ pub enum Error {
     ExpectedPattern,
     ExpectedPatternCount(usize),
     ExpectedFieldName,
-    ExpectedRBrace,
     DuplicateFieldName,
     ExpectedClassArgument,
     ExpectedClassName,
@@ -60,8 +59,6 @@ pub enum Error {
     ExpectedStackArrow,
     StackTailNotBottom,
     ExpectedType,
-    ExpectedRowVariable,
-    ExpectedElement,
     ExpectedName,
     UnterminatedArray,
     UnterminatedQuotation,
@@ -76,12 +73,10 @@ pub enum Error {
         name: String,
         count: usize,
     },
-    DuplicateField(String),
     TypeMismatch {
         expected: String,
         found: String,
     },
-    ExpectedRecord(String),
     ExpectedDataType(String),
     StackUnderflow,
     OccursCheck,
@@ -97,8 +92,6 @@ pub enum Error {
     EffectNotOpen {
         found: String,
     },
-    RecordHasNoField(String),
-    RecordTailOpen,
     QuotationArityUnknown,
     RedundantPattern,
     NonExhaustive,
@@ -229,6 +222,8 @@ pub enum Error {
     ExpectedProbePicture,
     /// A `?` check has no quotation.
     ExpectedProbeProgram,
+    /// A pattern names a parameter of a type whose arity is above two.
+    NoElementTest(String),
 }
 
 impl Error {
@@ -290,7 +285,6 @@ impl Error {
                 format!("expected {count} {}", noun(*count, "pattern", "patterns")),
             ),
             ExpectedFieldName => static_text("PL0035", "expected field name"),
-            ExpectedRBrace => static_text("PL0036", "expected '}'"),
             DuplicateFieldName => static_text("PL0037", "duplicate field name"),
             ExpectedClassArgument => static_text("PL0038", "expected class argument"),
             ExpectedClassName => static_text("PL0039", "expected class name"),
@@ -301,8 +295,6 @@ impl Error {
             ExpectedStackArrow => static_text("PL0044", "expected '--'"),
             StackTailNotBottom => static_text("PL0045", "stack tail must be the bottom"),
             ExpectedType => static_text("PL0046", "expected type"),
-            ExpectedRowVariable => static_text("PL0047", "expected row variable"),
-            ExpectedElement => static_text("PL0048", "expected element"),
             ExpectedName => static_text("PL0049", "expected name"),
             UnterminatedArray => static_text("PL0050", "unterminated array"),
             UnterminatedQuotation => static_text("PL0051", "unterminated quotation"),
@@ -325,14 +317,9 @@ impl Error {
                     noun(*count, "argument", "arguments")
                 ),
             ),
-            DuplicateField(name) => ("PL0060", format!("duplicate field {name}")),
             TypeMismatch { expected, found } => (
                 "PL0061",
                 format!("type mismatch: expected {expected}, found {found}"),
-            ),
-            ExpectedRecord(found) => (
-                "PL0062",
-                format!("type mismatch: expected a record, found {found}"),
             ),
             ExpectedDataType(found) => (
                 "PL0063",
@@ -353,8 +340,6 @@ impl Error {
                 "PL0069",
                 format!("effect mismatch: expected {{ | _ }}, found {found}"),
             ),
-            RecordHasNoField(name) => ("PL0070", format!("record has no field {name}")),
-            RecordTailOpen => static_text("PL0071", "record tail must be closed"),
             QuotationArityUnknown => static_text("PL0072", "quotation arity is not known"),
             RedundantPattern => static_text("PL0073", "redundant pattern"),
             NonExhaustive => static_text("PL0074", "non-exhaustive match"),
@@ -511,6 +496,7 @@ impl Error {
             ExpectedProbeName => static_text("PL0139", "check name must be a string"),
             ExpectedProbePicture => static_text("PL0140", "expected a stack picture"),
             ExpectedProbeProgram => static_text("PL0141", "expected a quotation"),
+            NoElementTest(name) => ("PL0142", format!("{name} has no element test")),
         }
     }
 }
@@ -649,7 +635,6 @@ mod tests {
                 "PL0034",
             ),
             (Error::ExpectedFieldName, "expected field name", "PL0035"),
-            (Error::ExpectedRBrace, "expected '}'", "PL0036"),
             (Error::DuplicateFieldName, "duplicate field name", "PL0037"),
             (
                 Error::ExpectedClassArgument,
@@ -668,12 +653,6 @@ mod tests {
                 "PL0045",
             ),
             (Error::ExpectedType, "expected type", "PL0046"),
-            (
-                Error::ExpectedRowVariable,
-                "expected row variable",
-                "PL0047",
-            ),
-            (Error::ExpectedElement, "expected element", "PL0048"),
             (Error::ExpectedName, "expected name", "PL0049"),
             (Error::UnterminatedArray, "unterminated array", "PL0050"),
             (
@@ -721,22 +700,12 @@ mod tests {
                 "PL0059",
             ),
             (
-                Error::DuplicateField("city".into()),
-                "duplicate field city",
-                "PL0060",
-            ),
-            (
                 Error::TypeMismatch {
                     expected: "Int".into(),
                     found: "Str".into(),
                 },
                 "type mismatch: expected Int, found Str",
                 "PL0061",
-            ),
-            (
-                Error::ExpectedRecord("Int".into()),
-                "type mismatch: expected a record, found Int",
-                "PL0062",
             ),
             (
                 Error::ExpectedDataType("Int".into()),
@@ -772,16 +741,6 @@ mod tests {
                 },
                 "effect mismatch: expected { | _ }, found { console }",
                 "PL0069",
-            ),
-            (
-                Error::RecordHasNoField("age".into()),
-                "record has no field age",
-                "PL0070",
-            ),
-            (
-                Error::RecordTailOpen,
-                "record tail must be closed",
-                "PL0071",
             ),
             (
                 Error::QuotationArityUnknown,
@@ -1132,8 +1091,13 @@ mod tests {
                 "expected a quotation",
                 "PL0141",
             ),
+            (
+                Error::NoElementTest("Triple".into()),
+                "Triple has no element test",
+                "PL0142",
+            ),
         ];
-        assert_eq!(samples.len(), 142);
+        assert_eq!(samples.len(), 136);
         for (error, message, code) in samples {
             assert_eq!(error.code(), code, "{message}");
             assert_eq!(error.message(), message);
