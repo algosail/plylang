@@ -7,8 +7,8 @@ use lsp_types::{
     TextDocumentSyncCapability, TextDocumentSyncKind,
 };
 use plylang::{
-    buffer_notes_open, complete, definition, hover_with_sites, utf16_position, CompletionKind,
-    StackAt,
+    buffer_notes_editor, complete, definition, hover_with_sites, utf16_position, CompletionKind,
+    OpenFault, OpenText, Related, StackAt,
 };
 use serde::Deserialize;
 
@@ -104,19 +104,21 @@ fn serve(connection: Connection) -> Result<(), String> {
                     continue;
                 }
                 if let Some((uri, text)) = document_text(&notification) {
-                    docs.insert(
-                        uri.clone(),
-                        Opened {
-                            text,
-                            sites: Vec::new(),
-                            deps: Vec::new(),
-                        },
-                    );
+                    let before = docs.get(&uri).and_then(|opened| opened.surface.clone());
+                    match docs.get_mut(&uri) {
+                        Some(opened) => opened.text = text,
+                        None => {
+                            docs.insert(uri.clone(), Opened::new(text));
+                        }
+                    }
                     refresh(&connection, &mut docs, &uri)?;
-                    let path = canonical_path(&uri);
-                    let stale = importers_of(&docs, &path, &uri);
-                    for other in stale {
-                        refresh(&connection, &mut docs, &other)?;
+                    let after = docs.get(&uri).and_then(|opened| opened.surface.clone());
+                    if before != after {
+                        let path = canonical_path(&uri);
+                        let stale = importers_of(&docs, &path, &uri);
+                        for other in stale {
+                            refresh(&connection, &mut docs, &other)?;
+                        }
                     }
                 }
             }
@@ -299,25 +301,48 @@ fn closed_uri(notification: &Notification) -> Option<String> {
     Some(params.text_document.uri)
 }
 
-fn publish(uri: &str, text: &str, errors: &[plylang::Diagnostic]) -> Notification {
-    let diagnostics = errors
-        .iter()
-        .map(|error| {
-            let (start_line, start_character) = utf16_position(text, error.span.start);
-            let (end_line, end_character) = utf16_position(text, error.span.end);
-            serde_json::json!({
-                "range": {
-                    "start": { "line": start_line, "character": start_character },
-                    "end": { "line": end_line, "character": end_character },
-                },
-                "severity": 1,
-                "source": "plylang",
-                "code": error.code,
-                "codeDescription": { "href": error.url() },
-                "message": error.reported(),
-            })
-        })
-        .collect::<Vec<_>>();
+fn publish(
+    uri: &str,
+    text: &str,
+    notes: &plylang::BufferNotes,
+    docs: &HashMap<String, Opened>,
+) -> Notification {
+    let mut diagnostics = Vec::new();
+    for error in &notes.errors {
+        let (start_line, start_character) = utf16_position(text, error.span.start);
+        let (end_line, end_character) = utf16_position(text, error.span.end);
+        let mut value = serde_json::json!({
+            "range": {
+                "start": { "line": start_line, "character": start_character },
+                "end": { "line": end_line, "character": end_character },
+            },
+            "severity": 1,
+            "source": "plylang",
+            "code": error.code,
+            "codeDescription": { "href": error.url() },
+            "message": error.reported(),
+        });
+        attach_related(&mut value, docs, error.related.as_ref());
+        diagnostics.push(value);
+    }
+    for hint in &notes.hints {
+        let (start_line, start_character) = utf16_position(text, hint.span.start);
+        let (end_line, end_character) = utf16_position(text, hint.span.end);
+        let mut value = serde_json::json!({
+            "range": {
+                "start": { "line": start_line, "character": start_character },
+                "end": { "line": end_line, "character": end_character },
+            },
+            "severity": 4,
+            "source": "plylang",
+            "message": hint.message,
+        });
+        if hint.unnecessary {
+            value["tags"] = serde_json::json!([1]);
+        }
+        attach_related(&mut value, docs, hint.related.as_ref());
+        diagnostics.push(value);
+    }
     Notification {
         method: "textDocument/publishDiagnostics".to_string(),
         params: serde_json::json!({
@@ -327,8 +352,44 @@ fn publish(uri: &str, text: &str, errors: &[plylang::Diagnostic]) -> Notificatio
     }
 }
 
-/// The changed buffer is published, then every open file that loaded it.
-/// The check reads those open buffers, so an unsaved export is already visible.
+fn attach_related(
+    value: &mut serde_json::Value,
+    docs: &HashMap<String, Opened>,
+    related: Option<&Related>,
+) {
+    let Some(related) = related else {
+        return;
+    };
+    value["relatedInformation"] = serde_json::json!([related_information(docs, related)]);
+}
+
+fn related_information(docs: &HashMap<String, Opened>, related: &Related) -> serde_json::Value {
+    let path = PathBuf::from(&related.path);
+    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+    let text = docs
+        .iter()
+        .find_map(|(uri, opened)| (canonical_path(uri) == canonical).then(|| opened.text.clone()))
+        .or_else(|| std::fs::read_to_string(&canonical).ok())
+        .unwrap_or_default();
+    let (start_line, start_character) = utf16_position(&text, related.span.start);
+    let (end_line, end_character) = utf16_position(&text, related.span.end);
+    let uri = url::Url::from_file_path(&canonical)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| related.path.clone());
+    serde_json::json!({
+        "location": {
+            "uri": uri,
+            "range": {
+                "start": { "line": start_line, "character": start_character },
+                "end": { "line": end_line, "character": end_character },
+            }
+        },
+        "message": related.message,
+    })
+}
+
+/// Publish this buffer. Callers recheck an importer when this file's surface
+/// changes, including the step from a surface to none and back.
 fn refresh(
     connection: &Connection,
     docs: &mut HashMap<String, Opened>,
@@ -337,11 +398,22 @@ fn refresh(
     let notes = notes_of(docs, uri);
     let notification = {
         let text = &docs[uri].text;
-        publish(uri, text, &notes.errors)
+        publish(uri, text, &notes, docs)
     };
     if let Some(opened) = docs.get_mut(uri) {
         opened.sites = notes.sites;
         opened.deps = notes.deps;
+        if let Some(surface) = notes.surface {
+            opened.checked = Some(opened.text.clone());
+            opened.surface = Some(surface);
+            opened.fault = None;
+        } else {
+            opened.surface = None;
+            opened.fault = notes.error.map(|error| OpenFault {
+                span: error.span,
+                message: error.message,
+            });
+        }
     }
     connection
         .sender
@@ -351,15 +423,30 @@ fn refresh(
 
 fn notes_of(docs: &HashMap<String, Opened>, uri: &str) -> plylang::BufferNotes {
     let path = uri_path(uri);
-    let mut files = Vec::new();
+    let mut held = Vec::new();
     for (other, opened) in docs {
-        files.push((uri_path(other), opened.text.as_str()));
+        let broken = opened.surface.is_none();
+        held.push((
+            uri_path(other),
+            opened.text.as_str(),
+            if broken {
+                opened.checked.as_deref()
+            } else {
+                None
+            },
+            if broken { opened.fault.as_ref() } else { None },
+        ));
     }
-    let open: Vec<(&Path, &str)> = files
+    let open: Vec<OpenText<'_>> = held
         .iter()
-        .map(|(file, text)| (Path::new(file.as_str()), *text))
+        .map(|(file, text, checked, fault)| OpenText {
+            path: Path::new(file.as_str()),
+            text,
+            checked: *checked,
+            fault: *fault,
+        })
         .collect();
-    buffer_notes_open(Path::new(&path), &docs[uri].text, &open)
+    buffer_notes_editor(Path::new(&path), &docs[uri].text, &open)
 }
 
 fn importers_of(docs: &HashMap<String, Opened>, path: &Path, skip: &str) -> Vec<String> {
@@ -405,6 +492,25 @@ struct Opened {
     sites: Vec<StackAt>,
     /// Canonical paths loaded by the last check of this buffer.
     deps: Vec<PathBuf>,
+    /// Last text whose check produced a surface.
+    checked: Option<String>,
+    /// Fingerprint of that surface. `None` while the file does not check.
+    surface: Option<String>,
+    /// The error in `text` while `surface` is `None`.
+    fault: Option<OpenFault>,
+}
+
+impl Opened {
+    fn new(text: String) -> Self {
+        Self {
+            text,
+            sites: Vec::new(),
+            deps: Vec::new(),
+            checked: None,
+            surface: None,
+            fault: None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1377,6 +1483,274 @@ mod tests {
             }))
             .unwrap();
         server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn fades_an_unused_import() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("plylang-ls-unused-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            "{\n  \"ply\": { \"language\": 1, \"source\": \"src\", \"out\": \"dist\" }\n}\n",
+        )
+        .unwrap();
+        let host = "@ spare, kept\n\n: spare ( -- Num )\n  1\n\n: kept ( -- Num )\n  1\n";
+        let app = "@ go\n~ \"Host\" spare, kept\n\n: go ( -- Num )\n  kept\n";
+        std::fs::write(root.join("src/Host.ply"), host).unwrap();
+        std::fs::write(root.join("src/App.ply"), app).unwrap();
+        let app_uri = url::Url::from_file_path(root.join("src/App.ply"))
+            .unwrap()
+            .to_string();
+
+        let (server, client) = Connection::memory();
+        let server = thread::spawn(move || serve(server));
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(1),
+                method: "initialize".to_string(),
+                params: json!({ "processId": null, "capabilities": {} }),
+            }))
+            .unwrap();
+        client
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("initialize response");
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "initialized".to_string(),
+                params: json!({}),
+            }))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "textDocument/didOpen".to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": app_uri,
+                        "languageId": "ply",
+                        "version": 1,
+                        "text": app,
+                    }
+                }),
+            }))
+            .unwrap();
+        let published = drain_diagnostics(&client);
+        assert_eq!(published.len(), 1, "{published:?}");
+        let diagnostics = published[0]["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0]["severity"], 4);
+        assert_eq!(diagnostics[0]["tags"], json!([1]));
+        assert_eq!(diagnostics[0]["message"], "unused word spare");
+        assert_eq!(diagnostics[0]["range"]["start"]["line"], 1);
+        let column = app.lines().nth(1).unwrap().find("spare").unwrap() as u64;
+        let start = diagnostics[0]["range"]["start"]["character"]
+            .as_u64()
+            .unwrap();
+        let end = diagnostics[0]["range"]["end"]["character"]
+            .as_u64()
+            .unwrap();
+        assert_eq!((start, end), (column, column + 5));
+
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(2),
+                method: "shutdown".to_string(),
+                params: json!(null),
+            }))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "exit".to_string(),
+                params: json!(null),
+            }))
+            .unwrap();
+        server.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_body_edit_does_not_republish_importers() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("plylang-ls-surface-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(root.join("src/Data")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            "{\n  \"ply\": { \"language\": 1, \"source\": \"src\", \"out\": \"dist\" }\n}\n",
+        )
+        .unwrap();
+        let good = "@ answer\n\n: answer ( -- Num )\n  1\n";
+        let body = "@ answer\n\n: answer ( -- Num )\n  2\n";
+        let scheme = "@ answer\n\n: answer ( -- Str )\n  \"a\"\n";
+        let hidden = "@\n\n: answer ( -- Num )\n  1\n";
+        let broken = "@ answer\n\n:::\n";
+        let broken_more = "@ answer\n\n::::\n";
+        let app = "@ go\n~ \"Data/Lib\" answer\n\n: go ( -- Num )\n  answer\n";
+        std::fs::write(root.join("src/Data/Lib.ply"), good).unwrap();
+        std::fs::write(root.join("src/App.ply"), app).unwrap();
+        let lib_uri = url::Url::from_file_path(root.join("src/Data/Lib.ply"))
+            .unwrap()
+            .to_string();
+        let app_uri = url::Url::from_file_path(root.join("src/App.ply"))
+            .unwrap()
+            .to_string();
+
+        let (server, client) = Connection::memory();
+        let server = thread::spawn(move || serve(server));
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(1),
+                method: "initialize".to_string(),
+                params: json!({ "processId": null, "capabilities": {} }),
+            }))
+            .unwrap();
+        client
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("initialize response");
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "initialized".to_string(),
+                params: json!({}),
+            }))
+            .unwrap();
+        for (uri, text) in [(&lib_uri, good), (&app_uri, app)] {
+            client
+                .sender
+                .send(Message::Notification(Notification {
+                    method: "textDocument/didOpen".to_string(),
+                    params: json!({
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": "ply",
+                            "version": 1,
+                            "text": text,
+                        }
+                    }),
+                }))
+                .unwrap();
+            let opened = drain_diagnostics(&client);
+            assert_eq!(opened.len(), 1, "{opened:?}");
+            assert_eq!(opened[0]["uri"], *uri);
+            assert!(
+                opened[0]["diagnostics"].as_array().unwrap().is_empty(),
+                "{opened:?}"
+            );
+        }
+
+        let change = |text: &str| {
+            client
+                .sender
+                .send(Message::Notification(Notification {
+                    method: "textDocument/didChange".to_string(),
+                    params: json!({
+                        "textDocument": { "uri": lib_uri },
+                        "contentChanges": [{ "text": text }],
+                    }),
+                }))
+                .unwrap();
+        };
+
+        change(body);
+        let published = drain_diagnostics(&client);
+        assert_eq!(published.len(), 1, "{published:?}");
+        assert_eq!(published[0]["uri"], lib_uri);
+
+        change(scheme);
+        let published = drain_diagnostics(&client);
+        assert_eq!(published.len(), 2, "{published:?}");
+        assert_eq!(published[0]["uri"], lib_uri);
+        assert_eq!(published[1]["uri"], app_uri);
+        let message = published[1]["diagnostics"][0]["message"].as_str().unwrap();
+        assert!(message.contains("type mismatch"), "{message}");
+
+        change(hidden);
+        let published = drain_diagnostics(&client);
+        assert_eq!(published.len(), 2, "{published:?}");
+        assert_eq!(published[1]["uri"], app_uri);
+        let diagnostic = &published[1]["diagnostics"][0];
+        let message = diagnostic["message"].as_str().unwrap();
+        assert!(message.starts_with("PL0091:"), "{message}");
+        assert!(message.contains("does not export answer"), "{message}");
+        let related = &diagnostic["relatedInformation"][0];
+        assert!(
+            related["location"]["uri"]
+                .as_str()
+                .unwrap()
+                .contains("Lib.ply"),
+            "{related}"
+        );
+        assert_eq!(related["message"], "does not export answer");
+        assert_eq!(related["location"]["range"]["start"]["line"], 0);
+        assert_eq!(related["location"]["range"]["start"]["character"], 0);
+
+        change(broken);
+        let published = drain_diagnostics(&client);
+        assert_eq!(published.len(), 2, "{published:?}");
+        let diagnostics = published[1]["diagnostics"].as_array().unwrap();
+        let hint = diagnostics
+            .iter()
+            .find(|item| item["message"].as_str().unwrap().contains("does not check"))
+            .expect("stale hint");
+        assert_eq!(hint["severity"], 4);
+        assert!(hint.get("tags").is_none(), "{hint}");
+        assert_eq!(hint["message"], "Data/Lib does not check");
+        let jump = &hint["relatedInformation"][0];
+        assert!(
+            jump["location"]["uri"]
+                .as_str()
+                .unwrap()
+                .contains("Lib.ply"),
+            "{jump}"
+        );
+        assert!(!jump["message"].as_str().unwrap().is_empty());
+
+        change(broken_more);
+        let published = drain_diagnostics(&client);
+        assert_eq!(published.len(), 1, "{published:?}");
+        assert_eq!(published[0]["uri"], lib_uri);
+
+        change(good);
+        let published = drain_diagnostics(&client);
+        assert_eq!(published.len(), 2, "{published:?}");
+        assert_eq!(published[1]["uri"], app_uri);
+        assert!(
+            published[1]["diagnostics"].as_array().unwrap().is_empty(),
+            "{published:?}"
+        );
+
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(2),
+                method: "shutdown".to_string(),
+                params: json!(null),
+            }))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "exit".to_string(),
+                params: json!(null),
+            }))
+            .unwrap();
+        server.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn drain_diagnostics(client: &Connection) -> Vec<serde_json::Value> {

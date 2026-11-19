@@ -150,6 +150,7 @@ impl Parser {
     }
 
     fn parse_public_list(&mut self) -> Result<PublicList, Diagnostic> {
+        let span = self.cur().span;
         self.bump();
         let mut names = Vec::new();
         loop {
@@ -172,7 +173,7 @@ impl Parser {
             }
             return Err(self.error(Error::ExpectedName));
         }
-        Ok(PublicList { names })
+        Ok(PublicList { span, names })
     }
 
     /// The name list is over when the next column-0 declaration, a doc, or
@@ -207,6 +208,7 @@ impl Parser {
                 path,
                 names: Vec::new(),
                 alias: None,
+                alias_span: None,
             });
         }
         if self.is(TokenKind::Colon) && !self.at_column_0() {
@@ -225,6 +227,7 @@ impl Parser {
                 path,
                 names: Vec::new(),
                 alias: Some(alias),
+                alias_span: Some(alias_span),
             });
         }
         let mut names = Vec::new();
@@ -240,17 +243,23 @@ impl Parser {
             let name_span = self.cur().span;
             let remote = self.expect_ident(Error::ExpectedImportedName)?;
             let mut local = remote.clone();
+            let mut span = name_span;
             if self.is(TokenKind::Colon) && !self.at_column_0() {
                 self.bump();
                 let local_span = self.cur().span;
                 local = self.expect_ident(Error::ExpectedName)?;
+                span = local_span;
                 if !seen.insert(local.clone()) {
                     return Err(self.error_at(local_span, Error::DuplicateDefinition(local)));
                 }
             } else if !seen.insert(local.clone()) {
                 return Err(self.error_at(name_span, Error::DuplicateDefinition(local)));
             }
-            names.push(ImportedName { remote, local });
+            names.push(ImportedName {
+                remote,
+                local,
+                span,
+            });
             self.skip_newlines();
             if self.eat(&TokenKind::Comma) {
                 continue;
@@ -265,6 +274,7 @@ impl Parser {
             path,
             names,
             alias: None,
+            alias_span: None,
         })
     }
 

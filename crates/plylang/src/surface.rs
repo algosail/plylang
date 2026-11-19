@@ -9,7 +9,10 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use crate::ast::{Class, Data, Def, Exports, Instance, Item, Module, Place, Synonym, Type};
+use crate::ast::{
+    scheme_string, type_string, Class, Data, Def, Exports, Instance, Item, Module, Place, Synonym,
+    Type,
+};
 
 pub(crate) enum Found {
     Data(Data),
@@ -273,4 +276,85 @@ fn def_published(module: &Module, def: &Def) -> bool {
         Exports::List(list) => list.has(&def.name),
         Exports::Closed => false,
     }
+}
+
+/// Names and schemes this file publishes. A body is not part of it.
+/// A re-exported name is only the name: its scheme lives in the dependency.
+pub(crate) fn surface_key(module: &Module) -> String {
+    let names = public_names(module);
+    let mut out = names.join(",");
+    for name in &names {
+        if let Some(detail) = published_detail(module, name) {
+            out.push('\n');
+            out.push_str(&detail);
+        }
+    }
+    out
+}
+
+fn published_detail(module: &Module, name: &str) -> Option<String> {
+    for item in &module.items {
+        match item {
+            Item::Def(def) if def.name == name => {
+                return Some(format!("word {name} {}", scheme_string(&def.scheme)));
+            }
+            Item::Place(place) if place.name == name => {
+                return Some(format!("place {name} {}", type_string(&place.ty)));
+            }
+            Item::Data(data) if data.name == name => {
+                return Some(data_line(data));
+            }
+            Item::Synonym(synonym) if synonym.name == name => {
+                return Some(format!("synonym {name} {}", type_string(&synonym.rhs)));
+            }
+            Item::Class(class) if class.name == name => {
+                return Some(class_line(class));
+            }
+            _ => {}
+        }
+    }
+    for item in &module.items {
+        if let Item::Data(data) = item {
+            if let Some(ctor) = data.ctors.iter().find(|ctor| ctor.name == name) {
+                let fields = ctor
+                    .fields
+                    .iter()
+                    .map(|field| type_string(&field.ty))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                return Some(format!("ctor {name} {fields}"));
+            }
+        }
+        if let Item::Class(class) = item {
+            if let Some(method) = class.methods.iter().find(|method| method.name == name) {
+                return Some(format!("method {name} {}", scheme_string(&method.scheme)));
+            }
+        }
+    }
+    None
+}
+
+fn data_line(data: &Data) -> String {
+    if data.params.is_empty() {
+        format!("type {}", data.name)
+    } else {
+        format!("type {} {}", data.name, data.params.join(" "))
+    }
+}
+
+fn class_line(class: &Class) -> String {
+    let mut line = if class.params.is_empty() {
+        format!("class {}", class.name)
+    } else {
+        format!("class {} {}", class.name, class.params.join(" "))
+    };
+    for method in &class.methods {
+        line.push('\n');
+        line.push_str(&format!(
+            "method {} {}",
+            method.name,
+            scheme_string(&method.scheme)
+        ));
+    }
+    line
 }

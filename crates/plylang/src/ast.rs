@@ -24,6 +24,8 @@ pub enum Exports {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublicList {
+    /// The `@` token. A jump from an importer lands here.
+    pub span: Span,
     pub names: Vec<ExportedName>,
 }
 
@@ -53,6 +55,8 @@ impl Exports {
 pub struct ImportedName {
     pub remote: String,
     pub local: String,
+    /// The local name as written. A rename `send : busSend` spans `busSend`.
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +67,8 @@ pub struct Import {
     pub names: Vec<ImportedName>,
     /// `: Alias` opens every published name as `Alias:name`.
     pub alias: Option<String>,
+    /// The alias ident. Set only together with `alias`.
+    pub alias_span: Option<Span>,
 }
 
 impl Import {

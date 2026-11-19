@@ -25,13 +25,13 @@ use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::ast::{
-    Class, Def, EffectRow, Exports, Import, Item, Lit, Module, Place, Scheme, Stack, StackEffect,
-    StackTail, Synonym, Term, TermNode, Type, Vis,
+    Class, Def, EffectRow, Exports, Import, ImportedName, Item, Lit, Module, Place, Scheme, Stack,
+    StackEffect, StackTail, Synonym, Term, TermNode, Type, Vis,
 };
 
 use crate::builtin;
 use crate::codes::Error;
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Diagnostic, Related};
 use crate::parser::parse;
 use crate::paths::ParseMode;
 use crate::span::Span;
@@ -152,12 +152,15 @@ pub(crate) struct ImportNotes {
     /// Every error from this pass, in the order the checker found them.
     pub errors: Vec<Diagnostic>,
     pub sites: Vec<StackAt>,
+    /// `prepare` registered this module's signatures. A body error leaves it set.
+    pub surface_ready: bool,
 }
 
 fn bare_error(error: Diagnostic) -> ImportNotes {
     ImportNotes {
         errors: vec![error],
         sites: Vec::new(),
+        surface_ready: false,
     }
 }
 
@@ -172,11 +175,11 @@ pub(crate) fn check_and_note(
         if let Err(error) = checker.stage_local_types(module) {
             return bare_error(error);
         }
+        let mut import_errors = Vec::new();
         for imported in imports {
-            if let Err(error) =
-                checker.import_resolved(imported.provider, imported.import, imported.known)
-            {
-                return bare_error(error);
+            match checker.import_noting(imported.provider, imported.import, imported.known) {
+                Ok(errors) => import_errors.extend(errors),
+                Err(error) => return bare_error(error),
             }
         }
         if let Err(error) = checker.register_local_classes(module) {
@@ -188,18 +191,26 @@ pub(crate) fn check_and_note(
             }
         }
         if let Err(error) = checker.prepare(module) {
-            return bare_error(error);
+            import_errors.push(error);
+            return ImportNotes {
+                errors: import_errors,
+                sites: checker.render_sites(),
+                surface_ready: false,
+            };
         }
         let failed = checker.check_bodies(module).err();
-        let errors = checker.take_errors(failed);
+        let mut errors = checker.take_errors(failed);
         let sites = checker.render_sites();
-        if !errors.is_empty() {
-            return ImportNotes { errors, sites };
+        if errors.is_empty() {
+            if let Some(error) = checker.lower_prepared(module).err() {
+                errors.push(error);
+            }
         }
-        let error = checker.lower_prepared(module).err();
+        import_errors.append(&mut errors);
         ImportNotes {
-            errors: error.into_iter().collect(),
+            errors: import_errors,
             sites,
+            surface_ready: true,
         }
     })
 }
@@ -232,11 +243,15 @@ pub(crate) fn collect_sites(module: &Module) -> Vec<StackAt> {
 
 /// Notes for one module that has no imports to install. The same pass as
 /// [`check`] plus the sites a hover reads. Every definition is checked.
-pub(crate) fn module_notes(module: &Module) -> (Vec<Diagnostic>, Vec<StackAt>) {
+pub(crate) fn module_notes(module: &Module) -> (Vec<Diagnostic>, Vec<StackAt>, bool) {
     with_checker(|checker| {
-        let failed = checker.check_module(module).err();
+        checker.check_probes = true;
+        if let Err(error) = checker.prepare(module) {
+            return (vec![error], checker.render_sites(), false);
+        }
+        let failed = checker.check_bodies(module).err();
         let errors = checker.take_errors(failed);
-        (errors, checker.render_sites())
+        (errors, checker.render_sites(), true)
     })
 }
 
@@ -1253,12 +1268,35 @@ impl Checker {
 
     /// Bring the selected public names of `provider` into scope.
     /// `known` includes `provider` and the modules its signatures mention.
+    /// The first missing name fails the check. `plylang check` uses this.
     pub(crate) fn import_resolved(
         &mut self,
         provider: &Module,
         import: &Import,
         known: &[KnownModule],
     ) -> Result<(), Diagnostic> {
+        self.import_names(provider, import, known, false)
+            .map(|_| ())
+    }
+
+    /// Editor path. A missing name is recorded and skipped. The names that
+    /// are published still bind. Staging a type or a class still fails the check.
+    fn import_noting(
+        &mut self,
+        provider: &Module,
+        import: &Import,
+        known: &[KnownModule],
+    ) -> Result<Vec<Diagnostic>, Diagnostic> {
+        self.import_names(provider, import, known, true)
+    }
+
+    fn import_names(
+        &mut self,
+        provider: &Module,
+        import: &Import,
+        known: &[KnownModule],
+        noting: bool,
+    ) -> Result<Vec<Diagnostic>, Diagnostic> {
         let saved = std::mem::take(&mut self.extra_arity);
         for known_module in known {
             for item in &known_module.module.items {
@@ -1281,7 +1319,7 @@ impl Checker {
                 }
             }
         }
-        let result = self.import_with_extra(provider, import, known);
+        let result = self.import_with_extra(provider, import, known, noting);
         self.extra_arity = saved;
         result
     }
@@ -1291,7 +1329,8 @@ impl Checker {
         _provider: &Module,
         import: &Import,
         known: &[KnownModule],
-    ) -> Result<(), Diagnostic> {
+        noting: bool,
+    ) -> Result<Vec<Diagnostic>, Diagnostic> {
         self.stash_known_synonyms(known);
         let none = HashSet::new();
         for known_module in known {
@@ -1321,17 +1360,39 @@ impl Checker {
             .map(|known_module| known_module.origin.as_str())
             .unwrap_or("");
         let surface = surface_names(origin, known);
+        let mut noted = Vec::new();
         if import.alias.is_none() {
             for imported in &import.names {
-                if !surface.iter().any(|have| have == &imported.remote) {
-                    return Err(self.import_missing(import, &imported.remote));
+                if surface.iter().any(|have| have == &imported.remote) {
+                    continue;
                 }
+                let error = if noting {
+                    self.missing_name(import, imported, origin, known)
+                } else {
+                    self.import_missing(import, &imported.remote)
+                };
+                if !noting {
+                    return Err(error);
+                }
+                noted.push(error);
             }
         }
         for (remote, local) in import.bindings(&surface) {
-            self.export_surface_name(origin, &remote, &local, &remote, import, known)?;
+            if let Err(error) =
+                self.export_surface_name(origin, &remote, &local, &remote, import, known)
+            {
+                let error = if noting {
+                    self.pin_missing(error, import, &local, &remote, origin, known)
+                } else {
+                    error
+                };
+                if !noting {
+                    return Err(error);
+                }
+                noted.push(error);
+            }
         }
-        Ok(())
+        Ok(noted)
     }
 
     /// Instances of `known`, after this module's classes exist.
@@ -1444,6 +1505,93 @@ impl Checker {
                 name: name.to_string(),
             },
         )
+    }
+
+    /// The editor underlines the imported name and jumps to the `@` that lost it.
+    fn missing_name(
+        &self,
+        import: &Import,
+        imported: &ImportedName,
+        origin: &str,
+        known: &[KnownModule],
+    ) -> Diagnostic {
+        let error = self.error(
+            imported.span,
+            Error::ImportNotExported {
+                path: import.path.to_string(),
+                name: imported.remote.clone(),
+            },
+        );
+        match self.export_break(origin, &imported.remote, &imported.remote, known) {
+            Some(related) => error.relate(related),
+            None => error,
+        }
+    }
+
+    fn pin_missing(
+        &self,
+        mut error: Diagnostic,
+        import: &Import,
+        local: &str,
+        remote: &str,
+        origin: &str,
+        known: &[KnownModule],
+    ) -> Diagnostic {
+        if let Some(name) = import.names.iter().find(|item| item.local == local) {
+            error.span = name.span;
+        }
+        if error.code == "PL0091" {
+            if let Some(related) = self.export_break(origin, remote, remote, known) {
+                error.related = Some(related);
+            }
+        }
+        error
+    }
+
+    /// The module whose `@` drops `name`. A re-export is followed to that module.
+    fn export_break(
+        &self,
+        origin: &str,
+        name: &str,
+        asked: &str,
+        known: &[KnownModule],
+    ) -> Option<Related> {
+        self.export_break_seen(origin, name, asked, known, &mut HashSet::new())
+    }
+
+    fn export_break_seen(
+        &self,
+        origin: &str,
+        name: &str,
+        asked: &str,
+        known: &[KnownModule],
+        seen: &mut HashSet<String>,
+    ) -> Option<Related> {
+        if !seen.insert(origin.to_string()) {
+            return None;
+        }
+        let known_module = known_at(known, origin)?;
+        let module = &known_module.module;
+        let here = Related {
+            path: known_module.origin.clone(),
+            span: public_mark(module),
+            message: format!("does not export {asked}"),
+        };
+        if !name_on_surface(module, name) || module_has_public(module, name) {
+            return Some(here);
+        }
+        for (index, child) in module.imports.iter().enumerate() {
+            let Some(dep) = known_module.deps.get(index) else {
+                continue;
+            };
+            let Some(remote) = child.remote_of(name) else {
+                continue;
+            };
+            if let Some(found) = self.export_break_seen(dep, remote, asked, known, seen) {
+                return Some(found);
+            }
+        }
+        Some(here)
     }
 
     /// A published scheme may name a type from the import closure. A type that
@@ -4684,6 +4832,14 @@ fn name_on_surface(module: &Module, name: &str) -> bool {
     match &module.exports {
         Exports::List(list) => list.has(name),
         Exports::Closed => false,
+    }
+}
+
+/// The `@` token, or a zero-width span at the start when the file has no list.
+fn public_mark(module: &Module) -> Span {
+    match &module.exports {
+        Exports::List(list) => list.span,
+        Exports::Closed => Span::new(module.span.start as usize, module.span.start as usize),
     }
 }
 

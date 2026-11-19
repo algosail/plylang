@@ -38,7 +38,7 @@ use crate::check::{
     module_notes, KnownModule, ResolvedImport, StackAt,
 };
 use crate::codes::{error_url, Error};
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Diagnostic, Hint, Related};
 use crate::parser::parse;
 use crate::paths::{mode_from_path, module_name_from_path, ParseMode};
 use crate::span::{line_col, Span};
@@ -628,6 +628,13 @@ pub struct BufferNotes {
     /// Canonical paths this check loaded, including a module reached through a
     /// closed file. An open importer is stale when one of these files changes.
     pub deps: Vec<PathBuf>,
+    /// Unused imported words, types, classes, and places. The editor fades them.
+    /// A module that does not check is a hint here too, without the fade.
+    /// `plylang check` does not read this.
+    pub hints: Vec<Hint>,
+    /// Published names and schemes of this buffer. `None` when it does not
+    /// parse or its signatures do not register. A body error leaves it set.
+    pub surface: Option<String>,
 }
 
 fn assemble_notes(
@@ -635,6 +642,8 @@ fn assemble_notes(
     mut errors: Vec<Diagnostic>,
     sites: Vec<StackAt>,
     deps: Vec<PathBuf>,
+    hints: Vec<Hint>,
+    surface: Option<String>,
 ) -> BufferNotes {
     if let Some(entry) = entry {
         errors.insert(0, entry);
@@ -644,6 +653,8 @@ fn assemble_notes(
         errors,
         sites,
         deps,
+        hints,
+        surface,
     }
 }
 
@@ -671,11 +682,44 @@ pub fn buffer_notes(path: &Path, source: &str) -> BufferNotes {
     buffer_notes_open(path, source, &[])
 }
 
+/// The error in an open file whose current text does not check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenFault {
+    pub span: Span,
+    pub message: String,
+}
+
+/// One open file. `checked` is the last text that still had a surface.
+/// The loader uses it only when it is `Some`. `fault` is the error in `text`.
+pub struct OpenText<'a> {
+    pub path: &'a Path,
+    pub text: &'a str,
+    pub checked: Option<&'a str>,
+    pub fault: Option<&'a OpenFault>,
+}
+
 /// Check one buffer. `open` is unsaved editor text, as `(path, text)`.
 /// A loaded file that is open is read from that text. A closed file is read
 /// from disk. The buffer being checked is `source`, even when `open` also
 /// names its path.
 pub fn buffer_notes_open(path: &Path, source: &str, open: &[(&Path, &str)]) -> BufferNotes {
+    let rows: Vec<OpenText<'_>> = open
+        .iter()
+        .map(|(file, text)| OpenText {
+            path: file,
+            text,
+            checked: None,
+            fault: None,
+        })
+        .collect();
+    buffer_notes_editor(path, source, &rows)
+}
+
+/// Check one buffer the way the language server does.
+/// A dependency whose `checked` text is set is loaded from that text, and the
+/// import gains one hint that the current text does not check.
+/// The buffer being checked is always `source`.
+pub fn buffer_notes_editor(path: &Path, source: &str, open: &[OpenText<'_>]) -> BufferNotes {
     let mode = if path.to_string_lossy().ends_with(".d.ply") {
         ParseMode::Interface
     } else {
@@ -684,7 +728,14 @@ pub fn buffer_notes_open(path: &Path, source: &str, open: &[(&Path, &str)]) -> B
     let module = match parse(source, mode) {
         Ok(module) => module,
         Err(error) => {
-            return assemble_notes(Some(error), Vec::new(), Vec::new(), Vec::new());
+            return assemble_notes(
+                Some(error),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            );
         }
     };
     let entry_error = if mode == ParseMode::Source {
@@ -693,8 +744,9 @@ pub fn buffer_notes_open(path: &Path, source: &str, open: &[(&Path, &str)]) -> B
         None
     };
     let Some(root) = find_ply_root(path) else {
-        let (errors, sites) = module_notes(&module);
-        return assemble_notes(entry_error, errors, sites, Vec::new());
+        let (errors, sites, ready) = module_notes(&module);
+        let surface = ready.then(|| crate::surface::surface_key(&module));
+        return assemble_notes(entry_error, errors, sites, Vec::new(), Vec::new(), surface);
     };
     let package = match read_package(&root) {
         Ok(package) => package,
@@ -708,12 +760,21 @@ pub fn buffer_notes_open(path: &Path, source: &str, open: &[(&Path, &str)]) -> B
                 )],
                 collect_sites(&module),
                 Vec::new(),
+                Vec::new(),
+                None,
             );
         }
     };
     let mut overlays = HashMap::new();
-    for (file, text) in open {
-        overlays.insert(canonical(file), *text);
+    for row in open {
+        overlays.insert(
+            canonical(row.path),
+            OpenCopy {
+                text: row.text,
+                checked: row.checked,
+                fault: row.fault,
+            },
+        );
     }
     let mut doc = OpenDoc {
         package,
@@ -723,6 +784,7 @@ pub fn buffer_notes_open(path: &Path, source: &str, open: &[(&Path, &str)]) -> B
         exports_cache: HashMap::new(),
         open: overlays,
         touched: Vec::new(),
+        stale: Vec::new(),
     };
     doc.push_buffer(path, module.clone());
     if let Err(error) = doc.visit(0, None) {
@@ -731,10 +793,19 @@ pub fn buffer_notes_open(path: &Path, source: &str, open: &[(&Path, &str)]) -> B
             vec![error],
             collect_sites(&module),
             doc.dependency_paths(),
+            Vec::new(),
+            None,
         );
     }
-    let (errors, sites) = doc.noted();
-    assemble_notes(entry_error, errors, sites, doc.dependency_paths())
+    let (errors, sites, hints, surface) = doc.noted();
+    assemble_notes(
+        entry_error,
+        errors,
+        sites,
+        doc.dependency_paths(),
+        hints,
+        surface,
+    )
 }
 
 /// Import paths the package of `from_file` can name: files under the source
@@ -1995,6 +2066,12 @@ struct DocUnit {
     linked: bool,
 }
 
+struct OpenCopy<'a> {
+    text: &'a str,
+    checked: Option<&'a str>,
+    fault: Option<&'a OpenFault>,
+}
+
 struct OpenDoc<'a> {
     package: Package,
     units: Vec<DocUnit>,
@@ -2002,10 +2079,12 @@ struct OpenDoc<'a> {
     by_module: HashMap<String, usize>,
     exports_cache: HashMap<PathBuf, HashMap<String, String>>,
     /// Unsaved text keyed by the canonical path. Disk is the fallback.
-    open: HashMap<PathBuf, &'a str>,
+    open: HashMap<PathBuf, OpenCopy<'a>>,
     /// Every file `load` considered, in visit order. A parse failure still
     /// records the path, so the importer is known before the module parses.
     touched: Vec<PathBuf>,
+    /// One hint per dependency whose last surface stands in for broken text.
+    stale: Vec<Hint>,
 }
 
 impl<'a> OpenDoc<'a> {
@@ -2259,9 +2338,36 @@ impl<'a> OpenDoc<'a> {
         } else {
             ParseMode::Source
         };
+        // The last surface stands in for text that does not check. The import
+        // then carries one hint, and the jump is the error in the open text.
+        if let Some(checked) = self.open.get(&canonical).and_then(|row| row.checked) {
+            let module = parse(checked, mode).map_err(|error| {
+                let (line, col) = line_col(checked, error.span.start);
+                Diagnostic::with_code(
+                    span,
+                    error.code,
+                    format!("{}:{line}:{col}: {}", file.display(), error.message),
+                )
+            })?;
+            let shown = module_path.clone().unwrap_or_else(|| file_label(&file));
+            let related = self.open.get(&canonical).and_then(|row| {
+                row.fault.map(|fault| Related {
+                    path: canonical.display().to_string(),
+                    span: fault.span,
+                    message: fault.message.clone(),
+                })
+            });
+            self.stale.push(Hint {
+                span,
+                message: format!("{shown} does not check"),
+                related,
+                unnecessary: false,
+            });
+            return Ok(self.insert(canonical, module, package_root, module_path));
+        }
         // The editor copy wins over disk, including when the parse fails.
         let module = {
-            let from_editor = self.open.get(&canonical).copied();
+            let from_editor = self.open.get(&canonical).map(|row| row.text);
             let disk = if from_editor.is_none() {
                 Some(fs::read_to_string(&file).map_err(|error| {
                     let os = Error::Os(error.to_string());
@@ -2312,7 +2418,7 @@ impl<'a> OpenDoc<'a> {
         Ok(exports)
     }
 
-    fn noted(&self) -> (Vec<Diagnostic>, Vec<StackAt>) {
+    fn noted(&self) -> (Vec<Diagnostic>, Vec<StackAt>, Vec<Hint>, Option<String>) {
         let import_count = self.units[0].module.imports.len();
         let mut providers = Vec::with_capacity(import_count);
         let mut knowns = Vec::with_capacity(import_count);
@@ -2334,7 +2440,15 @@ impl<'a> OpenDoc<'a> {
             &self.units[0].package_root,
             self.units[0].module_path.as_deref(),
         );
+        let mut hints = self.stale.clone();
+        hints.extend(crate::unused::unused_imports(
+            &self.units[0].module,
+            &resolved,
+        ));
         let noted = check_and_note(&self.units[0].module, &resolved, &key);
+        let surface = noted
+            .surface_ready
+            .then(|| crate::surface::surface_key(&self.units[0].module));
         let mut errors = noted.errors;
         if self.buffer_needs_public() && matches!(self.units[0].module.exports, Exports::Closed) {
             errors.insert(
@@ -2342,10 +2456,12 @@ impl<'a> OpenDoc<'a> {
                 Diagnostic::new(self.units[0].module.span, Error::MissingPublicList),
             );
         }
-        if !noted.sites.is_empty() {
-            return (errors, noted.sites);
-        }
-        (errors, self.sites())
+        let sites = if !noted.sites.is_empty() {
+            noted.sites
+        } else {
+            self.sites()
+        };
+        (errors, sites, hints, surface)
     }
 
     fn dependency_paths(&self) -> Vec<PathBuf> {
@@ -3288,6 +3404,181 @@ mod tests {
         let mid = fs::canonicalize(&mid_path).unwrap();
         assert!(notes.deps.contains(&lib), "{:?}", notes.deps);
         assert!(notes.deps.contains(&mid), "{:?}", notes.deps);
+    }
+
+    #[test]
+    fn a_body_error_keeps_the_surface_and_a_parse_error_drops_it() {
+        let temp = Temp::new("surface-key");
+        temp.write(
+            "package.json",
+            &package_json(r#""./App": { "ply": "./dist/App.d.ply", "import": "./dist/App.js" }"#),
+        );
+        let good = "@ answer\n\n: answer ( -- Num )\n  1\n";
+        let body = "@ answer\n\n: answer ( -- Num )\n  \"no\"\n";
+        let helper = "@ answer\n\n: helper ( -- Num )\n  1\n\n: answer ( -- Num )\n  helper\n";
+        let helper_body = "@ answer\n\n: helper ( -- Num )\n  2\n\n: answer ( -- Num )\n  helper\n";
+        let scheme = "@ answer\n\n: answer ( -- Str )\n  \"a\"\n";
+        let broken = "@ answer\n\n:::\n";
+        let path = temp.0.join("src/App.ply");
+        temp.write("src/App.ply", good);
+        let ok = super::buffer_notes(&path, good);
+        assert!(ok.errors.is_empty(), "{:?}", ok.errors);
+        let key = ok.surface.clone().expect("surface");
+        let bad_body = super::buffer_notes(&path, body);
+        assert!(
+            bad_body
+                .errors
+                .iter()
+                .any(|error| error.message.contains("type mismatch")),
+            "{:?}",
+            bad_body.errors
+        );
+        assert_eq!(bad_body.surface.as_deref(), Some(key.as_str()));
+        let private = super::buffer_notes(&path, helper);
+        let private_body = super::buffer_notes(&path, helper_body);
+        assert_eq!(private.surface.as_deref(), Some(key.as_str()));
+        assert_eq!(private.surface, private_body.surface);
+        let changed = super::buffer_notes(&path, scheme);
+        assert_ne!(changed.surface.as_deref(), Some(key.as_str()));
+        let unparsed = super::buffer_notes(&path, broken);
+        assert!(unparsed.surface.is_none(), "{:?}", unparsed.errors);
+    }
+
+    #[test]
+    fn an_importer_keeps_the_last_surface_while_a_dependency_does_not_check() {
+        let temp = Temp::new("stale-surface");
+        temp.write(
+            "package.json",
+            &package_json(
+                r#"
+    "./Data/Lib": { "ply": "./dist/Data/Lib.d.ply", "import": "./dist/Data/Lib.js" },
+    "./App": { "ply": "./dist/App.d.ply", "import": "./dist/App.js" }
+"#,
+            ),
+        );
+        let good = "@ answer\n\n: answer ( -- Num )\n  1\n";
+        let broken = "@ answer\n\n:::\n";
+        temp.write("src/Data/Lib.ply", good);
+        let app = "@ go\n~ \"Data/Lib\" answer\n\n: go ( -- Num )\n  answer\n";
+        temp.write("src/App.ply", app);
+        let app_path = temp.0.join("src/App.ply");
+        let lib_path = temp.0.join("src/Data/Lib.ply");
+        super::check_buffer(&app_path, app)
+            .unwrap_or_else(|error| panic!("{}", error.render("App.ply", app)));
+        let fault_diag = crate::parse(broken, crate::ParseMode::Source).unwrap_err();
+        let fault = super::OpenFault {
+            span: fault_diag.span,
+            message: fault_diag.message.clone(),
+        };
+        let notes = super::buffer_notes_editor(
+            &app_path,
+            app,
+            &[super::OpenText {
+                path: &lib_path,
+                text: broken,
+                checked: Some(good),
+                fault: Some(&fault),
+            }],
+        );
+        assert!(notes.errors.is_empty(), "{:?}", notes.errors);
+        assert!(notes.surface.is_some());
+        let hint = notes
+            .hints
+            .iter()
+            .find(|hint| hint.message.contains("does not check"))
+            .expect("hint");
+        assert_eq!(hint.message, "Data/Lib does not check");
+        assert!(!hint.unnecessary);
+        let related = hint.related.as_ref().expect("jump");
+        let lib = fs::canonicalize(&lib_path).unwrap();
+        assert_eq!(related.path, lib.display().to_string());
+        assert_eq!(related.span, fault.span);
+        assert_eq!(related.message, fault.message);
+        let use_at = app.rfind("answer").unwrap();
+        assert!(
+            notes
+                .sites
+                .iter()
+                .any(|site| site.span.start as usize == use_at),
+            "{:?}",
+            notes.sites
+        );
+    }
+
+    #[test]
+    fn a_removed_export_points_at_the_module_that_dropped_it() {
+        let temp = Temp::new("export-jump");
+        temp.write(
+            "package.json",
+            &package_json(
+                r#"
+    "./Data/Lib": { "ply": "./dist/Data/Lib.d.ply", "import": "./dist/Data/Lib.js" },
+    "./Data/Mid": { "ply": "./dist/Data/Mid.d.ply", "import": "./dist/Data/Mid.js" },
+    "./App": { "ply": "./dist/App.d.ply", "import": "./dist/App.js" }
+"#,
+            ),
+        );
+        let hidden =
+            "@ other\n\n: other ( Int -- Int )\n  dup drop\n\n: kept ( Int -- Int )\n  dup drop\n";
+        temp.write(
+            "src/Data/Lib.ply",
+            "@ kept, other\n\n: kept ( Int -- Int )\n  dup drop\n\n: other ( Int -- Int )\n  dup drop\n",
+        );
+        temp.write(
+            "src/Data/Mid.ply",
+            "@ kept\n~ \"Data/Lib\" kept\n\n: pass ( Int -- Int )\n  dup drop\n",
+        );
+        let direct = "@ go\n~ \"Data/Lib\" kept, other\n\n: go ( Int -- Int )\n  other\n";
+        let app_path = temp.0.join("src/App.ply");
+        let lib_path = temp.0.join("src/Data/Lib.ply");
+        let mid_path = temp.0.join("src/Data/Mid.ply");
+        temp.write("src/App.ply", direct);
+        let notes = super::buffer_notes_open(&app_path, direct, &[(&lib_path, hidden)]);
+        let error = notes.error.expect("missing kept");
+        assert_eq!(error.code, "PL0091");
+        assert_eq!(error.message, "~ \"Data/Lib\" does not export kept");
+        let kept_at = direct.find("kept").unwrap();
+        assert_eq!(error.span.start as usize, kept_at);
+        assert_eq!(error.span.end as usize, kept_at + 4);
+        let lib = fs::canonicalize(&lib_path).unwrap();
+        let related = error.related.as_ref().expect("jump");
+        assert_eq!(related.path, lib.display().to_string());
+        assert_eq!(related.message, "does not export kept");
+        assert_eq!(related.span.start, 0);
+        let other_at = direct.rfind("other").unwrap();
+        assert!(
+            notes
+                .sites
+                .iter()
+                .any(|site| site.span.start as usize == other_at),
+            "{:?}",
+            notes.sites
+        );
+        assert!(notes.surface.is_some());
+
+        let through = "@ go\n~ \"Data/Mid\" kept\n\n: go ( Int -- Int )\n  dup drop\n";
+        temp.write("src/App.ply", through);
+        let notes = super::buffer_notes_open(&app_path, through, &[(&lib_path, hidden)]);
+        let error = notes.error.expect("re-export lost kept");
+        assert!(
+            error.message.contains("does not export kept"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("Data/Mid"), "{}", error.message);
+        let related = error.related.as_ref().expect("jump");
+        assert_eq!(related.path, lib.display().to_string());
+        let mid = fs::canonicalize(&mid_path).unwrap();
+        assert_ne!(related.path, mid.display().to_string());
+        let dup_at = through.rfind("dup").unwrap();
+        assert!(
+            notes
+                .sites
+                .iter()
+                .any(|site| site.span.start as usize == dup_at),
+            "{:?}",
+            notes.sites
+        );
     }
 
     #[test]
