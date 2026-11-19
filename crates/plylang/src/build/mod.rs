@@ -618,14 +618,33 @@ fn snippet_javascript(path: &Path) -> Result<String, BuildError> {
     apply_entry(path, &source, &module, js)
 }
 
-/// One editor check: the diagnostic, and the stack notes for the same text.
-/// Hover reads `sites` instead of checking the buffer again.
+/// One editor check: the diagnostics, and the stack notes for the same text.
+/// `error` is the first of `errors`. Hover reads `sites`.
+/// A word, place, or `?` check that fails does not hide the ones below it.
 pub struct BufferNotes {
     pub error: Option<Diagnostic>,
+    pub errors: Vec<Diagnostic>,
     pub sites: Vec<StackAt>,
     /// Canonical paths this check loaded, including a module reached through a
     /// closed file. An open importer is stale when one of these files changes.
     pub deps: Vec<PathBuf>,
+}
+
+fn assemble_notes(
+    entry: Option<Diagnostic>,
+    mut errors: Vec<Diagnostic>,
+    sites: Vec<StackAt>,
+    deps: Vec<PathBuf>,
+) -> BufferNotes {
+    if let Some(entry) = entry {
+        errors.insert(0, entry);
+    }
+    BufferNotes {
+        error: errors.first().cloned(),
+        errors,
+        sites,
+        deps,
+    }
 }
 
 /// Check one editor buffer. Inside a package, imports resolve as in `plylang build`.
@@ -639,8 +658,9 @@ pub fn check_buffer(path: &Path, source: &str) -> Result<(), Diagnostic> {
 }
 
 /// Stack notes for the editor. Same import rules as [`check_buffer`].
-/// A failed check still returns the terms reached before the error.
-/// A package that cannot be resolved falls back to a single-file check.
+/// A definition that fails still returns the terms reached inside it, and the
+/// definitions below it. A package that cannot be resolved falls back to a
+/// single-file check.
 pub fn stack_sites(path: &Path, source: &str) -> Vec<StackAt> {
     buffer_notes(path, source).sites
 }
@@ -664,11 +684,7 @@ pub fn buffer_notes_open(path: &Path, source: &str, open: &[(&Path, &str)]) -> B
     let module = match parse(source, mode) {
         Ok(module) => module,
         Err(error) => {
-            return BufferNotes {
-                error: Some(error),
-                sites: Vec::new(),
-                deps: Vec::new(),
-            };
+            return assemble_notes(Some(error), Vec::new(), Vec::new(), Vec::new());
         }
     };
     let entry_error = if mode == ParseMode::Source {
@@ -677,25 +693,22 @@ pub fn buffer_notes_open(path: &Path, source: &str, open: &[(&Path, &str)]) -> B
         None
     };
     let Some(root) = find_ply_root(path) else {
-        let (error, sites) = module_notes(&module);
-        return BufferNotes {
-            error: entry_error.or(error),
-            sites,
-            deps: Vec::new(),
-        };
+        let (errors, sites) = module_notes(&module);
+        return assemble_notes(entry_error, errors, sites, Vec::new());
     };
     let package = match read_package(&root) {
         Ok(package) => package,
         Err(error) => {
-            return BufferNotes {
-                error: entry_error.or(Some(Diagnostic::with_code(
+            return assemble_notes(
+                entry_error,
+                vec![Diagnostic::with_code(
                     Span::new(0, 0),
                     error.code,
                     error.message,
-                ))),
-                sites: collect_sites(&module),
-                deps: Vec::new(),
-            };
+                )],
+                collect_sites(&module),
+                Vec::new(),
+            );
         }
     };
     let mut overlays = HashMap::new();
@@ -713,18 +726,15 @@ pub fn buffer_notes_open(path: &Path, source: &str, open: &[(&Path, &str)]) -> B
     };
     doc.push_buffer(path, module.clone());
     if let Err(error) = doc.visit(0, None) {
-        return BufferNotes {
-            error: entry_error.or(Some(error)),
-            sites: collect_sites(&module),
-            deps: doc.dependency_paths(),
-        };
+        return assemble_notes(
+            entry_error,
+            vec![error],
+            collect_sites(&module),
+            doc.dependency_paths(),
+        );
     }
-    let (error, sites) = doc.noted();
-    BufferNotes {
-        error: entry_error.or(error),
-        sites,
-        deps: doc.dependency_paths(),
-    }
+    let (errors, sites) = doc.noted();
+    assemble_notes(entry_error, errors, sites, doc.dependency_paths())
 }
 
 /// Import paths the package of `from_file` can name: files under the source
@@ -2302,7 +2312,7 @@ impl<'a> OpenDoc<'a> {
         Ok(exports)
     }
 
-    fn noted(&self) -> (Option<Diagnostic>, Vec<StackAt>) {
+    fn noted(&self) -> (Vec<Diagnostic>, Vec<StackAt>) {
         let import_count = self.units[0].module.imports.len();
         let mut providers = Vec::with_capacity(import_count);
         let mut knowns = Vec::with_capacity(import_count);
@@ -2324,20 +2334,18 @@ impl<'a> OpenDoc<'a> {
             &self.units[0].package_root,
             self.units[0].module_path.as_deref(),
         );
+        let noted = check_and_note(&self.units[0].module, &resolved, &key);
+        let mut errors = noted.errors;
         if self.buffer_needs_public() && matches!(self.units[0].module.exports, Exports::Closed) {
-            return (
-                Some(Diagnostic::new(
-                    self.units[0].module.span,
-                    Error::MissingPublicList,
-                )),
-                self.sites(),
+            errors.insert(
+                0,
+                Diagnostic::new(self.units[0].module.span, Error::MissingPublicList),
             );
         }
-        let noted = check_and_note(&self.units[0].module, &resolved, &key);
         if !noted.sites.is_empty() {
-            return (noted.error, noted.sites);
+            return (errors, noted.sites);
         }
-        (noted.error, collect_sites(&self.units[0].module))
+        (errors, self.sites())
     }
 
     fn dependency_paths(&self) -> Vec<PathBuf> {

@@ -1,5 +1,6 @@
 //! Completions at the cursor: words, types, import paths, import names, alias members,
-//! product fields, and the class, head, methods, and words of an instance.
+//! names on an `@` list, product fields, and the class, head, methods, and words
+//! of an instance.
 //! A file that does not parse still completes from the lines above the cursor.
 
 use std::collections::HashMap;
@@ -80,6 +81,10 @@ pub fn complete(source: &str, path: &Path, line: u32, character: u32) -> Vec<Com
             seen,
             closed,
         } => import_names(path, &import, &seen, closed, replace),
+        Context::Export { seen } => {
+            let module = parsed_module(source, path, offset);
+            export_names(path, module.as_ref(), &seen, replace)
+        }
         Context::Type { vars } => {
             let module = parsed_module(source, path, offset);
             type_names(path, module.as_ref(), &vars, replace)
@@ -154,6 +159,10 @@ enum Context {
         seen: Vec<String>,
         closed: bool,
     },
+    /// Names this module can publish. `seen` is already written on the `@` line.
+    Export {
+        seen: Vec<String>,
+    },
     Type {
         vars: Vec<String>,
     },
@@ -205,6 +214,12 @@ fn context_of(walked: &Walk, partial: Option<&Token>, at_column_0: bool) -> Cont
             keywords: at_column_0,
         },
         Place::InstanceWord => Context::Word,
+        // A blank line at column 0 can start the next declaration.
+        // A name on this line, or after `@` on its line, is an export.
+        Place::Export if at_column_0 && partial.is_none() => Context::Keyword,
+        Place::Export => Context::Export {
+            seen: walked.seen.clone(),
+        },
         Place::Body if !at_column_0 => Context::Word,
         // A term at column 0 is still a term. The brackets are not a new declaration.
         Place::ProbePicture | Place::ProbeProgram => Context::Word,
@@ -248,6 +263,137 @@ fn import_paths(from: &Path, replace: Span, quoted: bool) -> Vec<Completion> {
             entry(&path, &insert, CompletionKind::Module, "", "", "1", replace)
         })
         .collect()
+}
+
+/// Words, types, constructors, synonyms, classes, and places defined here,
+/// plus a plain import. Builtins are not published. A name already on the
+/// line is left out. An alias member is `Alias:name`, which is not one export.
+fn export_names(
+    from: &Path,
+    module: Option<&Module>,
+    seen: &[String],
+    replace: Span,
+) -> Vec<Completion> {
+    let mut items = Vec::new();
+    let Some(module) = module else {
+        return items;
+    };
+    let listed = |name: &str| seen.iter().any(|have| have == name);
+    for item in &module.items {
+        match item {
+            Item::Def(def) => {
+                if !listed(&def.name) {
+                    push(&mut items, def_entry(def, "1", replace));
+                }
+            }
+            Item::Data(data) => {
+                if !listed(&data.name) {
+                    push(
+                        &mut items,
+                        entry(
+                            &data.name,
+                            &data.name,
+                            CompletionKind::Type,
+                            &type_detail(data),
+                            &data.doc,
+                            "1",
+                            replace,
+                        ),
+                    );
+                }
+                for ctor in &data.ctors {
+                    if !listed(&ctor.name) {
+                        push(&mut items, ctor_entry(data, ctor, "1", replace));
+                    }
+                }
+            }
+            Item::Synonym(synonym) => {
+                if !listed(&synonym.name) {
+                    push(
+                        &mut items,
+                        entry(
+                            &synonym.name,
+                            &synonym.name,
+                            CompletionKind::Type,
+                            &synonym_detail(synonym),
+                            &synonym.doc,
+                            "1",
+                            replace,
+                        ),
+                    );
+                }
+            }
+            Item::Class(class) => {
+                if !listed(&class.name) {
+                    push(
+                        &mut items,
+                        entry(
+                            &class.name,
+                            &class.name,
+                            CompletionKind::Class,
+                            &class_detail(class),
+                            &class.doc,
+                            "1",
+                            replace,
+                        ),
+                    );
+                }
+            }
+            Item::Place(place) => {
+                if !listed(&place.name) {
+                    push(
+                        &mut items,
+                        entry(
+                            &place.name,
+                            &place.name,
+                            CompletionKind::Word,
+                            &format!("-- {}", type_string(&place.ty)),
+                            &place.doc,
+                            "1",
+                            replace,
+                        ),
+                    );
+                }
+            }
+            Item::Instance(_) | Item::Probe(_) => {}
+        }
+    }
+    for import in &module.imports {
+        if import.alias.is_some() {
+            continue;
+        }
+        for imported in &import.names {
+            if listed(&imported.local) {
+                continue;
+            }
+            push(
+                &mut items,
+                imported_export(from, import, &imported.local, &imported.remote, replace),
+            );
+        }
+    }
+    items
+}
+
+fn imported_export(
+    from: &Path,
+    import: &crate::ast::Import,
+    local: &str,
+    remote: &str,
+    replace: Span,
+) -> Completion {
+    if let Some(file) = provider_file(from, &import.path) {
+        if let Some(module) = read_module(&file) {
+            let mut load = |start: &Path, path: &str| load_surface(start, path);
+            if let Some((_, found)) = surface::lookup(&module, &file, remote, &mut load) {
+                if let Some((kind, detail, doc)) = found_exports(&found, remote).into_iter().next()
+                {
+                    return entry(local, local, kind, &detail, &doc, "2", replace);
+                }
+            }
+        }
+    }
+    unnamed_export(local, replace)
 }
 
 fn import_names(
@@ -1051,6 +1197,8 @@ enum Place {
     InstanceEq,
     /// After `=`, on the implementation word.
     InstanceWord,
+    /// After `@`, on a name this module publishes. A column-0 declaration ends it.
+    Export,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1087,7 +1235,8 @@ pub(crate) fn name_space_at(tokens: &[Token], index: usize) -> NameSpace {
         | Place::ImportList
         | Place::DataGap
         | Place::ProbeHead
-        | Place::ProbeBetween => NameSpace::Either,
+        | Place::ProbeBetween
+        | Place::Export => NameSpace::Either,
     }
 }
 
@@ -1179,6 +1328,7 @@ fn resets(state: Place, token: &Token) -> bool {
             | Place::InstanceBody
             | Place::InstanceEq
             | Place::InstanceWord
+            | Place::Export
     )
 }
 
@@ -1210,6 +1360,23 @@ fn step(walked: &mut Walk, token: &Token, next: Option<&&Token>) {
                 walked.state = Place::DefName;
             }
             TokenKind::Data => walked.state = Place::DataName,
+            TokenKind::Export => {
+                walked.seen.clear();
+                walked.state = Place::Export;
+            }
+            _ => {}
+        },
+        Place::Export => match &token.kind {
+            TokenKind::Ident(name) => walked.seen.push(name.clone()),
+            TokenKind::Comma | TokenKind::Newline => {}
+            TokenKind::Eq if token.col == 0 && token.line_start => {
+                walked.seen.clear();
+                walked.state = Place::Top;
+            }
+            TokenKind::Doc(_) => {
+                walked.seen.clear();
+                walked.state = Place::Top;
+            }
             _ => {}
         },
         Place::Vis => match &token.kind {
@@ -2506,6 +2673,66 @@ mod tests {
             .find(|item| item.label == "differ")
             .expect("differ");
         assert_eq!(differ.documentation, "Equality.");
+    }
+
+    #[test]
+    fn completes_names_on_an_export_line() {
+        let source = "\
+@ 
+
+~ \"Data/Missing\" Nothing, just
+
+; Box a = Box a
+
+- Age Num
+
+& Show a
+  show ( a -- Str )
+
+= base Num
+  0
+
+: keep ( Int -- Int )
+  dup drop
+
+: hide ( Int -- Int )
+  dup drop
+";
+        let open = labels(source, "@ ");
+        for name in [
+            "Box", "Age", "Show", "base", "keep", "hide", "Nothing", "just",
+        ] {
+            assert!(open.iter().any(|label| label == name), "{name} in {open:?}");
+        }
+        assert!(!open.iter().any(|label| label == "dup"), "{open:?}");
+        assert!(!open.iter().any(|label| label == "show"), "{open:?}");
+        assert!(!open.iter().any(|label| label == "true"), "{open:?}");
+
+        let typed = source.replacen("@ \n", "@ ke\n", 1);
+        let (line, character) = at(&typed, "@ ke");
+        let items = complete(&typed, Path::new("M.ply"), line, character);
+        let keep = items
+            .iter()
+            .find(|item| item.label == "keep")
+            .expect("keep");
+        assert_eq!(keep.insert, "keep");
+        let ke = typed.find("ke").unwrap();
+        assert_eq!(keep.replace.start, ke as u32);
+        assert_eq!(keep.replace.end, (ke + 2) as u32);
+        assert!(items.iter().any(|item| item.label == "hide"));
+
+        let listed = source.replacen("@ \n", "@ keep,\n  ", 1);
+        let after = labels(&listed, "@ keep,\n  ");
+        assert!(after.iter().any(|label| label == "hide"), "{after:?}");
+        assert!(!after.iter().any(|label| label == "keep"), "{after:?}");
+        assert!(!after.iter().any(|label| label == "dup"), "{after:?}");
+
+        let next = labels(source, "@ \n");
+        assert!(next.iter().any(|label| label == ":"), "{next:?}");
+        assert!(!next.iter().any(|label| label == "keep"), "{next:?}");
+
+        let body = labels(&typed, "  du");
+        assert!(body.iter().any(|label| label == "dup"), "{body:?}");
     }
 
     #[test]

@@ -145,11 +145,20 @@ pub(crate) fn check_with_imports_key(
     })
 }
 
-/// The diagnostic and the stack notes from one pass. Lowering still runs when
-/// the bodies check, so an editor sees the same error as [`check_with_imports_key`].
+/// The diagnostics and the stack notes from one pass. One definition that fails
+/// does not skip the definitions below it. Lowering still runs only when every
+/// body checks. [`check_with_imports_key`] reports the first of these errors.
 pub(crate) struct ImportNotes {
-    pub error: Option<Diagnostic>,
+    /// Every error from this pass, in the order the checker found them.
+    pub errors: Vec<Diagnostic>,
     pub sites: Vec<StackAt>,
+}
+
+fn bare_error(error: Diagnostic) -> ImportNotes {
+    ImportNotes {
+        errors: vec![error],
+        sites: Vec::new(),
+    }
 }
 
 pub(crate) fn check_and_note(
@@ -161,48 +170,35 @@ pub(crate) fn check_and_note(
         checker.module_key = module_key.to_string();
         checker.check_probes = true;
         if let Err(error) = checker.stage_local_types(module) {
-            return ImportNotes {
-                error: Some(error),
-                sites: Vec::new(),
-            };
+            return bare_error(error);
         }
         for imported in imports {
             if let Err(error) =
                 checker.import_resolved(imported.provider, imported.import, imported.known)
             {
-                return ImportNotes {
-                    error: Some(error),
-                    sites: Vec::new(),
-                };
+                return bare_error(error);
             }
         }
         if let Err(error) = checker.register_local_classes(module) {
-            return ImportNotes {
-                error: Some(error),
-                sites: Vec::new(),
-            };
+            return bare_error(error);
         }
         for imported in imports {
             if let Err(error) = checker.import_instances(imported.known) {
-                return ImportNotes {
-                    error: Some(error),
-                    sites: Vec::new(),
-                };
+                return bare_error(error);
             }
         }
         if let Err(error) = checker.prepare(module) {
-            return ImportNotes {
-                error: Some(error),
-                sites: Vec::new(),
-            };
+            return bare_error(error);
         }
-        let error = checker.check_bodies(module).err();
+        let failed = checker.check_bodies(module).err();
+        let errors = checker.take_errors(failed);
         let sites = checker.render_sites();
-        if error.is_some() {
-            return ImportNotes { error, sites };
+        if !errors.is_empty() {
+            return ImportNotes { errors, sites };
         }
+        let error = checker.lower_prepared(module).err();
         ImportNotes {
-            error: checker.lower_prepared(module).err(),
+            errors: error.into_iter().collect(),
             sites,
         }
     })
@@ -225,7 +221,8 @@ fn with_checker<T>(body: impl FnOnce(&mut Checker) -> T) -> T {
     })
 }
 
-/// Sites from a single-file check. A body that fails still yields the terms reached before it.
+/// Sites from a single-file check. A definition that fails still yields the terms
+/// reached inside it, and the definitions below it are checked too.
 pub(crate) fn collect_sites(module: &Module) -> Vec<StackAt> {
     with_checker(|checker| {
         let _ = checker.check_module(module);
@@ -234,14 +231,17 @@ pub(crate) fn collect_sites(module: &Module) -> Vec<StackAt> {
 }
 
 /// Notes for one module that has no imports to install. The same pass as
-/// [`check`] plus the sites a hover reads.
-pub(crate) fn module_notes(module: &Module) -> (Option<Diagnostic>, Vec<StackAt>) {
+/// [`check`] plus the sites a hover reads. Every definition is checked.
+pub(crate) fn module_notes(module: &Module) -> (Vec<Diagnostic>, Vec<StackAt>) {
     with_checker(|checker| {
-        let error = checker.check_module(module).err();
-        (error, checker.render_sites())
+        let failed = checker.check_module(module).err();
+        let errors = checker.take_errors(failed);
+        (errors, checker.render_sites())
     })
 }
 
+/// Sites when the full check stopped before any definition. Imports are installed,
+/// and a failure there yields nothing so the caller can fall back to one file.
 pub(crate) fn collect_sites_with_imports_key(
     module: &Module,
     imports: &[ResolvedImport<'_>],
@@ -554,6 +554,8 @@ struct Checker {
     fn_arity: HashMap<u32, (usize, usize)>,
     next_local: u32,
     sites: Vec<RawSite>,
+    /// Failures of places, words, and `?` checks. One does not skip the next.
+    body_errors: Vec<Diagnostic>,
     pending_here: Option<(StackId, StackId, EffectId)>,
     kinds: Vec<KindNode>,
     type_kind: Option<KindId>,
@@ -636,6 +638,7 @@ impl Checker {
             fn_arity: HashMap::new(),
             next_local: 0,
             sites: Vec::new(),
+            body_errors: Vec::new(),
             pending_here: None,
             kinds: Vec::new(),
             type_kind: None,
@@ -693,6 +696,7 @@ impl Checker {
         self.fn_arity.clear();
         self.next_local = 0;
         self.sites.clear();
+        self.body_errors.clear();
         self.pending_here = None;
         self.kinds.clear();
         self.type_kind = None;
@@ -782,7 +786,47 @@ impl Checker {
         self.check_closed_surface(module)
     }
 
+    /// Drop the scratch of one definition so the next one starts clean.
+    /// Sites, refinements, and the type graph stay: hover still reads them.
+    fn abandon_word(&mut self) {
+        self.deferred.clear();
+        self.pending_arity.clear();
+        self.pending_quotes.clear();
+        self.bind_tys.clear();
+        self.assumptions.clear();
+        self.assumption_locals.clear();
+        self.ambient = None;
+        self.solving.clear();
+        self.guarded.clear();
+        self.recording = false;
+        self.trail.clear();
+        self.locals.clear();
+        self.pending_here = None;
+        self.frozen_ty.clear();
+        self.frozen_stack.clear();
+        self.frozen_effect.clear();
+        self.expanding.clear();
+    }
+
+    fn take_errors(&mut self, fallback: Option<Diagnostic>) -> Vec<Diagnostic> {
+        let mut errors = std::mem::take(&mut self.body_errors);
+        if errors.is_empty() {
+            if let Some(error) = fallback {
+                errors.push(error);
+            }
+        }
+        errors
+    }
+
+    fn note_body(&mut self, error: Diagnostic) {
+        self.body_errors.push(error);
+        self.abandon_word();
+    }
+
+    /// Check every place, word, and `?` line. A failure is kept and the next
+    /// definition still runs: its signature was registered on its own.
     fn check_bodies(&mut self, module: &Module) -> Result<(), Diagnostic> {
+        self.body_errors.clear();
         let mut unready: HashSet<String> = module
             .items
             .iter()
@@ -794,28 +838,38 @@ impl Checker {
         let graph = place_graph(module);
         for item in &module.items {
             if let Item::Place(place) = item {
-                self.reject_unready_place(place, &unready, &graph)?;
-                unready.remove(&place.name);
-                if !place.body.is_empty() {
-                    self.check_body(&place_def(place))?;
+                if let Err(error) = self.reject_unready_place(place, &unready, &graph) {
+                    self.note_body(error);
+                } else if !place.body.is_empty() {
+                    if let Err(error) = self.check_body(&place_def(place)) {
+                        self.note_body(error);
+                    }
                 }
+                unready.remove(&place.name);
             }
         }
         for item in &module.items {
             if let Item::Def(def) = item {
                 if !def.body.is_empty() || !def.clauses.is_empty() {
-                    self.check_body(def)?;
+                    if let Err(error) = self.check_body(def) {
+                        self.note_body(error);
+                    }
                 }
             }
         }
         if self.check_probes {
             for item in &module.items {
                 if let Item::Probe(probe) = item {
-                    self.check_probe(probe)?;
+                    if let Err(error) = self.check_probe(probe) {
+                        self.note_body(error);
+                    }
                 }
             }
         }
-        Ok(())
+        match self.body_errors.first() {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
     }
 
     /// The picture and the program both start empty. Their stacks must agree.

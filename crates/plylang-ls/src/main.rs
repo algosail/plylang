@@ -39,6 +39,7 @@ fn serve(connection: Connection) -> Result<(), String> {
                 "=".to_string(),
                 ":".to_string(),
                 "#".to_string(),
+                "@".to_string(),
             ]),
             ..CompletionOptions::default()
         }),
@@ -298,13 +299,13 @@ fn closed_uri(notification: &Notification) -> Option<String> {
     Some(params.text_document.uri)
 }
 
-fn publish(uri: &str, text: &str, error: Option<&plylang::Diagnostic>) -> Notification {
-    let diagnostics = match error {
-        None => Vec::new(),
-        Some(error) => {
+fn publish(uri: &str, text: &str, errors: &[plylang::Diagnostic]) -> Notification {
+    let diagnostics = errors
+        .iter()
+        .map(|error| {
             let (start_line, start_character) = utf16_position(text, error.span.start);
             let (end_line, end_character) = utf16_position(text, error.span.end);
-            vec![serde_json::json!({
+            serde_json::json!({
                 "range": {
                     "start": { "line": start_line, "character": start_character },
                     "end": { "line": end_line, "character": end_character },
@@ -314,9 +315,9 @@ fn publish(uri: &str, text: &str, error: Option<&plylang::Diagnostic>) -> Notifi
                 "code": error.code,
                 "codeDescription": { "href": error.url() },
                 "message": error.reported(),
-            })]
-        }
-    };
+            })
+        })
+        .collect::<Vec<_>>();
     Notification {
         method: "textDocument/publishDiagnostics".to_string(),
         params: serde_json::json!({
@@ -336,7 +337,7 @@ fn refresh(
     let notes = notes_of(docs, uri);
     let notification = {
         let text = &docs[uri].text;
-        publish(uri, text, notes.error.as_ref())
+        publish(uri, text, &notes.errors)
     };
     if let Some(opened) = docs.get_mut(uri) {
         opened.sites = notes.sites;
@@ -872,6 +873,7 @@ mod tests {
         assert!(triggers.iter().any(|item| item == "="));
         assert!(triggers.iter().any(|item| item == ":"));
         assert!(triggers.iter().any(|item| item == "#"));
+        assert!(triggers.iter().any(|item| item == "@"));
 
         client
             .sender
@@ -1269,6 +1271,112 @@ mod tests {
             .unwrap();
         server.join().unwrap().unwrap();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publishes_every_word_error_and_hovers_the_next_word() {
+        let (server, client) = Connection::memory();
+        let server = thread::spawn(move || serve(server));
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(1),
+                method: "initialize".to_string(),
+                params: json!({ "processId": null, "capabilities": {} }),
+            }))
+            .unwrap();
+        client
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("initialize response");
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "initialized".to_string(),
+                params: json!({}),
+            }))
+            .unwrap();
+        let source = ": broken ( Int -- Int )\n  dup\n: later ( Int -- Int )\n  dup drop\n: also ( Int -- Int )\n  swap\n";
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "textDocument/didOpen".to_string(),
+                params: json!({
+                    "textDocument": {
+                        "uri": "file:///tmp/Words.ply",
+                        "languageId": "ply",
+                        "version": 1,
+                        "text": source,
+                    }
+                }),
+            }))
+            .unwrap();
+        let published = client
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("diagnostics");
+        let Message::Notification(notification) = published else {
+            panic!("expected diagnostics, got {published:?}");
+        };
+        let diagnostics = notification.params["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert!(
+            diagnostics[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("type mismatch"),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics[1]["message"]
+                .as_str()
+                .unwrap()
+                .contains("stack underflow"),
+            "{diagnostics:?}"
+        );
+
+        let drop_at = source.rfind("drop").unwrap();
+        let (line, character) = position(source, drop_at);
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(2),
+                method: "textDocument/hover".to_string(),
+                params: json!({
+                    "textDocument": { "uri": "file:///tmp/Words.ply" },
+                    "position": { "line": line, "character": character },
+                }),
+            }))
+            .unwrap();
+        let hovered = client
+            .receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("hover");
+        let Message::Response(response) = hovered else {
+            panic!("expected hover, got {hovered:?}");
+        };
+        let contents = response.result.unwrap()["contents"]["value"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(contents.contains("Int Int -- Int"), "{contents}");
+
+        client
+            .sender
+            .send(Message::Request(Request {
+                id: RequestId::from(3),
+                method: "shutdown".to_string(),
+                params: json!(null),
+            }))
+            .unwrap();
+        client
+            .sender
+            .send(Message::Notification(Notification {
+                method: "exit".to_string(),
+                params: json!(null),
+            }))
+            .unwrap();
+        server.join().unwrap().unwrap();
     }
 
     fn drain_diagnostics(client: &Connection) -> Vec<serde_json::Value> {

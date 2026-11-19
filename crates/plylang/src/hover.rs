@@ -535,6 +535,7 @@ mod tests {
     use std::path::Path;
 
     use super::hover;
+    use crate::buffer_notes;
 
     #[test]
     fn hovers_a_class_method_with_its_constraint() {
@@ -643,6 +644,58 @@ mod tests {
         let name = at(source, "double");
         let hovered = hover(source, Path::new("M.ply"), name.0, name.1).unwrap();
         assert_eq!(hovered.contents, "```ply\n: double ( Int -- Int )\n```");
+    }
+
+    #[test]
+    fn checks_words_below_a_failed_word() {
+        let source = "\
+: broken ( Int -- Int )
+  dup
+
+: later ( Int -- Int )
+  dup drop
+
+: uses ( Int -- Int )
+  broken
+
+: also ( Int -- Int )
+  swap
+
+? \"kept\" <
+  1n
+> [
+  1n
+]
+";
+        let notes = buffer_notes(Path::new("M.ply"), source);
+        let messages: Vec<&str> = notes
+            .errors
+            .iter()
+            .map(|error| error.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            ["type mismatch: expected .._, found Int", "stack underflow",],
+            "{messages:?}"
+        );
+        let drop = source.rfind("drop").unwrap();
+        let (line, character) = at_offset(source, drop);
+        let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert!(
+            hovered.contents.contains("Int Int -- Int"),
+            "{}",
+            hovered.contents
+        );
+        let call = source.rfind("broken").unwrap();
+        let (line, character) = at_offset(source, call);
+        let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
+        assert!(
+            hovered.contents.contains("Int -- Int"),
+            "{}",
+            hovered.contents
+        );
+        let kept = source.rfind("1n").unwrap();
+        assert_eq!(gap_at(source, kept + 2), "```ply\n. Int\n```");
     }
 
     #[test]
