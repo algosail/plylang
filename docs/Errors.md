@@ -1120,3 +1120,19 @@ Fix: write `[ program ]` after the picture.
 A pattern names a parameter of a type whose arity is above two. `Nullary`, `Unary`, and `Binary` cover arities zero, one, and two. A missing instance is `no instance for Unary Hub`, not this error. `(Array Num)` calls that instance's parameter word.
 
 Fix: match the head once that module defines `Unary`. A type of arity above two has no parameter test.
+
+## PL0143
+
+`expected BASE digits`
+
+`0b`, `0o`, or `0x` has no digit of that base (`0b`, `0x`), or a digit outside it (`0b2`, `0o8`). `_` right after the prefix is the same error (`0b_1`).
+
+Fix: write a digit of that base. Binary is `0` and `1`. Octal is `0` through `7`. Hex is `0` through `9` and `a` through `f`.
+
+## PL0144
+
+`numeric separator needs a digit`
+
+`_` in a numeric literal is not between two digits (`1_`, `1__0`, `0b1_`).
+
+Fix: put a digit of the same base on each side (`1_000`, `0xFF_FF`), or drop the `_`.

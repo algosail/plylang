@@ -8,7 +8,7 @@ A function type is a stack effect, `( -- a )`. It is not a name in this list.
 
 ## Int
 
-No parameters. A literal is a plain integer and the suffix `n`: `0n`, `42n`, `-42n`. `1name` is the number `1` and the name `name`. A fraction or an exponent is [`Num`](#num), so the suffix `n` is not part of it.
+No parameters. A literal is a plain integer and the suffix `n`: `0n`, `42n`, `-42n`. A base prefix is `0b`, `0o`, or `0x`: `0b1010n`, `0o755n`, `0xFFn`, `-0x10n`. `_` may separate digits: `1_000n`, `0xFF_FFn`. `1name` is the number `1` and the name `name`. A fraction or an exponent is [`Num`](#num), so the suffix `n` is not part of it.
 
 JavaScript emits a `bigint`.
 
@@ -16,7 +16,7 @@ An equation does not cover every `Int`. The last arm is a name or `_`.
 
 ## Num
 
-No parameters. A literal is a JavaScript number: `1`, `42`, `1.5`, `1e-3`, `-2.5`. `1.0` is a number. `1.` is the number `1` and a separate `.`.
+No parameters. A literal is a JavaScript number: `1`, `42`, `1.5`, `1e-3`, `-2.5`. A base prefix is `0b`, `0o`, or `0x`: `0b1010`, `0o10`, `0xFF`. `_` may separate digits: `1_000`, `1.5_0`, `0b1111_0000`. A based literal has no fraction and no exponent. `1.0` is a number. `1.` is the number `1` and a separate `.`.
 
 JavaScript emits a number.
 

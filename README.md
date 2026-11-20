@@ -42,7 +42,7 @@ Five built-in types and `Array` are visible in every module. They cannot be rede
 | `Bool` | `true`, `false`          | boolean       |
 | `Unit` | `unit`                   | `undefined`   |
 
-`(Array a)` is an array. Bare digits are `Num`, an ordinary number in JavaScript. `Int` is written with the suffix `n` and becomes a `bigint`. In the examples below a number is `Num`. `1.0` is a number. `1.` is the number `1` and a separate dot. A string accepts `\\`, `\"`, `\n`, `\t`, and `\r`.
+`(Array a)` is an array. Bare digits are `Num`, an ordinary number in JavaScript. `Int` is written with the suffix `n` and becomes a `bigint`. A base prefix is `0b`, `0o`, or `0x`, and the same suffix makes that integer an `Int`: `0b1010`, `0b1010n`, `0o10`, `0xFF`. `_` separates digits: `1_000`, `0xFF_FF`. In the examples below a number is `Num`. `1.0` is a number. `1.` is the number `1` and a separate dot. A string accepts `\\`, `\"`, `\n`, `\t`, and `\r`.
 
 `unit` is the one value of type `Unit`. It needs no import. `Unit ->` leaves that value when `Nullary` for `Unit` is visible.
 

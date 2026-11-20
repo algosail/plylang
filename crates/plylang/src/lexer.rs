@@ -354,16 +354,30 @@ impl<'a> Lexer<'a> {
     }
 
     fn number(&mut self, start: usize) -> Result<Token, Diagnostic> {
-        while self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
-            self.bump();
+        // `next_token` has consumed the first digit. `dash` has consumed only
+        // the minus, so the first digit is still ahead. `00` stays decimal.
+        // A fraction or an exponent is not part of a based literal.
+        let signed = self.source[start..].starts_with('-');
+        if signed {
+            if self.peek() == Some('0') {
+                if let Some(radix) = Radix::from_marker(self.peek_at(1)) {
+                    self.bump();
+                    self.bump();
+                    return self.radix_number(start, radix);
+                }
+            }
+        } else if self.source[start..].starts_with('0') {
+            if let Some(radix) = Radix::from_marker(self.peek()) {
+                self.bump();
+                return self.radix_number(start, radix);
+            }
         }
+        self.separated_digits(start, |ch| ch.is_ascii_digit())?;
         let mut float = false;
         if self.peek() == Some('.') && self.peek_at(1).is_some_and(|ch| ch.is_ascii_digit()) {
             float = true;
             self.bump();
-            while self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
-                self.bump();
-            }
+            self.separated_digits(start, |ch| ch.is_ascii_digit())?;
         }
         if matches!(self.peek(), Some('e' | 'E')) {
             float = true;
@@ -374,12 +388,59 @@ impl<'a> Lexer<'a> {
             if !self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
                 return Err(self.error(start, Error::ExpectedExponentDigits));
             }
-            while self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+            self.separated_digits(start, |ch| ch.is_ascii_digit())?;
+        }
+        self.finish_number(start, float)
+    }
+
+    /// `0b1010`, `0o10`, `0xFF`. The marker is already consumed.
+    fn radix_number(&mut self, start: usize, radix: Radix) -> Result<Token, Diagnostic> {
+        if !self.peek().is_some_and(|ch| radix.digit(ch)) {
+            if self
+                .peek()
+                .is_some_and(|ch| ch.is_ascii_digit() || ch == '_')
+            {
                 self.bump();
             }
+            return Err(self.error(start, Error::ExpectedRadixDigits(radix.label())));
         }
-        // `1n` is Int. `1name` stays the number `1` and the name `name`.
-        // A fraction or an exponent is always Number: the suffix is not part of it.
+        self.separated_digits(start, |ch| radix.digit(ch))?;
+        // `0b12` is one bad literal. `0xfg` is `0xf` and the name `g`.
+        if self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+            self.bump();
+            return Err(self.error(start, Error::ExpectedRadixDigits(radix.label())));
+        }
+        self.finish_number(start, false)
+    }
+
+    /// Digits of one base. `_` stands only between two of those digits.
+    /// The first digit may already have been consumed.
+    fn separated_digits(
+        &mut self,
+        start: usize,
+        accept: impl Fn(char) -> bool,
+    ) -> Result<(), Diagnostic> {
+        loop {
+            if self.peek() == Some('_') && self.peek_at(1).is_some_and(&accept) {
+                self.bump();
+                continue;
+            }
+            if self.peek().is_some_and(&accept) {
+                self.bump();
+                continue;
+            }
+            if self.peek() == Some('_') {
+                self.bump();
+                return Err(self.error(start, Error::ExpectedSeparatorDigit));
+            }
+            break;
+        }
+        Ok(())
+    }
+
+    /// `1n` is Int. `1name` stays the number `1` and the name `name`.
+    /// A fraction or an exponent is always Number: the suffix is not part of it.
+    fn finish_number(&mut self, start: usize, float: bool) -> Result<Token, Diagnostic> {
         if !float && self.peek() == Some('n') && !self.peek_at(1).is_some_and(is_ident_continue) {
             let digits_end = self.index;
             self.bump();
@@ -388,6 +449,40 @@ impl<'a> Lexer<'a> {
         }
         let lexeme = self.source[start..self.index].to_string();
         Ok(self.make(TokenKind::Number(lexeme), start, self.index))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Radix {
+    Binary,
+    Octal,
+    Hex,
+}
+
+impl Radix {
+    fn from_marker(ch: Option<char>) -> Option<Self> {
+        match ch {
+            Some('b' | 'B') => Some(Self::Binary),
+            Some('o' | 'O') => Some(Self::Octal),
+            Some('x' | 'X') => Some(Self::Hex),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Binary => "binary",
+            Self::Octal => "octal",
+            Self::Hex => "hex",
+        }
+    }
+
+    fn digit(self, ch: char) -> bool {
+        match self {
+            Self::Binary => ch == '0' || ch == '1',
+            Self::Octal => matches!(ch, '0'..='7'),
+            Self::Hex => ch.is_ascii_hexdigit(),
+        }
     }
 }
 
@@ -548,6 +643,59 @@ mod tests {
                 "Ident(\"eqInt\")".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn based_literals_and_separators() {
+        assert_eq!(
+            spell("0b1010 0B11 0o10 0O7 0xFF 0Xff -0x10 0b1010n -0o10n 0xFF_FFn 1_000 1_000n 1.5_0 1e1_2 0b1010name 0xfg 00 0n"),
+            vec![
+                "Number(\"0b1010\")".to_string(),
+                "Number(\"0B11\")".to_string(),
+                "Number(\"0o10\")".to_string(),
+                "Number(\"0O7\")".to_string(),
+                "Number(\"0xFF\")".to_string(),
+                "Number(\"0Xff\")".to_string(),
+                "Number(\"-0x10\")".to_string(),
+                "Int(\"0b1010\")".to_string(),
+                "Int(\"-0o10\")".to_string(),
+                "Int(\"0xFF_FF\")".to_string(),
+                "Number(\"1_000\")".to_string(),
+                "Int(\"1_000\")".to_string(),
+                "Number(\"1.5_0\")".to_string(),
+                "Number(\"1e1_2\")".to_string(),
+                "Number(\"0b1010\")".to_string(),
+                "Ident(\"name\")".to_string(),
+                "Number(\"0xf\")".to_string(),
+                "Ident(\"g\")".to_string(),
+                "Number(\"00\")".to_string(),
+                "Int(\"0\")".to_string(),
+            ]
+        );
+        assert_eq!(
+            spell("0b1.1\n0n"),
+            vec![
+                "Number(\"0b1\")".to_string(),
+                "Newline".to_string(),
+                "Int(\"0\")".to_string(),
+            ]
+        );
+        for (source, message) in [
+            ("0b", "expected binary digits"),
+            ("0b2", "expected binary digits"),
+            ("0b12", "expected binary digits"),
+            ("0b_1", "expected binary digits"),
+            ("0o8", "expected octal digits"),
+            ("0x", "expected hex digits"),
+            ("0xG", "expected hex digits"),
+            ("1_", "numeric separator needs a digit"),
+            ("1__0", "numeric separator needs a digit"),
+            ("0b1_", "numeric separator needs a digit"),
+            ("1e+_2", "expected exponent digits"),
+        ] {
+            let error = tokenize(source).unwrap_err();
+            assert_eq!(error.message, message, "{source}");
+        }
     }
 
     #[test]

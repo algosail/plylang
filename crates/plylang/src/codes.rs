@@ -224,6 +224,10 @@ pub enum Error {
     ExpectedProbeProgram,
     /// A pattern names a parameter of a type whose arity is above two.
     NoElementTest(String),
+    /// `0b`, `0o`, or `0x` has no digit of that base, or a digit outside it.
+    ExpectedRadixDigits(&'static str),
+    /// `_` in a numeric literal is not between two digits.
+    ExpectedSeparatorDigit,
 }
 
 impl Error {
@@ -497,6 +501,8 @@ impl Error {
             ExpectedProbePicture => static_text("PL0140", "expected a stack picture"),
             ExpectedProbeProgram => static_text("PL0141", "expected a quotation"),
             NoElementTest(name) => ("PL0142", format!("{name} has no element test")),
+            ExpectedRadixDigits(base) => ("PL0143", format!("expected {base} digits")),
+            ExpectedSeparatorDigit => static_text("PL0144", "numeric separator needs a digit"),
         }
     }
 }
@@ -1096,8 +1102,18 @@ mod tests {
                 "Triple has no element test",
                 "PL0142",
             ),
+            (
+                Error::ExpectedRadixDigits("binary"),
+                "expected binary digits",
+                "PL0143",
+            ),
+            (
+                Error::ExpectedSeparatorDigit,
+                "numeric separator needs a digit",
+                "PL0144",
+            ),
         ];
-        assert_eq!(samples.len(), 136);
+        assert_eq!(samples.len(), 138);
         for (error, message, code) in samples {
             assert_eq!(error.code(), code, "{message}");
             assert_eq!(error.message(), message);

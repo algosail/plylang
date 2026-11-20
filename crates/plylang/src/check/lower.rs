@@ -3185,6 +3185,65 @@ if (tag(null) !== 0) throw new Error("tag null");
     }
 
     #[test]
+    fn javascript_runs_based_literals() {
+        run(
+            r#"
+: bin ( -- Num )
+  0b1010
+
+: oct ( -- Num )
+  0o10
+
+: hex ( -- Num )
+  0xFF
+
+: grouped ( -- Num )
+  1_000
+
+: frac ( -- Num )
+  1.5_0
+
+: exp ( -- Num )
+  1e1_2
+
+: bits ( -- Int )
+  0b1010n
+
+: wide ( -- Int )
+  -0x10n
+
+: mask ( -- Int )
+  0xFF_FFn
+
+: seen ( Num -- Num )
+  0b1010 -> 1
+  0x10 -> 2
+  _ -> drop 0
+
+: seenInt ( Int -- Int )
+  0o10n -> 1n
+  _ -> drop 0n
+"#,
+            r#"
+if (bin() !== 10) throw new Error("bin");
+if (oct() !== 8) throw new Error("oct");
+if (hex() !== 255) throw new Error("hex");
+if (grouped() !== 1000) throw new Error("grouped");
+if (frac() !== 1.5) throw new Error("frac");
+if (exp() !== 1e12) throw new Error("exp");
+if (bits() !== 10n) throw new Error("bits");
+if (wide() !== -16n) throw new Error("wide");
+if (mask() !== 65535n) throw new Error("mask");
+if (seen(10) !== 1) throw new Error("seen bin");
+if (seen(16) !== 2) throw new Error("seen hex");
+if (seen(3) !== 0) throw new Error("seen other");
+if (seenInt(8n) !== 1n) throw new Error("seen int");
+if (seenInt(9n) !== 0n) throw new Error("seen int other");
+"#,
+        );
+    }
+
+    #[test]
     fn javascript_runs_a_three_arm_match() {
         run(
             r#"
