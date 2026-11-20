@@ -806,7 +806,7 @@ mod tests {
         assert_eq!(contents["kind"].as_str().unwrap(), "markdown");
         assert_eq!(
             contents["value"].as_str().unwrap(),
-            "```ply\n: dup ( ..s a -- ..s a a )\n```\n\nCopies the top value. On `x y` the result is `x y y`.\n\n```ply\nInt -- Int Int\n```"
+            "```ply\n: dup ( ..s a -- ..s a a )\n```\n\nCopies the top value. On `x y` the result is `x y y`.\n\n```ply\nInt\nInt Int\n```"
         );
 
         client
@@ -1465,7 +1465,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        assert!(contents.contains("Int Int -- Int"), "{contents}");
+        assert!(contents.contains("Int Int\nInt"), "{contents}");
 
         client
             .sender

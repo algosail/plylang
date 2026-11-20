@@ -4487,7 +4487,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             found.contents,
-            "```ply\n: add ( Int Int -- Int )\n```\n\nAdd two integers.\n\n```ply\nInt Int -- Int\n```"
+            "```ply\n: add ( Int Int -- Int )\n```\n\nAdd two integers.\n\n```ply\nInt Int\nInt\n```"
         );
     }
 

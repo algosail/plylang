@@ -1,7 +1,8 @@
 //! Hover is markdown. A named `ply` block is the declared scheme. Prose from the `..`
-//! lines above that declaration sits under it. One unwrapped line with `--` and no
-//! name is this use. A field word has no scheme, so that line is its whole hover.
-//! A gap shows only the stack. A `?` check shows that stack inside `< >` and `[ ]`.
+//! lines above that declaration sits under it. This use is two lines in one block:
+//! the stack before the word, then the stack after it. A field word has no scheme,
+//! so that block is its whole hover. A gap shows only the stack. A `?` check shows
+//! that stack inside `< >` and `[ ]`.
 
 use std::path::Path;
 
@@ -546,7 +547,7 @@ mod tests {
         let used = hover(source, Path::new("M.ply"), use_at.0, use_at.1).unwrap();
         assert_eq!(
             used.contents,
-            "```ply\neq ( Eq a => a a -- Bool )\n```\n\n```ply\nInt Int -- Bool\n```"
+            "```ply\neq ( Eq a => a a -- Bool )\n```\n\n```ply\nInt Int\nBool\n```"
         );
     }
 
@@ -566,7 +567,7 @@ mod tests {
         let used = hover(source, Path::new("M.ply"), use_at.0, use_at.1).unwrap();
         assert_eq!(
             used.contents,
-            "```ply\neq ( Eq a => a a -- Bool )\n```\n\nEquality.\n\n```ply\nInt Int -- Bool\n```"
+            "```ply\neq ( Eq a => a a -- Bool )\n```\n\nEquality.\n\n```ply\nInt Int\nBool\n```"
         );
     }
 
@@ -592,7 +593,7 @@ mod tests {
         let used = hover(source, Path::new("M.ply"), use_at.0, use_at.1).unwrap();
         assert_eq!(
             used.contents,
-            "```ply\neq ( Eq a => a a -- Bool )\n```\n\nTwo values are the same.\n\nThe top two.\n\n```ply\nInt Int -- Bool\n```"
+            "```ply\neq ( Eq a => a a -- Bool )\n```\n\nTwo values are the same.\n\nThe top two.\n\n```ply\nInt Int\nBool\n```"
         );
     }
 
@@ -633,13 +634,13 @@ mod tests {
         let hovered = hover(source, Path::new("M.ply"), dup.0, dup.1).unwrap();
         assert_eq!(
             hovered.contents,
-            "```ply\n: dup ( ..s a -- ..s a a )\n```\n\nCopies the top value. On `x y` the result is `x y y`.\n\n```ply\nInt -- Int Int\n```"
+            "```ply\n: dup ( ..s a -- ..s a a )\n```\n\nCopies the top value. On `x y` the result is `x y y`.\n\n```ply\nInt\nInt Int\n```"
         );
         let drop = at(source, "drop");
         let hovered = hover(source, Path::new("M.ply"), drop.0, drop.1).unwrap();
         assert_eq!(
             hovered.contents,
-            "```ply\n: drop ( ..s a -- ..s )\n```\n\nDrops the top value. On `x y` the result is `x`.\n\n```ply\nInt Int -- Int\n```"
+            "```ply\n: drop ( ..s a -- ..s )\n```\n\nDrops the top value. On `x y` the result is `x`.\n\n```ply\nInt Int\nInt\n```"
         );
         let name = at(source, "double");
         let hovered = hover(source, Path::new("M.ply"), name.0, name.1).unwrap();
@@ -682,7 +683,7 @@ mod tests {
         let (line, character) = at_offset(source, drop);
         let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
         assert!(
-            hovered.contents.contains("Int Int -- Int"),
+            hovered.contents.contains("Int Int\nInt"),
             "{}",
             hovered.contents
         );
@@ -712,7 +713,7 @@ mod tests {
         let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
         assert_eq!(
             hovered.contents,
-            "```ply\n: double ( Int -- Int )\n```\n\nCopy the top value.\nIt becomes the new top.\n\n```ply\nInt -- Int\n```"
+            "```ply\n: double ( Int -- Int )\n```\n\nCopy the top value.\nIt becomes the new top.\n\n```ply\nInt\nInt\n```"
         );
         let plain = ". not the doc\n: id ( Int -- Int )\n  dup drop\n";
         let id = at(plain, "id");
@@ -758,7 +759,7 @@ mod tests {
         let hovered = hover(source, Path::new("M.ply"), line_no, character).unwrap();
         assert_eq!(
             hovered.contents,
-            "```ply\n: read ( -- Str )\n```\n\n```ply\n-- Str\n```"
+            "```ply\n: read ( -- Str )\n```\n\n```ply\n.\nStr\n```"
         );
     }
 
@@ -828,7 +829,7 @@ mod tests {
         let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
         assert_eq!(
             hovered.contents,
-            "```ply\n: hold ( Int -- Int )\n```\n\n```ply\n. Int -- . Int\n```"
+            "```ply\n: hold ( Int -- Int )\n```\n\n```ply\n. Int\n. Int\n```"
         );
 
         let nested = "\
@@ -843,7 +844,7 @@ mod tests {
         let hovered = hover(nested, Path::new("M.ply"), line, character).unwrap();
         assert_eq!(
             hovered.contents,
-            "```ply\n: dup ( ..s a -- ..s a a )\n```\n\nCopies the top value. On `x y` the result is `x y y`.\n\n```ply\n. Int -- . Int Int\n```"
+            "```ply\n: dup ( ..s a -- ..s a a )\n```\n\nCopies the top value. On `x y` the result is `x y y`.\n\n```ply\n. Int\n. Int Int\n```"
         );
         assert_eq!(gap_at(nested, dup + "dup".len()), "```ply\n. Int Int\n```");
 
@@ -894,13 +895,13 @@ mod tests {
         let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
         assert_eq!(
             hovered.contents,
-            "```ply\n: dup ( ..s a -- ..s a a )\n```\n\nCopies the top value. On `x y` the result is `x y y`.\n\n```ply\nInt -- Int Int\n```"
+            "```ply\n: dup ( ..s a -- ..s a a )\n```\n\nCopies the top value. On `x y` the result is `x y y`.\n\n```ply\nInt\nInt Int\n```"
         );
         let drop = at(source, "drop");
         let hovered = hover(source, Path::new("M.ply"), drop.0, drop.1).unwrap();
         assert_eq!(
             hovered.contents,
-            "```ply\n: drop ( ..s a -- ..s )\n```\n\nDrops the top value. On `x y` the result is `x`.\n\n```ply\nInt --\n```"
+            "```ply\n: drop ( ..s a -- ..s )\n```\n\nDrops the top value. On `x y` the result is `x`.\n\n```ply\nInt\n.\n```"
         );
     }
 
@@ -946,8 +947,12 @@ mod tests {
             .unwrap()
             .trim_start_matches("```ply\n")
             .trim_end_matches("\n```");
-        assert!(!inferred.contains('\n'), "{inferred}");
-        assert!(inferred.contains("--"), "{inferred}");
+        let lines: Vec<&str> = inferred.split('\n').collect();
+        assert_eq!(lines.len(), 2, "{inferred}");
+        assert!(
+            lines.iter().all(|line| line.matches("--").count() == 1),
+            "{inferred}"
+        );
     }
 
     #[test]
@@ -1003,7 +1008,7 @@ mod tests {
         let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
         assert_eq!(
             hovered.contents,
-            "```ply\n: older ( Human -- Human )\n```\n\n```ply\nHuman -- Human\n```"
+            "```ply\n: older ( Human -- Human )\n```\n\n```ply\nHuman\nHuman\n```"
         );
         let between = source.find("37 >>age").unwrap();
         let (line, character) = at_offset(source, between + "37".len());
@@ -1014,7 +1019,7 @@ mod tests {
         let (line, character) = at_offset(source, outer);
         let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
         assert!(
-            hovered.contents.ends_with("```ply\nOuter -- Outer\n```"),
+            hovered.contents.ends_with("```ply\nOuter\nOuter\n```"),
             "{}",
             hovered.contents
         );
@@ -1026,7 +1031,7 @@ mod tests {
         assert!(
             hovered
                 .contents
-                .ends_with("```ply\n(Pair Int Str) -- (Pair Int Str) (Pair Int Str)\n```"),
+                .ends_with("```ply\n(Pair Int Str)\n(Pair Int Str) (Pair Int Str)\n```"),
             "{}",
             hovered.contents
         );
@@ -1035,7 +1040,7 @@ mod tests {
         let (line, character) = at_offset(source, widen);
         let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
         assert!(
-            hovered.contents.ends_with("```ply\nAge -- Int\n```"),
+            hovered.contents.ends_with("```ply\nAge\nInt\n```"),
             "{}",
             hovered.contents
         );
@@ -1044,7 +1049,7 @@ mod tests {
         let (line, character) = at_offset(source, plain);
         let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
         assert!(
-            hovered.contents.ends_with("```ply\nInt -- Int\n```"),
+            hovered.contents.ends_with("```ply\nInt\nInt\n```"),
             "{}",
             hovered.contents
         );
@@ -1052,17 +1057,17 @@ mod tests {
         let name = source.find("name>>").unwrap();
         let (line, character) = at_offset(source, name);
         let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
-        assert_eq!(hovered.contents, "```ply\nOuter -- Str\n```");
+        assert_eq!(hovered.contents, "```ply\nOuter\nStr\n```");
         let age = source.find(">>age").unwrap();
         let (line, character) = at_offset(source, age);
         let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
-        assert_eq!(hovered.contents, "```ply\nHuman Num -- Human\n```");
+        assert_eq!(hovered.contents, "```ply\nHuman Num\nHuman\n```");
 
         let row = source.rfind("\n  read").unwrap() + 3;
         let (line, character) = at_offset(source, row);
         let hovered = hover(source, Path::new("M.ply"), line, character).unwrap();
         assert!(
-            hovered.contents.ends_with("```ply\nOuter -- Str\n```"),
+            hovered.contents.ends_with("```ply\nOuter\nStr\n```"),
             "{}",
             hovered.contents
         );

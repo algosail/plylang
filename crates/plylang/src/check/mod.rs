@@ -88,7 +88,7 @@ pub struct StackAt {
     pub ctors: Vec<Option<String>>,
     /// Stack after the term. Absent when checking stopped on this term.
     pub after: Option<String>,
-    /// Instantiated `input -- output` of a word at this use.
+    /// Stack before this word, then the stack after it, on two lines.
     pub here: Option<String>,
 }
 
@@ -3965,16 +3965,12 @@ impl Checker {
         }
     }
 
+    /// The stack before the word, then the stack after it. One block keeps both
+    /// lines on one scrollbar. An effect row stays at the end of the second line.
     fn show_note_effect(&self, input: StackId, output: StackId, effect: EffectId) -> String {
         let input = self.show_note(input);
         let output = self.show_note(output);
-        let line = match (input.as_str(), output.as_str()) {
-            (".", ".") => "--".to_string(),
-            (".", output) => format!("-- {output}"),
-            (input, ".") => format!("{input} --"),
-            (input, output) => format!("{input} -- {output}"),
-        };
-        format!("{line}{}", self.effect_suffix(effect))
+        format!("{input}\n{output}{}", self.effect_suffix(effect))
     }
 
     /// A bare open row prints as nothing, so a pure word keeps `Int -- Int`.
