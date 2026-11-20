@@ -985,7 +985,7 @@ Fix: name a module that `plylang build` compiles, or remove the field.
 
 A module under the source directory has no `@` list. A `?` check is not a published name and does not need one.
 
-Fix: write one `@` list. A bare `@` publishes nothing.
+Fix: write one `@` list. A bare `@` publishes no names. A module that only writes instances is still built.
 
 ## PL0126
 

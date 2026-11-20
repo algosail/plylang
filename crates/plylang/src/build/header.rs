@@ -23,18 +23,11 @@ impl Session {
 
     /// A `@` list. A name from an import is re-exported when the body does
     /// not mention it. A mentioned name is imported, and exported when `@`
-    /// lists it. A name the built program does not mention stays out of the
-    /// import. An instance word is imported from the module that defines it.
+    /// lists it or a visible instance binds it. A name the built program does
+    /// not mention stays out of the import. An instance word is imported from
+    /// the module that defines it.
     fn list_js_header(&self, id: usize, from_js: &Path, anf: &AnfModule) -> String {
-        let listed: HashSet<String> = self.units[id]
-            .module
-            .exports
-            .list()
-            .expect("name list")
-            .names
-            .iter()
-            .map(|item| item.name.clone())
-            .collect();
+        let publish = publish_names(&self.units[id].module);
         let imports = self.units[id].module.imports.clone();
         let deps = self.units[id].deps.clone();
         let referenced: HashSet<String> = referenced_words(anf).into_iter().collect();
@@ -52,10 +45,11 @@ impl Session {
             let mut local_names = Vec::new();
             let mut reexport_names = Vec::new();
             for (remote, local_name) in brought {
-                if listed.contains(&local_name) && !referenced.contains(&local_name) {
+                let exported = publish.contains(&local_name);
+                if exported && !referenced.contains(&local_name) {
                     reexport_names.push((remote, local_name));
                 } else if referenced.contains(&local_name) {
-                    if listed.contains(&local_name) && !local_exports.contains(&local_name) {
+                    if exported && !local_exports.contains(&local_name) {
                         local_exports.push(local_name.clone());
                     }
                     local_names.push((remote, local_name));
@@ -75,7 +69,7 @@ impl Session {
             &imports,
             &deps,
             &mut groups,
-            Some((&listed, &mut local_exports)),
+            Some((&publish, &mut local_exports)),
         );
         let mut header = String::new();
         for (spec, names) in &groups {
@@ -246,12 +240,7 @@ impl Session {
     /// re-exported value, a place helper, or the module that defined an instance word.
     pub(super) fn javascript_deps(&self, id: usize, anf: &AnfModule) -> Vec<usize> {
         let referenced: HashSet<String> = referenced_words(anf).into_iter().collect();
-        let listed: HashSet<String> = self.units[id]
-            .module
-            .exports
-            .list()
-            .map(|list| list.names.iter().map(|item| item.name.clone()).collect())
-            .unwrap_or_default();
+        let publish = publish_names(&self.units[id].module);
         let closed = self.units[id].module.exports.list().is_none();
         let mut found = Vec::new();
         let mut seen = HashSet::new();
@@ -268,7 +257,7 @@ impl Session {
         {
             for (_, local_name) in self.imported_values(*dep, import) {
                 let mentioned = referenced.contains(&local_name);
-                let reexport = !closed && listed.contains(&local_name) && !mentioned;
+                let reexport = !closed && publish.contains(&local_name) && !mentioned;
                 if mentioned || reexport {
                     push(*dep);
                 }
@@ -484,6 +473,19 @@ fn npm_name(root: &Path) -> Option<String> {
     } else {
         Some(name.to_string())
     }
+}
+
+/// Names `@` lists, plus words a visible instance binds.
+/// A file with no list re-exports nothing.
+fn publish_names(module: &Module) -> HashSet<String> {
+    let Some(list) = module.exports.list() else {
+        return HashSet::new();
+    };
+    let mut names: HashSet<String> = list.names.iter().map(|item| item.name.clone()).collect();
+    for name in crate::surface::own_method_words(module) {
+        names.insert(name);
+    }
+    names
 }
 
 fn local_runtime_names(module: &Module) -> HashSet<String> {

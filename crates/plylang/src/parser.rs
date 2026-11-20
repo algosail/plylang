@@ -97,7 +97,7 @@ impl Parser {
 
     /// Imports, one `@` list, and declarations, in any order. The list may
     /// stand anywhere. A second `@` is a duplicate definition. Imports stay
-    /// before the first `:`, `;`, `-`, `&`, `#`, `?`, or `=`. A bare `@` publishes
+    /// before the first `:`, `;`, `-`, `&`, `#`, `?`, or `=`. A bare `@` names
     /// nothing. Commas separate names. A newline does not, so the list ends
     /// at the next column-0 declaration.
     fn parse_contents(&mut self) -> Result<(Exports, Vec<Import>, Vec<Item>), Diagnostic> {

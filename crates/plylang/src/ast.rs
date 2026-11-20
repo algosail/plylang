@@ -15,7 +15,7 @@ pub struct Module {
 /// The names another module can import.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Exports {
-    /// Written `@ names`. A bare `@` publishes nothing.
+    /// Written `@ names`. A bare `@` names nothing.
     List(PublicList),
     /// No list. Nothing leaves the file. A test entry is this, and so is a
     /// snippet checked outside a package.

@@ -58,11 +58,11 @@ function show(value) {
     if (value.length === 0) return "<>";
     return "< " + value.map(show).join(" ") + " >";
   }
-  if (typeof value.tag === "string") {
-    const fields = Object.keys(value).filter((key) => key !== "tag");
-    if (fields.length === 0) return value.tag;
-    if (fields.length === 1 && fields[0] === "value") return value.tag + " " + show(value.value);
-    return value.tag + " " + fields.map((key) => key + ": " + show(value[key])).join(" ");
+  if (typeof value.__PLY_TAG__ === "string") {
+    const fields = Object.keys(value).filter((key) => key !== "__PLY_TAG__");
+    if (fields.length === 0) return value.__PLY_TAG__;
+    if (fields.length === 1 && fields[0] === "value") return value.__PLY_TAG__ + " " + show(value.value);
+    return value.__PLY_TAG__ + " " + fields.map((key) => key + ": " + show(value[key])).join(" ");
   }
   return JSON.stringify(value);
 }
@@ -413,7 +413,8 @@ fn execute(
             .map(|time| time.as_nanos())
             .unwrap_or(0)
     ));
-    fs::write(&harness, HARNESS).map_err(|error| error.to_string())?;
+    fs::write(&harness, HARNESS.replace("__PLY_TAG__", crate::anf::TAG))
+        .map_err(|error| error.to_string())?;
     let result = std::env::temp_dir().join(format!(
         "plylang-test-result-{}-{}.json",
         std::process::id(),

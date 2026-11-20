@@ -453,7 +453,8 @@ struct InstanceMethod {
 
 /// A solved constraint. `Assumption` is a dictionary parameter of the current def.
 /// `Super` projects a superclass dictionary out of another dictionary.
-#[derive(Clone, Debug)]
+/// Equality is structural, so one pure dictionary can be built once per module.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Dict {
     Assumption(usize),
     Super {
@@ -467,7 +468,7 @@ enum Dict {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ResolvedMethod {
     name: String,
     word: String,
@@ -596,6 +597,12 @@ struct Checker {
     bind_arity: HashMap<(Span, String), (usize, usize)>,
     /// Solved form of [`deferred`], keyed by the use span. The second lower pass reads it.
     use_dicts: HashMap<Span, Vec<Dict>>,
+    /// Pure dictionaries already kept for this module. The key is the solved dictionary.
+    dict_ids: HashMap<Dict, u32>,
+    dict_lets: Vec<crate::anf::Let>,
+    /// Dictionaries of the lower pass that is running. Kept only when that pass is the one emitted.
+    pending_dict_ids: HashMap<Dict, u32>,
+    pending_dict_lets: Vec<crate::anf::Let>,
     /// Instance words lowered in this module, with the `#` that selected them.
     method_homes: Vec<crate::anf::MethodHome>,
     /// Parallel to [`assumptions`] while lowering. Empty during checking.
@@ -670,6 +677,10 @@ impl Checker {
             bind_tys: Vec::new(),
             bind_arity: HashMap::new(),
             use_dicts: HashMap::new(),
+            dict_ids: HashMap::new(),
+            dict_lets: Vec::new(),
+            pending_dict_ids: HashMap::new(),
+            pending_dict_lets: Vec::new(),
             method_homes: Vec::new(),
             assumption_locals: Vec::new(),
             solving: Vec::new(),
@@ -728,6 +739,10 @@ impl Checker {
         self.bind_tys.clear();
         self.bind_arity.clear();
         self.use_dicts.clear();
+        self.dict_ids.clear();
+        self.dict_lets.clear();
+        self.pending_dict_ids.clear();
+        self.pending_dict_lets.clear();
         self.method_homes.clear();
         self.assumption_locals.clear();
         self.solving.clear();
@@ -795,7 +810,7 @@ impl Checker {
         let origin = self.module_key.clone();
         for item in &module.items {
             if let Item::Instance(instance) = item {
-                self.declare_instance(instance, module, true, &origin)?;
+                self.declare_instance(instance, module, true, &origin, &[], "")?;
             }
         }
         self.check_closed_surface(module)
@@ -6090,10 +6105,10 @@ mod tests {
         )
         .unwrap();
         let js = alias.anf.javascript();
-        assert!(js.contains(".tag === \"Just\""), "{js}");
+        assert!(js.contains(".$$tag === \"Just\""), "{js}");
         assert!(js.contains("Bus$Nothing"), "{js}");
         assert!(js.contains("Bus$fromMaybe"), "{js}");
-        assert!(!js.contains(".tag === \"Bus"), "{js}");
+        assert!(!js.contains(".$$tag === \"Bus"), "{js}");
         let partial = check_import(
             "~ \"Data/Maybe\" : Bus\n\n: open ( (Bus:Maybe Int) -- Int )\n  (Bus:Just x) -> x\n",
         )
@@ -6113,10 +6128,13 @@ mod tests {
         )
         .unwrap();
         let renamed_js = renamed.anf.javascript();
-        assert!(renamed_js.contains(".tag === \"Nothing\""), "{renamed_js}");
+        assert!(
+            renamed_js.contains(".$$tag === \"Nothing\""),
+            "{renamed_js}"
+        );
         assert!(renamed_js.contains("Yes("), "{renamed_js}");
-        assert!(!renamed_js.contains(".tag === \"Yes\""), "{renamed_js}");
-        assert!(!renamed_js.contains(".tag === \"No\""), "{renamed_js}");
+        assert!(!renamed_js.contains(".$$tag === \"Yes\""), "{renamed_js}");
+        assert!(!renamed_js.contains(".$$tag === \"No\""), "{renamed_js}");
         check_import(
             "~ \"Data/Maybe\" Maybe, Nothing : a, Nothing : b\n\n: use ( -- (Maybe Int) (Maybe Int) )\n  a b\n",
         )

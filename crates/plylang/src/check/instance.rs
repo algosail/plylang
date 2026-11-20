@@ -331,7 +331,14 @@ impl Checker {
                 if crate::surface::instance_head_is_hidden(&known_module.module, instance) {
                     continue;
                 }
-                self.declare_instance(instance, &known_module.module, false, &key)?;
+                self.declare_instance(
+                    instance,
+                    &known_module.module,
+                    false,
+                    &key,
+                    known,
+                    &known_module.origin,
+                )?;
             }
         }
         Ok(())
@@ -343,6 +350,8 @@ impl Checker {
         module: &Module,
         local: bool,
         origin: &str,
+        known: &[KnownModule],
+        file: &str,
     ) -> Result<(), Diagnostic> {
         let mut seen_classes = HashSet::new();
         for name in &instance.class_names {
@@ -393,7 +402,7 @@ impl Checker {
             }
         }
         for (name, class) in instance.class_names.iter().zip(&classes) {
-            self.declare_class_instance(instance, module, local, name, class, origin)?;
+            self.declare_class_instance(instance, module, local, name, class, origin, known, file)?;
         }
         Ok(())
     }
@@ -408,6 +417,8 @@ impl Checker {
         class_name: &str,
         class: &ClassInfo,
         origin: &str,
+        known: &[KnownModule],
+        file: &str,
     ) -> Result<(), Diagnostic> {
         if local && self.orphan(class_name, &instance.args) {
             return Err(with_head(
@@ -481,7 +492,7 @@ impl Checker {
                 .find(|binding| binding.name == method.name)
                 .expect("method was checked");
             let word = self
-                .lookup_word_scheme(module, &binding.word, binding.name_span)
+                .lookup_word_scheme(module, &binding.word, binding.name_span, local, known, file)
                 .map_err(|diag| with_method(diag, &head_text, &method.name))?;
             let (context, extra) = self
                 .check_impl(class, method, &word, &head, binding.name_span)
@@ -618,10 +629,14 @@ impl Checker {
         module: &Module,
         name: &str,
         span: Span,
+        local: bool,
+        known: &[KnownModule],
+        file: &str,
     ) -> Result<SemScheme, Diagnostic> {
         // The provider's own definition is the instance. An importer often
         // already has the class method under that name, and that scheme is
-        // not the implementation.
+        // not the implementation. A word brought in by the instance module
+        // keeps the scheme of the module that defined it.
         if let Some(def) = find_def(module, name) {
             let saved = self.relax_visibility;
             self.relax_visibility = true;
@@ -629,10 +644,70 @@ impl Checker {
             self.relax_visibility = saved;
             return result;
         }
-        if let Some(scheme) = self.lookup(name) {
+        if let Some(scheme) = self.scheme_along_imports(module, name, known, file, span)? {
             return Ok(scheme);
         }
+        if local {
+            if let Some(scheme) = self.lookup(name) {
+                return Ok(scheme);
+            }
+        }
         Err(self.error(span, Error::UndefinedWord(name.to_string())))
+    }
+
+    /// The scheme of `name` as the instance module imported it.
+    /// The search follows a re-export. It does not read the importer's scope.
+    fn scheme_along_imports(
+        &mut self,
+        module: &Module,
+        name: &str,
+        known: &[KnownModule],
+        origin: &str,
+        span: Span,
+    ) -> Result<Option<SemScheme>, Diagnostic> {
+        let mut seen = HashSet::new();
+        self.scheme_along(module, name, known, origin, span, &mut seen)
+    }
+
+    fn scheme_along(
+        &mut self,
+        module: &Module,
+        name: &str,
+        known: &[KnownModule],
+        origin: &str,
+        span: Span,
+        seen: &mut HashSet<(String, String)>,
+    ) -> Result<Option<SemScheme>, Diagnostic> {
+        let Some(known_module) = known_at(known, origin) else {
+            return Ok(None);
+        };
+        for (index, import) in module.imports.iter().enumerate() {
+            let Some(remote) = import.remote_of(name) else {
+                continue;
+            };
+            let Some(dep) = known_module.deps.get(index) else {
+                continue;
+            };
+            if !seen.insert((dep.clone(), remote.to_string())) {
+                continue;
+            }
+            let Some(provider) = known_at(known, dep) else {
+                continue;
+            };
+            if let Some(def) = find_def(&provider.module, remote) {
+                let saved = self.relax_visibility;
+                self.relax_visibility = true;
+                let result = self.elaborate_scheme(&def.scheme, span);
+                self.relax_visibility = saved;
+                return result.map(Some);
+            }
+            if let Some(found) =
+                self.scheme_along(&provider.module, remote, known, dep, span, seen)?
+            {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
     }
 
     /// The implementation word lists head dictionaries first and the method's own

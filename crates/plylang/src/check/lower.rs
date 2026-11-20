@@ -192,6 +192,7 @@ impl Checker {
         };
         let anf = AnfModule {
             datas,
+            dicts: std::mem::take(&mut self.dict_lets),
             defs,
             places,
             checks,
@@ -233,15 +234,7 @@ impl Checker {
         name: &str,
         terms: &[crate::ast::Term],
     ) -> Result<AnfDef, Diagnostic> {
-        self.use_dicts.clear();
-        self.deferred.clear();
-        let first = self.lower_check_pass(name, terms)?;
-        if self.use_dicts.is_empty() {
-            return Ok(first);
-        }
-        let second = self.lower_check_pass(name, terms)?;
-        self.use_dicts.clear();
-        Ok(second)
+        self.lower_kept(|checker| checker.lower_check_pass(name, terms))
     }
 
     fn lower_check_pass(
@@ -297,14 +290,40 @@ impl Checker {
         module: &crate::ast::Module,
         def: &crate::ast::Def,
     ) -> Result<AnfDef, Diagnostic> {
+        self.lower_kept(|checker| checker.lower_def_pass(module, def))
+    }
+
+    /// The first pass records dictionaries it could solve. A deferred use makes
+    /// that pass disposable, so its constants are dropped before the second pass
+    /// builds the ones that are actually emitted.
+    fn lower_kept(
+        &mut self,
+        mut pass: impl FnMut(&mut Self) -> Result<AnfDef, Diagnostic>,
+    ) -> Result<AnfDef, Diagnostic> {
         self.use_dicts.clear();
         self.deferred.clear();
-        let first = self.lower_def_pass(module, def)?;
+        self.drop_pending_dicts();
+        let first = match pass(self) {
+            Ok(def) => def,
+            Err(error) => {
+                self.drop_pending_dicts();
+                return Err(error);
+            }
+        };
         if self.use_dicts.is_empty() {
+            self.commit_dicts();
             return Ok(first);
         }
-        let second = self.lower_def_pass(module, def)?;
+        self.drop_pending_dicts();
+        let second = match pass(self) {
+            Ok(def) => def,
+            Err(error) => {
+                self.drop_pending_dicts();
+                return Err(error);
+            }
+        };
         self.use_dicts.clear();
+        self.commit_dicts();
         Ok(second)
     }
 
@@ -1054,19 +1073,41 @@ impl Checker {
         frame.stack.extend(binds.into_iter().map(Operand::Local));
     }
 
+    fn dict_is_pure(dict: &Dict) -> bool {
+        match dict {
+            Dict::Assumption(_) => false,
+            Dict::Super { base, .. } => Self::dict_is_pure(base),
+            Dict::Instance { methods, supers } => {
+                methods
+                    .iter()
+                    .all(|method| method.dicts.iter().all(Self::dict_is_pure))
+                    && supers.iter().all(|(_, nested)| Self::dict_is_pure(nested))
+            }
+        }
+    }
+
+    /// A dictionary with no assumption is the same object on every call, including
+    /// a call inside a branch or a quotation. It is built once, as a module constant.
+    /// A dictionary that closes over a parameter stays in the frame that built it:
+    /// that local is not in scope in another arm, or after the quotation returns.
     fn materialize_dict(&mut self, dict: &Dict, frame: &mut Frame) -> LocalId {
+        if let Some(id) = self.cached_pure(dict) {
+            return id;
+        }
         match dict {
             Dict::Assumption(index) => self.assumption_locals[*index],
             Dict::Super { base, field } => {
                 let base = self.materialize_dict(base, frame);
                 let id = self.fresh_local();
-                frame.lets.push(Let {
-                    binds: vec![id],
-                    value: Value::Prop {
+                self.keep_dict(
+                    dict,
+                    id,
+                    Value::Prop {
                         base,
                         name: field.clone(),
                     },
-                });
+                    frame,
+                );
                 id
             }
             Dict::Instance { methods, supers } => {
@@ -1098,13 +1139,42 @@ impl Checker {
                     });
                 }
                 let id = self.fresh_local();
-                frame.lets.push(Let {
-                    binds: vec![id],
-                    value: Value::Dict { fields },
-                });
+                self.keep_dict(dict, id, Value::Dict { fields }, frame);
                 id
             }
         }
+    }
+
+    fn keep_dict(&mut self, dict: &Dict, id: LocalId, value: Value, frame: &mut Frame) {
+        if Self::dict_is_pure(dict) {
+            self.pending_dict_ids.insert(dict.clone(), id);
+            self.pending_dict_lets.push(Let {
+                binds: vec![id],
+                value,
+            });
+        } else {
+            frame.lets.push(Let {
+                binds: vec![id],
+                value,
+            });
+        }
+    }
+
+    fn cached_pure(&self, dict: &Dict) -> Option<LocalId> {
+        self.dict_ids
+            .get(dict)
+            .or_else(|| self.pending_dict_ids.get(dict))
+            .copied()
+    }
+
+    fn drop_pending_dicts(&mut self) {
+        self.pending_dict_ids.clear();
+        self.pending_dict_lets.clear();
+    }
+
+    fn commit_dicts(&mut self) {
+        self.dict_ids.extend(self.pending_dict_ids.drain());
+        self.dict_lets.append(&mut self.pending_dict_lets);
     }
 
     fn instantiate_word(
@@ -2715,9 +2785,9 @@ const wrapped = pairSnd(1n, 2n);
 if (double(21n) !== 42n) throw new Error("double");
 if (fromMaybe(1n, Nothing) !== 1n) throw new Error("from nothing");
 if (fromMaybe(1n, Just(2n)) !== 2n) throw new Error("from just");
-if (mapMaybe(Nothing, double).tag !== "Nothing") throw new Error("map nothing");
+if (mapMaybe(Nothing, double).$$tag !== "Nothing") throw new Error("map nothing");
 const mapped = mapMaybe(Just(21n), double);
-if (mapped.tag !== "Just" || mapped.value !== 42n) throw new Error("map just");
+if (mapped.$$tag !== "Just" || mapped.value !== 42n) throw new Error("map just");
 if (lo !== 21n || hi !== 5n) throw new Error("dip " + lo + " " + hi);
 if (held(7n) !== 7n) throw new Error("held");
 if (twice(21n, double) !== 42n) throw new Error("call");
@@ -2890,9 +2960,9 @@ if (choose(1, 2, false) !== 2) throw new Error("choose false " + choose(1, 2, fa
 const double = (n) => n + n;
 if (fromMaybe(1n, Nothing) !== 1n) throw new Error("from nothing");
 if (fromMaybe(1n, Just(2n)) !== 2n) throw new Error("from just");
-if (mapMaybe(Nothing, double).tag !== "Nothing") throw new Error("map nothing");
+if (mapMaybe(Nothing, double).$$tag !== "Nothing") throw new Error("map nothing");
 const mapped = mapMaybe(Just(21n), double);
-if (mapped.tag !== "Just" || mapped.value !== 42n) throw new Error("map just " + mapped.value);
+if (mapped.$$tag !== "Just" || mapped.value !== 42n) throw new Error("map just " + mapped.value);
 "#
             ),
         )
@@ -3322,11 +3392,11 @@ if (use(1n, 1n) !== true) throw new Error("eq");
 if (use(1n, 2n) !== false) throw new Error("neq");
 if (useSame(1n, 1n) !== true) throw new Error("same");
 const negated = negate(Just(3n));
-if (negated.tag !== "Just" || negated.value !== -3n) throw new Error("map");
-if (negate(Nothing).tag !== "Nothing") throw new Error("map nothing");
+if (negated.$$tag !== "Just" || negated.value !== -3n) throw new Error("map");
+if (negate(Nothing).$$tag !== "Nothing") throw new Error("map nothing");
 const quotient = divInt(6n, 2n);
-if (quotient.tag !== "Just" || quotient.value !== 3n) throw new Error("div");
-if (divInt(1n, 0n).tag !== "Nothing") throw new Error("div0");
+if (quotient.$$tag !== "Just" || quotient.value !== 3n) throw new Error("div");
+if (divInt(1n, 0n).$$tag !== "Nothing") throw new Error("div0");
 "#,
         );
     }
@@ -3435,6 +3505,141 @@ if (useBoth(1n, 2n) !== false) throw new Error("both neq");
     }
 
     #[test]
+    fn a_concrete_dictionary_is_shared_at_module_scope() {
+        let body = r#"
+: foreign ieq ( Int Int -- Bool )
+
+& Eq a
+  eq ( a a -- Bool )
+
+: eqInt ( Int Int -- Bool )
+  ieq
+
+# Eq Int
+  eq = eqInt
+
+: same ( a. Eq a => a a -- Bool )
+  eq
+
+: once ( Int Int -- Bool )
+  same
+
+: twice ( Int Int Int Int -- Bool Bool )
+  [ same ] dip2 same
+
+: branch ( Int Int Bool -- Bool )
+  [ same ] [ same ] if
+
+: later ( Int Int -- ( -- Bool ) )
+  [ same ] cons cons
+
+: open ( a. Eq a => a a -- Bool )
+  same
+
+; Maybe a = Nothing | Just a
+
+: eqMaybe ( a. Eq a => (Maybe a) (Maybe a) -- Bool )
+  (Nothing ..) (Nothing ..) -> true
+  (Just _) (Nothing ..) -> false
+  (Nothing ..) (Just _) -> false
+  (Just x) (Just y) -> x y eq
+
+# Eq (Maybe a)
+  eq = eqMaybe
+
+: useOpen ( a. Eq a => (Maybe a) (Maybe a) -- Bool )
+  same
+
+: useInt ( (Maybe Int) (Maybe Int) -- Bool )
+  same
+"#;
+        let code = js(body);
+        assert_eq!(code.matches("({ eq: eqInt })").count(), 1, "{code}");
+        let head = code
+            .split("export function")
+            .next()
+            .unwrap_or(code.as_str());
+        assert!(head.contains("({ eq: eqInt })"), "{code}");
+        assert!(head.contains("eqMaybe("), "{code}");
+        let body_of = |name: &str| -> String {
+            let marker = format!("function {name}");
+            let rest = code
+                .split(&marker)
+                .nth(1)
+                .unwrap_or_else(|| panic!("missing {name}\n{code}"));
+            rest.split("\nexport function ").next().unwrap().to_string()
+        };
+        let dict_at = |text: &str, at: usize| -> String {
+            let rest = &text[at + "same(".len()..];
+            let end = rest
+                .find(|ch: char| ch == ',' || ch == ')')
+                .unwrap_or_else(|| panic!("same call\n{text}"));
+            rest[..end].to_string()
+        };
+        let same_dicts = |name: &str| -> Vec<String> {
+            let text = body_of(name);
+            text.match_indices("same(")
+                .map(|(at, _)| dict_at(&text, at))
+                .collect()
+        };
+        let shared = same_dicts("once");
+        assert_eq!(shared.len(), 1, "{code}");
+        let shared = &shared[0];
+        for name in ["twice", "branch", "later"] {
+            let dicts = same_dicts(name);
+            assert!(!dicts.is_empty(), "{name}\n{code}");
+            assert!(
+                dicts.iter().all(|dict| dict == shared),
+                "{name} {dicts:?}\n{code}"
+            );
+        }
+        for name in ["once", "twice", "branch", "later", "useInt"] {
+            assert!(
+                !body_of(name).contains("({"),
+                "{name} rebuilt a dictionary\n{code}"
+            );
+        }
+        let open = body_of("open");
+        assert!(!open.contains("({"), "{open}");
+        assert_ne!(
+            dict_at(&open, open.find("same(").expect("open same")),
+            *shared
+        );
+        let use_open = body_of("useOpen");
+        assert!(use_open.contains("({"), "{use_open}");
+        assert!(use_open.contains("eqMaybe("), "{use_open}");
+        assert!(!use_open.contains("eqInt"), "{use_open}");
+        let maybe = &same_dicts("useInt")[0];
+        assert_ne!(maybe, shared);
+        assert!(head.contains(&format!("eqMaybe({shared},")), "{code}");
+        let lowered = to_anf(&module(body)).expect("anf");
+        let names = crate::anf::referenced_words(&lowered);
+        assert!(names.iter().any(|name| name == "eqInt"), "{names:?}");
+        assert!(names.iter().any(|name| name == "eqMaybe"), "{names:?}");
+        run(
+            body,
+            r#"
+function ieq(a, b) { return a === b; }
+if (once(1n, 1n) !== true) throw new Error("once");
+if (once(1n, 2n) !== false) throw new Error("once ne");
+const pair = twice(1n, 1n, 2n, 3n);
+if (pair[0] !== true || pair[1] !== false) throw new Error("twice " + pair);
+if (branch(1n, 1n, true) !== true) throw new Error("branch yes");
+if (branch(1n, 2n, false) !== false) throw new Error("branch no");
+if (later(4n, 4n)() !== true) throw new Error("later");
+if (open({ eq: ieq }, 1n, 2n) !== false) throw new Error("open");
+if (useOpen({ eq: ieq }, Nothing, Nothing) !== true) throw new Error("open nothing");
+if (useOpen({ eq: ieq }, Just(1n), Just(1n)) !== true) throw new Error("open just");
+if (useOpen({ eq: ieq }, Just(1n), Just(2n)) !== false) throw new Error("open ne");
+if (useOpen({ eq: ieq }, Nothing, Just(1n)) !== false) throw new Error("open mixed");
+if (useInt(Just(1n), Just(1n)) !== true) throw new Error("useInt");
+if (useInt(Nothing, Nothing) !== true) throw new Error("useInt nothing");
+if (useInt(Just(1n), Nothing) !== false) throw new Error("useInt mixed");
+"#,
+        );
+    }
+
+    #[test]
     fn result_type_picks_empty_and_pure() {
         let body = r#"
 : foreign scat ( Str Str -- Str )
@@ -3503,10 +3708,10 @@ function iadd(a, b) { return a + b; }
 if (blank() !== "") throw new Error("blank");
 if (beside("a") !== "a") throw new Error("beside");
 const one = wrapped(1n);
-if (one.tag !== "Just" || one.value !== 1n) throw new Error("pure");
+if (one.$$tag !== "Just" || one.value !== 1n) throw new Error("pure");
 const inc = chainInc(Just(2n));
-if (inc.tag !== "Just" || inc.value !== 3n) throw new Error("chain");
-if (chainInc(Nothing).tag !== "Nothing") throw new Error("chain nothing");
+if (inc.$$tag !== "Just" || inc.value !== 3n) throw new Error("chain");
+if (chainInc(Nothing).$$tag !== "Nothing") throw new Error("chain nothing");
 "#,
         );
     }
@@ -3515,7 +3720,7 @@ if (chainInc(Nothing).tag !== "Nothing") throw new Error("chain nothing");
     fn a_product_field_is_property_access() {
         assert_eq!(
             js("; Person = Person name : Str, age : Num\n\n: nameOf ( Person -- Str )\n  name>>"),
-            "export const Person = (v0, v1) => ({ tag: \"Person\", name: v0, age: v1 });\n\nexport function nameOf(v0) {\n  const v1 = v0.name;\n  return v1;\n}\n"
+            "export const Person = (v0, v1) => ({ $$tag: \"Person\", name: v0, age: v1 });\n\nexport function nameOf(v0) {\n  const v1 = v0.name;\n  return v1;\n}\n"
         );
     }
 
@@ -3523,7 +3728,7 @@ if (chainInc(Nothing).tag !== "Nothing") throw new Error("chain nothing");
     fn named_constructor_field_is_a_property() {
         assert_eq!(
             js("; Entry = Entry id : Num, at : Num\n\n: get ( Entry -- Num )\n  at>>\n"),
-            "export const Entry = (v0, v1) => ({ tag: \"Entry\", id: v0, at: v1 });\n\nexport function get(v0) {\n  const v1 = v0.at;\n  return v1;\n}\n"
+            "export const Entry = (v0, v1) => ({ $$tag: \"Entry\", id: v0, at: v1 });\n\nexport function get(v0) {\n  const v1 = v0.at;\n  return v1;\n}\n"
         );
         run(
             r#"
@@ -3539,16 +3744,19 @@ function nadd(a, b) { return a + b; }
 const first = Entry(1, 10);
 const next = shift(first);
 if (first.at !== 10 || first.id !== 1) throw new Error("old " + JSON.stringify(first));
-if (next.at !== 11 || next.id !== 1 || next.tag !== "Entry") throw new Error("next " + JSON.stringify(next));
+if (next.at !== 11 || next.id !== 1 || next.$$tag !== "Entry") throw new Error("next " + JSON.stringify(next));
 "#,
         );
         let tagged = js(
             "; Entry = Entry tag : Num, at : Num | Nope\n\n: read ( Entry -- Num )\n  (Entry n _) -> n\n  (Nope ..) -> 0\n",
         );
-        assert!(tagged.contains("tag: \"Entry\""), "{tagged}");
-        assert!(tagged.contains("$tag: v0"), "{tagged}");
-        assert!(tagged.contains(".tag === \"Entry\""), "{tagged}");
-        assert!(tagged.contains(".$tag"), "{tagged}");
+        assert!(tagged.contains("$$tag: \"Entry\""), "{tagged}");
+        assert!(tagged.contains("tag: v0"), "{tagged}");
+        assert!(tagged.contains(".$$tag === \"Entry\""), "{tagged}");
+        assert!(tagged.contains(".tag"), "{tagged}");
+        // `$tag:` is a substring of `$$tag:`. The old rename was a space or a dot before one `$`.
+        assert!(!tagged.contains(" $tag:"), "{tagged}");
+        assert!(!tagged.contains(".$tag"), "{tagged}");
         run(
             r#"
 ; Entry = Entry tag : Num, at : Num | Nope
@@ -3563,7 +3771,7 @@ if (next.at !== 11 || next.id !== 1 || next.tag !== "Entry") throw new Error("ne
 "#,
             r#"
 const row = Entry(7, 10);
-if (row.tag !== "Entry" || row.$tag !== 7 || row.at !== 10) throw new Error("stored " + JSON.stringify(row));
+if (row.$$tag !== "Entry" || row.tag !== 7 || row.at !== 10) throw new Error("stored " + JSON.stringify(row));
 if (kind(row) !== 0n) throw new Error("kind " + kind(row));
 if (kind(Nope) !== 1n) throw new Error("nope");
 if (read(row) !== 7) throw new Error("read");
@@ -3581,10 +3789,10 @@ if (read(row) !== 7) throw new Error("read");
 "#,
             r#"
 const row = Row(7, 10);
-if (row.tag !== "Row" || row.$tag !== 7 || row.at !== 10) throw new Error("stored " + JSON.stringify(row));
+if (row.$$tag !== "Row" || row.tag !== 7 || row.at !== 10) throw new Error("stored " + JSON.stringify(row));
 if (read(row) !== 7) throw new Error("read");
 const next = move(row, 8);
-if (row.$tag !== 7 || next.$tag !== 8 || next.tag !== "Row" || next.at !== 10) throw new Error("moved " + JSON.stringify(next));
+if (row.tag !== 7 || next.tag !== 8 || next.$$tag !== "Row" || next.at !== 10) throw new Error("moved " + JSON.stringify(next));
 "#,
         );
     }
@@ -3607,7 +3815,7 @@ if (row.$tag !== 7 || next.$tag !== 8 || next.tag !== "Row" || next.at !== 10) t
   (Redirect ..) ->
 ";
         let code = js(source);
-        assert!(code.contains(".tag === \"Sent\""), "{code}");
+        assert!(code.contains(".$$tag === \"Sent\""), "{code}");
         assert!(code.contains("body:"), "{code}");
         run(
             source,
@@ -3615,7 +3823,7 @@ if (row.$tag !== 7 || next.$tag !== 8 || next.tag !== "Row" || next.at !== 10) t
 const sent = Sent(200, "hello");
 const cleared = emptied(sent);
 if (sent.body !== "hello") throw new Error("old " + JSON.stringify(sent));
-if (cleared.tag !== "Sent" || cleared.body !== "" || cleared.status !== 200) {
+if (cleared.$$tag !== "Sent" || cleared.body !== "" || cleared.status !== 200) {
   throw new Error("cleared " + JSON.stringify(cleared));
 }
 if (bodyOf(sent) !== "hello") throw new Error("body");
@@ -3653,8 +3861,8 @@ if (spilled[0] !== 200 || spilled[1] !== "hello") throw new Error("spill " + JSO
   person name>>
 "#,
             r#"
-function person() { return { tag: "Person", name: "Ada", age: 36n }; }
-const value = { tag: "Person", name: "Ada", age: 36n };
+function person() { return { $$tag: "Person", name: "Ada", age: 36n }; }
+const value = { $$tag: "Person", name: "Ada", age: 36n };
 if (nameOf(value) !== "Ada") throw new Error("name");
 if (ageOf(value) !== 36n) throw new Error("age");
 const both = keepName(value);
@@ -3946,7 +4154,7 @@ if (repeat(5).join(",") !== "5,5") throw new Error("repeat");
 if (hidden(9).join(",") !== "4,4") throw new Error("hidden");
 const p = person();
 const q = older(p);
-if (p.age !== 36 || q.age !== 37 || q.name !== "Ada" || p.tag !== "Person") throw new Error("product");
+if (p.age !== 36 || q.age !== 37 || q.name !== "Ada" || p.$$tag !== "Person") throw new Error("product");
 const pair = bump(20, 5);
 if (pair[0] !== 21 || pair[1] !== 5) throw new Error("dip " + pair);
 "#,
@@ -3977,7 +4185,7 @@ if (pair[0] !== 21 || pair[1] !== 5) throw new Error("dip " + pair);
             js("; foreign Hub a\n; Box = Box\n\n: pass ( (Hub a) -- (Hub a) )\n  hub -> hub\n");
         assert_eq!(
             code,
-            "export const Box = { tag: \"Box\" };\n\nexport function pass(v0) {\n  let v1;\n  v1 = v0;\n  return v1;\n}\n"
+            "export const Box = { $$tag: \"Box\" };\n\nexport function pass(v0) {\n  let v1;\n  v1 = v0;\n  return v1;\n}\n"
         );
         run(
             r#"
@@ -4119,18 +4327,18 @@ function at(arr, i) { return arr[i]; }
 const double = (n) => n + n;
 if (toString(true) !== "true" || toString(false) !== "false") throw new Error("bool");
 if (fact(0n) !== 1n || fact(5n) !== 120n) throw new Error("fact " + fact(5n));
-if (mapMaybe(Nothing, double).tag !== "Nothing") throw new Error("map nothing");
+if (mapMaybe(Nothing, double).$$tag !== "Nothing") throw new Error("map nothing");
 const mapped = mapMaybe(Just(21n), double);
-if (mapped.tag !== "Just" || mapped.value !== 42n) throw new Error("map just");
-if (divInt(4n, 0n).tag !== "Nothing") throw new Error("div zero");
+if (mapped.$$tag !== "Just" || mapped.value !== 42n) throw new Error("map just");
+if (divInt(4n, 0n).$$tag !== "Nothing") throw new Error("div zero");
 const quarter = divInt(4n, 2n);
-if (quarter.tag !== "Just" || quarter.value !== 2n) throw new Error("div");
+if (quarter.$$tag !== "Just" || quarter.value !== 2n) throw new Error("div");
 if (fromMaybe(1n, Nothing) !== 1n) throw new Error("from nothing");
 if (fromMaybe(1n, Just(2n)) !== 2n) throw new Error("from just");
-if (flatten(Nothing).tag !== "Nothing") throw new Error("flat nothing");
-if (flatten(Just(Nothing)).tag !== "Nothing") throw new Error("flat just nothing");
+if (flatten(Nothing).$$tag !== "Nothing") throw new Error("flat nothing");
+if (flatten(Just(Nothing)).$$tag !== "Nothing") throw new Error("flat just nothing");
 const flat = flatten(Just(Just(3n)));
-if (flat.tag !== "Just" || flat.value !== 3n) throw new Error("flat just just");
+if (flat.$$tag !== "Just" || flat.value !== 3n) throw new Error("flat just just");
 if (fromJust(Nothing) !== 0n) throw new Error("fromJust nothing");
 if (fromJust(Just(4n)) !== 4n) throw new Error("fromJust");
 if (isJust(Nothing) !== false || isJust(Just(1n)) !== true) throw new Error("isJust");
@@ -4228,11 +4436,11 @@ if (born(Person("Grace", 1906n)) !== "Grace") throw new Error("grace");
 "#,
             r#"
 const once = use(Mk(1n));
-if (once.tag !== "Mk" || once.value.tag !== "Mk" || once.value.value !== 1n) {
+if (once.$$tag !== "Mk" || once.value.$$tag !== "Mk" || once.value.value !== 1n) {
   throw new Error("use " + JSON.stringify(once));
 }
 const twice = useVia(Mk(2n));
-if (twice.tag !== "Mk" || twice.value.tag !== "Mk" || twice.value.value !== 2n) {
+if (twice.$$tag !== "Mk" || twice.value.$$tag !== "Mk" || twice.value.value !== 2n) {
   throw new Error("via " + JSON.stringify(twice));
 }
 "#,

@@ -1208,7 +1208,7 @@ function ping() { inner(); n += 1; new Marker(); return `x ${g()}`; }
 function boom() { extra(); }
 let n = 0;
 class Marker {}
-const made = { tag: \"Effect\", value: n };
+const made = { $$tag: \"Effect\", value: n };
 ";
         let items = split_items(src);
         let names: Vec<&str> = items
@@ -1227,8 +1227,9 @@ const made = { tag: \"Effect\", value: n };
         assert!(uses.contains(&"n".to_string()), "{uses:?}");
         assert!(uses.contains(&"Marker".to_string()), "{uses:?}");
         assert!(uses.contains(&"g".to_string()), "{uses:?}");
-        let made = references("const made = { tag: \"Effect\", value: n };");
+        let made = references("const made = { $$tag: \"Effect\", value: n };");
         assert!(made.contains(&"n".to_string()), "{made:?}");
+        assert!(!made.contains(&"$$tag".to_string()), "{made:?}");
         assert!(!made.contains(&"tag".to_string()), "{made:?}");
         assert!(!made.contains(&"value".to_string()), "{made:?}");
     }

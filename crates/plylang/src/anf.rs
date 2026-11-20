@@ -12,6 +12,8 @@ pub type LocalId = u32;
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnfModule {
     pub datas: Vec<AnfData>,
+    /// Dictionaries that do not close over a parameter. Emitted once, before the functions.
+    pub dicts: Vec<Let>,
     pub defs: Vec<AnfDef>,
     /// Source order. An empty list leaves the JavaScript unchanged.
     pub places: Vec<AnfPlace>,
@@ -115,7 +117,7 @@ pub enum PatTest {
     Length(usize),
     /// The value has this runtime shape. A ground type emits no test.
     Shape(ShapeTest),
-    /// The literal `unit`. The value is `undefined`. Reading `.tag` throws.
+    /// The literal `unit`. The value is `undefined`. Reading the discriminant throws.
     Undefined,
 }
 
@@ -225,14 +227,10 @@ pub fn local_name(id: LocalId) -> String {
     format!("v{id}")
 }
 
-/// The discriminant owns the key `tag`. A field of that name is stored beside it.
-pub(crate) fn field_key(name: &str) -> &str {
-    if name == "tag" {
-        "$tag"
-    } else {
-        name
-    }
-}
+/// Constructor discriminant. `$` cannot start a Ply name, so a field called
+/// `tag` is stored as `tag` and does not share this key. Other systems rarely
+/// use it either.
+pub(crate) const TAG: &str = "$$tag";
 
 /// The module that wrote the `#` whose word `local` calls.
 /// `remote` is the word's name in that module. `origin` is its module key.
@@ -255,7 +253,15 @@ impl AnfModule {
                 out.push('\n');
             }
         }
-        if !self.datas.is_empty() && !self.defs.is_empty() {
+        if !self.dicts.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            for let_ in &self.dicts {
+                write_let(&mut out, let_, 0);
+            }
+        }
+        if !self.defs.is_empty() && !out.is_empty() {
             out.push('\n');
         }
         for (index, def) in self.defs.iter().enumerate() {
@@ -356,11 +362,11 @@ fn ctor_export(ctor: &AnfCtor) -> String {
         return format!("export const {name} = (value) => value;");
     }
     if ctor.fields == 0 {
-        return format!("export const {name} = {{ tag: \"{}\" }};", ctor.name);
+        return format!("export const {name} = {{ {TAG}: \"{}\" }};", ctor.name);
     }
     if ctor.fields == 1 {
         return format!(
-            "export const {name} = (value) => ({{ tag: \"{}\", value }});",
+            "export const {name} = (value) => ({{ {TAG}: \"{}\", value }});",
             ctor.name
         );
     }
@@ -371,7 +377,7 @@ fn ctor_export(ctor: &AnfCtor) -> String {
         ctor.names
             .iter()
             .enumerate()
-            .map(|(index, name)| format!("{}: v{index}", field_key(name.as_deref().unwrap())))
+            .map(|(index, name)| format!("{}: v{index}", name.as_deref().unwrap()))
             .collect::<Vec<_>>()
             .join(", ")
     } else {
@@ -381,7 +387,7 @@ fn ctor_export(ctor: &AnfCtor) -> String {
             .join(", ")
     };
     format!(
-        "export const {name} = ({list}) => ({{ tag: \"{}\", {fields} }});",
+        "export const {name} = ({list}) => ({{ {TAG}: \"{}\", {fields} }});",
         ctor.name
     )
 }
@@ -568,7 +574,7 @@ fn render_cond(cond: &Cond) -> String {
             Access::Field { width: 1, .. } => path.push_str(".value"),
             Access::Field { index, .. } => path.push_str(&format!(".value{index}")),
             Access::Index(index) => path.push_str(&format!("[{index}]")),
-            Access::Prop(name) => path.push_str(&format!(".{}", field_key(name))),
+            Access::Prop(name) => path.push_str(&format!(".{name}")),
         }
     }
     match &cond.test {
@@ -576,7 +582,7 @@ fn render_cond(cond: &Cond) -> String {
         PatTest::Int(lexeme) => format!("{path} === {lexeme}n"),
         PatTest::Number(lexeme) => format!("{path} === {lexeme}"),
         PatTest::String(value) => format!("{path} === {}", js_string(value)),
-        PatTest::Tag(tag) => format!("{path}.tag === \"{tag}\""),
+        PatTest::Tag(tag) => format!("{path}.{TAG} === \"{tag}\""),
         PatTest::Length(len) => format!("{path}.length === {len}"),
         PatTest::Shape(shape) => render_shape(&path, shape, 0),
         PatTest::Undefined => format!("{path} === undefined"),
@@ -673,11 +679,10 @@ fn render_value(value: &Value) -> String {
             }
         }
         Value::Index { base, index } => format!("{}[{index}]", local_name(*base)),
-        Value::Prop { base, name } => format!("{}.{}", local_name(*base), field_key(name)),
+        Value::Prop { base, name } => format!("{}.{}", local_name(*base), name),
         Value::SetProp { base, name, value } => format!(
-            "({{ ...{}, {}: {} }})",
+            "({{ ...{}, {name}: {} }})",
             local_name(*base),
-            field_key(name),
             local_name(*value)
         ),
         Value::Array(items) => {
@@ -699,6 +704,9 @@ fn render_value(value: &Value) -> String {
 /// are properties, not imports.
 pub(crate) fn referenced_words(module: &AnfModule) -> Vec<String> {
     let mut names = Vec::new();
+    for let_ in &module.dicts {
+        collect_value(&let_.value, &mut names);
+    }
     for def in &module.defs {
         collect_words(&def.body, &mut names);
     }
@@ -905,6 +913,16 @@ impl fmt::Display for AnfModule {
                     }
                 }
             }
+        }
+        for let_ in &self.dicts {
+            if !first {
+                writeln!(formatter)?;
+            }
+            first = false;
+            if let [one] = let_.binds.as_slice() {
+                write!(formatter, "{} = ", local_name(*one))?;
+            }
+            write_anf_value(formatter, &let_.value, 0)?;
         }
         for def in &self.defs {
             if !first {

@@ -4,7 +4,7 @@
 //! An import brings those names into one file. Repeating one in the list
 //! publishes it again. Instances are not names: every import carries them.
 //! A word bound by `#` stays in the file that defines it unless that name is
-//! also in the list. A file with no list publishes nothing.
+//! also in the list. A file with no list publishes no names.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
