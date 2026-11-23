@@ -384,13 +384,13 @@ impl Checker {
             self.assumption_locals.clear();
             return Err(self.error(def.name_span, message));
         }
+        let result = drain_results(self, &mut frame)?;
         let finished = self.finish_deferred();
         self.ambient = saved;
         self.assumptions.clear();
         self.assumption_locals.clear();
         finished?;
         self.escaped_effect(def.name_span)?;
-        let result = drain_results(self, &mut frame)?;
         let concrete = self.cons_len(output);
         if result.len() != concrete {
             panic!(
