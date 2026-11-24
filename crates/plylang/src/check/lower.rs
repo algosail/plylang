@@ -812,6 +812,11 @@ impl Checker {
             frame.stack.push(Operand::Local(id));
             return Ok(output);
         }
+        let stack = if name == "call" {
+            self.instantiate_callable(stack)
+        } else {
+            stack
+        };
         if name == "call" {
             if let Some(output) = self.lower_unsolved_call(span, stack, frame)? {
                 return Ok(output);

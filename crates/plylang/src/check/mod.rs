@@ -2,8 +2,9 @@
 //!
 //! A signature's outer tail and its named tails are rigid, so a body cannot
 //! consume below what the signature wrote. An implicit tail inside a nested
-//! quotation stays flexible: `call` has to unify it with the stack under the
-//! quotation. Word schemes instantiate to fresh variables.
+//! quotation is polymorphic. Each `call` instantiates those tails on the
+//! consumed copy, leaving any retained copy at its general type. Word schemes
+//! instantiate to fresh variables.
 //!
 //! A quotation that is passed to another word keeps a fresh function type until
 //! that word ascribes it. The body is checked then, on a private copy of the
@@ -612,6 +613,9 @@ struct Checker {
     recording: bool,
     frozen_ty: HashSet<TyId>,
     frozen_stack: HashSet<StackId>,
+    /// Implicit stack tails quantified inside function types. Each call gets a
+    /// fresh instantiation without changing the type of a retained quotation.
+    poly_stack: HashSet<StackId>,
     frozen_effect: HashSet<EffectId>,
     /// Nested effect variables of the signature currently being checked.
     /// A body that instantiates one has outgrown the annotation.
@@ -688,6 +692,7 @@ impl Checker {
             recording: false,
             frozen_ty: HashSet::new(),
             frozen_stack: HashSet::new(),
+            poly_stack: HashSet::new(),
             frozen_effect: HashSet::new(),
             guarded: Vec::new(),
             relax_visibility: false,
@@ -750,6 +755,7 @@ impl Checker {
         self.recording = false;
         self.frozen_ty.clear();
         self.frozen_stack.clear();
+        self.poly_stack.clear();
         self.frozen_effect.clear();
         self.guarded.clear();
         self.relax_visibility = false;
@@ -2306,6 +2312,16 @@ impl Checker {
         name: &str,
         stack: StackId,
     ) -> Result<StackId, Diagnostic> {
+        let shadows_call = self
+            .locals
+            .iter()
+            .rev()
+            .any(|scope| scope.contains_key(name));
+        let stack = if name == "call" && !shadows_call {
+            self.instantiate_callable(stack)
+        } else {
+            stack
+        };
         self.force_running(name, stack)?;
         let Some(scheme) = self.lookup(name) else {
             return Err(self.error(span, Error::UndefinedWord(name.to_string())));
@@ -2326,6 +2342,117 @@ impl Checker {
         self.settle_ascribed(stack)?;
         self.pending_here = Some((input, output, effect));
         Ok(output)
+    }
+
+    /// Give each call a fresh instantiation of the quotation's implicit stack
+    /// tails. The function value beneath a duplicated quotation keeps its
+    /// polymorphic type; only the consumed copy is specialized to this stack.
+    fn instantiate_callable(&mut self, stack: StackId) -> StackId {
+        let Some((under, func)) = self.top_slot(stack) else {
+            return stack;
+        };
+        let original = self.expose(func);
+        if !matches!(self.tys[original.0 as usize], TyNode::Fun(_, _, _)) {
+            return stack;
+        }
+
+        let mut poly_tails = Vec::new();
+        self.collect_poly_tails_ty(
+            original,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &mut poly_tails,
+        );
+        if poly_tails.is_empty() {
+            return stack;
+        }
+        let mut subst = Subst::default();
+        for tail in poly_tails {
+            subst.stack.insert(tail, self.stack_var());
+        }
+        let instantiated = self.copy_ty(original, &subst, &mut Memo::default());
+        let instantiated = self.expose(instantiated);
+        if let TyNode::Fun(input, output, effect) = self.tys[instantiated.0 as usize].clone() {
+            if let Some(index) = self
+                .pending_quotes
+                .iter()
+                .position(|quote| self.expose(quote.fun) == original && !quote.checked)
+            {
+                let (span, terms, locals) = {
+                    let quote = &mut self.pending_quotes[index];
+                    quote.checked = true;
+                    (quote.span, quote.terms.clone(), quote.locals.clone())
+                };
+                self.pending_quotes.push(PendingQuote {
+                    span,
+                    fun: instantiated,
+                    terms,
+                    input,
+                    output,
+                    effect,
+                    locals,
+                    checked: false,
+                });
+            }
+        }
+        self.stack_cons(under, instantiated)
+    }
+
+    fn collect_poly_tails_ty(
+        &self,
+        ty: TyId,
+        seen_tys: &mut HashSet<TyId>,
+        seen_stacks: &mut HashSet<StackId>,
+        found: &mut Vec<StackId>,
+    ) {
+        let ty = self.expose(ty);
+        if !seen_tys.insert(ty) {
+            return;
+        }
+        match self.tys[ty.0 as usize].clone() {
+            TyNode::Ctor(_, args) | TyNode::App(_, args) => {
+                for arg in args {
+                    self.collect_poly_tails_ty(arg, seen_tys, seen_stacks, found);
+                }
+                if let TyNode::App(head, _) = self.tys[ty.0 as usize].clone() {
+                    self.collect_poly_tails_ty(head, seen_tys, seen_stacks, found);
+                }
+            }
+            TyNode::Fun(input, output, _) => {
+                self.collect_poly_tails_stack(input, seen_tys, seen_stacks, found);
+                self.collect_poly_tails_stack(output, seen_tys, seen_stacks, found);
+            }
+            TyNode::Alias { args, body, .. } => {
+                for arg in args {
+                    self.collect_poly_tails_ty(arg, seen_tys, seen_stacks, found);
+                }
+                self.collect_poly_tails_ty(body, seen_tys, seen_stacks, found);
+            }
+            TyNode::Var | TyNode::Rigid(_) | TyNode::Template | TyNode::Link(_) => {}
+        }
+    }
+
+    fn collect_poly_tails_stack(
+        &self,
+        stack: StackId,
+        seen_tys: &mut HashSet<TyId>,
+        seen_stacks: &mut HashSet<StackId>,
+        found: &mut Vec<StackId>,
+    ) {
+        let stack = self.find_stack(stack);
+        if !seen_stacks.insert(stack) {
+            return;
+        }
+        match self.stacks[stack.0 as usize].clone() {
+            StackNode::Var | StackNode::Template if self.poly_stack.contains(&stack) => {
+                found.push(stack);
+            }
+            StackNode::Cons(rest, ty) => {
+                self.collect_poly_tails_stack(rest, seen_tys, seen_stacks, found);
+                self.collect_poly_tails_ty(ty, seen_tys, seen_stacks, found);
+            }
+            _ => {}
+        }
     }
 
     /// Scheme input variables that are one narrowed value. Two slots that share
@@ -2817,6 +2944,9 @@ impl Checker {
             } else {
                 self.stack_var()
             };
+            if !tail.skolem {
+                self.poly_stack.insert(fresh);
+            }
             subst.stack.insert(tail.id, fresh);
         }
         let mut guarded = Vec::new();
@@ -5119,6 +5249,8 @@ mod tests {
         ok(": r ( a b. a b (a -- c) (b -- d) -- c d )\n  bis");
         ok(": r ( a. a a (a -- b) -- b b )\n  bia");
         ok(": r ( a. a (a -- b) -- ( -- b) )\n  cons");
+        ok(": test ( a (a -- Bool) -- a (a -- Bool) Bool )\n  dup2 call");
+        ok(": testCons ( a (a -- Bool) -- Bool )\n  cons call");
         ok(": r ( a b. b (a b -- c) -- (a -- c) )\n  cons");
         ok(": r ( a. a -- ( -- a) )\n  [ ] cons");
         ok(": r ( a. a -- ( -- a Num) )\n  [ 1 ] cons");

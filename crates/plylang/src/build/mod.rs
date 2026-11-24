@@ -3404,6 +3404,37 @@ mod tests {
     }
 
     #[test]
+    fn check_buffer_accepts_polymorphic_call_with_an_import() {
+        let temp = Temp::new("polymorphic-call");
+        temp.write(
+            "package.json",
+            &package_json(
+                r#""./Data/Lib": { "ply": "./dist/Data/Lib.d.ply", "import": "./dist/Data/Lib.js" }, "./App": { "ply": "./dist/App.d.ply", "import": "./dist/App.js" }"#,
+            ),
+        );
+        temp.write(
+            "src/Data/Lib.ply",
+            r#"@ id
+
+: id ( Num -- Num )
+  dup drop
+"#,
+        );
+        let source = r#"@ test, testCons
+~ "Data/Lib" id
+
+: test ( a (a -- Bool) -- a (a -- Bool) Bool )
+  dup2 call
+
+: testCons ( a (a -- Bool) -- Bool )
+  cons call
+"#;
+        temp.write("src/App.ply", source);
+        super::check_buffer(&temp.0.join("src/App.ply"), source)
+            .unwrap_or_else(|error| panic!("{}", error.render("App.ply", source)));
+    }
+
+    #[test]
     fn check_buffer_accepts_an_imported_constructor() {
         let temp = Temp::new("buffer");
         temp.write(
